@@ -66,7 +66,7 @@ class HackRFAddon(SensorAddon):
         self.radio_lock = RadioLock()
         self.fm_player = FMPlayer()
         self.data_store: HackRFDataStore | None = None
-        self.target_tracker = None
+        self._target_tracker = None
         self._poll_task = None
 
     async def register(self, app=None, *, context=None):
@@ -101,7 +101,7 @@ class HackRFAddon(SensorAddon):
             site_id = getattr(app, 'site_id', 'home')
             router_handler = app if (app and hasattr(app, 'include_router')) else None
 
-        self.target_tracker = target_tracker
+        self._target_tracker = target_tracker
         # Wire ADS-B decoder to target tracker for live aircraft updates
         self.adsb_decoder.target_tracker = target_tracker
 

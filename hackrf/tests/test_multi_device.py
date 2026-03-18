@@ -345,7 +345,7 @@ class TestAddonContextRegistration:
 
         await addon.register(context=ctx)
 
-        assert addon.target_tracker is mock_tracker
+        assert addon._target_tracker is mock_tracker
         assert addon.adsb_decoder.target_tracker is mock_tracker
         # Router should have been included via context.router_handler
         mock_router_handler.include_router.assert_called_once()
@@ -377,7 +377,7 @@ class TestAddonContextRegistration:
 
         await addon.register(mock_app)
 
-        assert addon.target_tracker is mock_app.target_tracker
+        assert addon._target_tracker is mock_app.target_tracker
         mock_app.include_router.assert_called_once()
 
         await addon.unregister(mock_app)

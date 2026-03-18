@@ -9,8 +9,9 @@ and backward compatibility with legacy single-radio endpoints.
 """
 
 import asyncio
+import inspect
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, AsyncMock
 
 from tritium_lib.sdk import DeviceRegistry, DeviceState, RegisteredDevice
 
@@ -720,3 +721,94 @@ class TestHealthCheck:
         assert h["connected"] is True
         assert h["total_radios"] == 2
         assert h["connected_radios"] == 1
+
+
+# ---------------------------------------------------------------------------
+# AddonContext registration tests
+# ---------------------------------------------------------------------------
+
+class TestAddonContextRegistration:
+    """Tests for register() with AddonContext kwarg."""
+
+    @pytest.mark.asyncio
+    @patch("meshtastic_addon.detect_meshtastic_ports", return_value=[])
+    async def test_register_with_context(self, mock_detect):
+        """register(context=ctx) extracts deps from context, not app."""
+        from meshtastic_addon import MeshtasticAddon
+
+        addon = MeshtasticAddon()
+
+        mock_tracker = MagicMock()
+        mock_event_bus = MagicMock()
+        mock_mqtt = MagicMock(spec=[])  # No subscribe attr
+        mock_router_handler = MagicMock()
+        mock_router_handler.include_router = MagicMock()
+
+        ctx = MagicMock()
+        ctx.target_tracker = mock_tracker
+        ctx.event_bus = mock_event_bus
+        ctx.mqtt_client = mock_mqtt
+        ctx.site_id = "test-site"
+        ctx.router_handler = mock_router_handler
+        ctx.get_state = MagicMock(return_value=None)
+        ctx.set_state = MagicMock()
+
+        await addon.register(context=ctx)
+
+        assert addon.node_manager is not None
+        assert addon.node_manager.target_tracker is mock_tracker
+        # Router should have been included via context.router_handler
+        assert mock_router_handler.include_router.call_count == 2  # main + device routes
+
+        # State should be persisted via context.set_state
+        set_state_calls = {c[0][0] for c in ctx.set_state.call_args_list}
+        assert "node_manager" in set_state_calls
+        assert "connections" in set_state_calls
+        assert "registry" in set_state_calls
+
+        await addon.unregister(context=ctx)
+
+    @pytest.mark.asyncio
+    @patch("meshtastic_addon.detect_meshtastic_ports", return_value=[])
+    async def test_register_legacy_app_still_works(self, mock_detect):
+        """register(app) still works without context (backwards compat)."""
+        from meshtastic_addon import MeshtasticAddon
+
+        addon = MeshtasticAddon()
+
+        mock_app = MagicMock()
+        mock_app.state = MagicMock()
+        mock_app.state.amy = None
+        mock_app.state.meshtastic_node_manager = None
+        mock_app.state.meshtastic_connections = None
+        mock_app.state.meshtastic_node_managers = None
+        mock_app.state.meshtastic_registry = None
+        mock_app.state.meshtastic_connection = None
+        mock_app.target_tracker = MagicMock()
+        mock_app.event_bus = MagicMock()
+        mock_app.include_router = MagicMock()
+        mock_app.mqtt_bridge = None
+        mock_app.site_id = "legacy-site"
+
+        await addon.register(mock_app)
+
+        assert addon.node_manager is not None
+        mock_app.include_router.assert_called()
+
+        await addon.unregister(mock_app)
+
+    def test_register_accepts_context_kwarg(self):
+        """register() method signature has context as keyword-only arg."""
+        from meshtastic_addon import MeshtasticAddon
+        sig = inspect.signature(MeshtasticAddon.register)
+        params = sig.parameters
+        assert "context" in params
+        assert params["context"].kind == inspect.Parameter.KEYWORD_ONLY
+
+    def test_unregister_accepts_context_kwarg(self):
+        """unregister() method signature has context as keyword-only arg."""
+        from meshtastic_addon import MeshtasticAddon
+        sig = inspect.signature(MeshtasticAddon.unregister)
+        params = sig.parameters
+        assert "context" in params
+        assert params["context"].kind == inspect.Parameter.KEYWORD_ONLY
