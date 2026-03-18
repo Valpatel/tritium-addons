@@ -431,6 +431,7 @@ export const MeshtasticPanelDef = {
                 </div>
                 <div class="msh-radio-actions">
                     <button class="msh-btn" data-action="refresh-all" title="Refresh all data from device">REFRESH</button>
+                    ${withGps > 0 ? '<button class="msh-btn" data-action="center-map" title="Center the tactical map on mesh network GPS nodes" style="background:#00d4aa20;border-color:#00d4aa">CENTER MAP ON MESH</button>' : ''}
                     <button class="msh-btn msh-btn-warn" data-action="reboot" title="Reboot the connected radio">REBOOT DEVICE</button>
                 </div>
                 ` : `
@@ -603,6 +604,31 @@ export const MeshtasticPanelDef = {
                 fetchDeviceInfo();
                 fetchChannels();
                 fetchModuleConfig();
+            });
+            body.querySelector('[data-action="center-map"]')?.addEventListener('click', async () => {
+                try {
+                    const r = await fetch(API + '/center');
+                    if (!r.ok) return;
+                    const d = await r.json();
+                    if (d.bounds) {
+                        // Use AddonMapLayers fitToLayer or emit map event
+                        if (window._addonMapLayers) {
+                            window._addonMapLayers.fitToLayer('meshtastic-nodes');
+                        } else if (window._tritiumMap) {
+                            window._tritiumMap.fitBounds(d.bounds, { padding: 60, maxZoom: 14 });
+                        }
+                        EventBus.emit('toast:show', { message: `Centered on ${d.node_count} mesh nodes with GPS`, type: 'info' });
+                    } else if (d.center) {
+                        if (window._tritiumMap) {
+                            window._tritiumMap.flyTo({ center: d.center, zoom: 10 });
+                        }
+                        EventBus.emit('toast:show', { message: 'Centered on mesh network', type: 'info' });
+                    } else {
+                        EventBus.emit('toast:show', { message: 'No GPS-equipped mesh nodes found', type: 'alert' });
+                    }
+                } catch (e) {
+                    EventBus.emit('toast:show', { message: 'Failed to center map: ' + e.message, type: 'alert' });
+                }
             });
             body.querySelector('[data-action="reboot"]')?.addEventListener('click', async () => {
                 if (confirm('Reboot the Meshtastic device?') === false) return;

@@ -491,6 +491,44 @@ def create_router(
             })
         return {"type": "FeatureCollection", "features": features}
 
+    @router.get("/center")
+    async def mesh_center():
+        """Return map center and bounds for the mesh network.
+
+        Uses GPS-equipped nodes to compute centroid and bounding box.
+        If the local node has GPS, returns that. Otherwise uses the
+        centroid of all GPS-equipped nodes.
+        """
+        if not node_manager:
+            return {"center": None, "bounds": None, "node_count": 0}
+
+        lats, lngs = [], []
+        local_lat, local_lng = None, None
+
+        for nid, node in node_manager.nodes.items():
+            lat = node.get("lat")
+            lng = node.get("lng")
+            if lat is None or lng is None or (lat == 0.0 and lng == 0.0):
+                continue
+            lats.append(lat)
+            lngs.append(lng)
+            # Check if this is the local/connected node
+            if node.get("is_local") or nid == getattr(connection, '_local_node_id', None):
+                local_lat, local_lng = lat, lng
+
+        if not lats:
+            return {"center": None, "bounds": None, "node_count": 0}
+
+        center_lat = local_lat if local_lat else sum(lats) / len(lats)
+        center_lng = local_lng if local_lng else sum(lngs) / len(lngs)
+
+        return {
+            "center": [center_lng, center_lat],
+            "bounds": [[min(lngs), min(lats)], [max(lngs), max(lats)]],
+            "node_count": len(lats),
+            "local_node_position": [local_lng, local_lat] if local_lat else None,
+        }
+
     @router.get("/health")
     async def health():
         """Addon health check."""
