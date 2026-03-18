@@ -283,7 +283,9 @@ export const HackRFPanelDef = {
                         renderBody();
                     }
                 }
-            } catch (_) { /* network error */ }
+            } catch (e) {
+                console.warn('[HackRF] Sweep data fetch error:', e.message);
+            }
         }
 
         async function fetchFirmware() {
@@ -299,44 +301,93 @@ export const HackRFPanelDef = {
         }
 
         // ── Actions ────────────────────────────────────────────────
+        function _parseBinWidth(binWidth) {
+            if (typeof binWidth === 'number') return binWidth;
+            const s = String(binWidth).trim().toLowerCase();
+            const num = parseFloat(s);
+            if (isNaN(num)) return 500000;
+            if (s.includes('mhz')) return num * 1000000;
+            if (s.includes('khz')) return num * 1000;
+            if (s.includes('hz'))  return num;
+            // Bare number — if small assume MHz, if large assume Hz
+            return num < 10000 ? num * 1000 : num;
+        }
+
         async function startSweep(startMhz, endMhz, binWidth) {
-            _logCommand(`Starting sweep ${_fmtFreq(startMhz * 1e6)}-${_fmtFreq(endMhz * 1e6)}, bin ${binWidth}`);
+            const bw = _parseBinWidth(binWidth);
+            _logCommand(`Starting sweep ${_fmtFreq(startMhz * 1e6)}–${_fmtFreq(endMhz * 1e6)}, bin ${(bw / 1000).toFixed(0)} kHz`);
 
             // Clear old data immediately so axes update to new range
             sweepData = null;
             waterfallHistory.length = 0;
 
-            // Update status bar immediately
+            // Update status bar immediately with "STARTING..."
             if (!deviceStatus.sweep) deviceStatus.sweep = {};
             deviceStatus.sweep.freq_start_mhz = startMhz;
             deviceStatus.sweep.freq_end_mhz = endMhz;
-            deviceStatus.sweep.bin_width = typeof binWidth === 'string' ? parseInt(binWidth) * 1000 : binWidth;
+            deviceStatus.sweep.bin_width = bw;
             deviceStatus.sweep.sweep_count = 0;
             deviceStatus.sweep.measurement_count = 0;
             deviceStatus.sweep.running = true;
             _updateStatusBar();
 
+            // Show immediate feedback on the spectrum canvas
+            sweepRunning = true;
+            renderBody();
+            const specCanvas = body.querySelector('[data-bind="spectrum-canvas"]');
+            if (specCanvas) {
+                const ctx = specCanvas.getContext('2d');
+                ctx.fillStyle = '#0a0a0f';
+                ctx.fillRect(0, 0, specCanvas.width, specCanvas.height);
+                ctx.fillStyle = '#fcee0a';
+                ctx.font = '13px monospace';
+                ctx.textAlign = 'center';
+                ctx.fillText('Starting sweep... waiting for data', specCanvas.width / 2, specCanvas.height / 2);
+            }
+
             try {
-                const bw = typeof binWidth === 'string' ? parseInt(binWidth) * 1000 : binWidth;
                 const r = await fetch(API + '/sweep/start', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ freq_start: startMhz, freq_end: endMhz, bin_width: bw }),
                 });
-                if (r.ok) {
+                const d = await r.json();
+                if (r.ok && d.success !== false) {
                     sweepRunning = true;
-                    _logCommand(`Sweep running: ${_fmtFreq(startMhz * 1e6)}-${_fmtFreq(endMhz * 1e6)}`);
-                    renderBody();
+                    _logCommand(`Sweep running: ${_fmtFreq(startMhz * 1e6)}–${_fmtFreq(endMhz * 1e6)}`);
                 } else {
-                    _logCommand(`Sweep start failed: HTTP ${r.status}`);
+                    const errMsg = d.error || d.detail || `HTTP ${r.status}`;
+                    _logCommand(`Sweep failed: ${errMsg}`);
                     sweepRunning = false;
                     deviceStatus.sweep.running = false;
                     _updateStatusBar();
+                    // Show error on canvas
+                    if (specCanvas) {
+                        const ctx = specCanvas.getContext('2d');
+                        ctx.fillStyle = '#0a0a0f';
+                        ctx.fillRect(0, 0, specCanvas.width, specCanvas.height);
+                        ctx.fillStyle = '#ff2a6d';
+                        ctx.font = '13px monospace';
+                        ctx.textAlign = 'center';
+                        ctx.fillText(`Error: ${errMsg}`, specCanvas.width / 2, specCanvas.height / 2);
+                    }
+                    renderBody();
                 }
             } catch (e) {
                 _logCommand(`Sweep error: ${e.message}`);
                 sweepRunning = false;
+                deviceStatus.sweep.running = false;
                 _updateStatusBar();
+                if (specCanvas) {
+                    const ctx = specCanvas.getContext('2d');
+                    ctx.fillStyle = '#0a0a0f';
+                    ctx.fillRect(0, 0, specCanvas.width, specCanvas.height);
+                    ctx.fillStyle = '#ff2a6d';
+                    ctx.font = '13px monospace';
+                    ctx.textAlign = 'center';
+                    ctx.fillText(`Network error: ${e.message}`, specCanvas.width / 2, specCanvas.height / 2);
+                }
+                renderBody();
             }
         }
 
