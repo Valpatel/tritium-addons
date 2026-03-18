@@ -9,6 +9,11 @@ Each mesh node becomes a tracked target on the tactical map.
 
 from tritium_lib.sdk import SensorAddon, AddonInfo, AddonGeoLayer, DeviceRegistry, DeviceState
 
+try:
+    from tritium_lib.sdk.context import AddonContext
+except ImportError:
+    AddonContext = None  # SDK agent building in parallel — fall back to app pattern
+
 from .connection import ConnectionManager, detect_meshtastic_ports
 from .data_store import MeshtasticDataStore
 from .device_manager import DeviceManager
@@ -84,34 +89,58 @@ class MeshtasticAddon(SensorAddon):
                     merged[node_id] = node_copy
         self.node_manager.nodes = merged
 
-    async def register(self, app):
+    async def register(self, app=None, *, context=None):
         await super().register(app)
-
-        # Resolve target_tracker from app.state.amy (where the Command Center stores it)
-        target_tracker = None
-        event_bus = None
-
-        # Try app.state.amy first (the standard SC pattern)
-        amy = getattr(getattr(app, 'state', None), 'amy', None)
-        if amy is not None:
-            target_tracker = getattr(amy, 'target_tracker', None)
-            event_bus = getattr(amy, 'event_bus', None)
-
-        # Fallback: direct attributes on app (for testing or alternate setups)
-        if target_tracker is None:
-            target_tracker = getattr(app, 'target_tracker', None)
-        if event_bus is None:
-            event_bus = getattr(app, 'event_bus', None)
 
         import logging
         log = logging.getLogger("meshtastic")
+
+        # --- Resolve dependencies from context (preferred) or app (legacy) ---
+        if context is not None:
+            target_tracker = context.target_tracker
+            event_bus = context.event_bus
+            mqtt_client = context.mqtt_client
+            site_id = context.site_id
+            router_handler = context.router_handler
+
+            # Reuse existing state from context (survives hot-reload)
+            existing_nm = context.get_state("node_manager")
+            existing_connections = context.get_state("connections")
+            existing_node_managers = context.get_state("node_managers")
+            existing_registry = context.get_state("registry")
+            existing_conn = context.get_state("connection")
+        else:
+            # Legacy fallback: fish attributes from app.state.amy
+            target_tracker = None
+            event_bus = None
+            amy = getattr(getattr(app, 'state', None), 'amy', None)
+            if amy is not None:
+                target_tracker = getattr(amy, 'target_tracker', None)
+                event_bus = getattr(amy, 'event_bus', None)
+            if target_tracker is None:
+                target_tracker = getattr(app, 'target_tracker', None)
+            if event_bus is None:
+                event_bus = getattr(app, 'event_bus', None)
+
+            mqtt_client = getattr(app, 'mqtt_bridge', None)
+            if mqtt_client is None:
+                mqtt_client = getattr(getattr(app, 'state', None), 'mqtt_bridge', None)
+
+            site_id = getattr(app, 'site_id', 'home')
+            router_handler = app if (app and hasattr(app, 'include_router')) else None
+
+            existing_nm = getattr(getattr(app, 'state', None), 'meshtastic_node_manager', None)
+            existing_connections = getattr(getattr(app, 'state', None), 'meshtastic_connections', None)
+            existing_node_managers = getattr(getattr(app, 'state', None), 'meshtastic_node_managers', None)
+            existing_registry = getattr(getattr(app, 'state', None), 'meshtastic_registry', None)
+            existing_conn = getattr(getattr(app, 'state', None), 'meshtastic_connection', None)
+
         if target_tracker:
             log.info("Meshtastic addon wired to TargetTracker")
         else:
             log.warning("Meshtastic addon: no TargetTracker found — mesh nodes will not appear on tactical map")
 
-        # Reuse existing node_manager from app.state if available (preserves nodes across hot-reload)
-        existing_nm = getattr(getattr(app, 'state', None), 'meshtastic_node_manager', None)
+        # Reuse existing node_manager if available (preserves nodes across hot-reload)
         if existing_nm and existing_nm.nodes:
             log.info(f"Reusing existing NodeManager with {len(existing_nm.nodes)} nodes")
             self.node_manager = existing_nm
@@ -122,16 +151,12 @@ class MeshtasticAddon(SensorAddon):
                 event_bus=event_bus,
                 target_tracker=target_tracker,
             )
-        if hasattr(app, 'state'):
-            app.state.meshtastic_node_manager = self.node_manager
 
-        # Reuse existing connections from app.state if available (survives hot-reload)
-        existing_connections = getattr(getattr(app, 'state', None), 'meshtastic_connections', None)
-        existing_registry = getattr(getattr(app, 'state', None), 'meshtastic_registry', None)
+        # Reuse existing connections if available (survives hot-reload)
         if existing_connections and isinstance(existing_connections, dict):
-            log.info(f"Reusing {len(existing_connections)} existing Meshtastic connections from app.state")
+            log.info(f"Reusing {len(existing_connections)} existing Meshtastic connections")
             self._connections = existing_connections
-            self._node_managers = getattr(getattr(app, 'state', None), 'meshtastic_node_managers', {})
+            self._node_managers = existing_node_managers if isinstance(existing_node_managers, dict) else {}
             if existing_registry:
                 self.registry = existing_registry
             # Update event_bus and node_manager refs on all existing connections
@@ -183,10 +208,9 @@ class MeshtasticAddon(SensorAddon):
                 self._connections[default_id] = conn
                 log.info("No serial ports detected — created default connection for manual connect")
 
-        # Also support legacy single-connection from app.state
-        existing_conn = getattr(getattr(app, 'state', None), 'meshtastic_connection', None)
+        # Also support legacy single-connection from persisted state
         if existing_conn and existing_conn.interface is not None:
-            log.info("Reusing legacy single Meshtastic connection from app.state")
+            log.info("Reusing legacy single Meshtastic connection")
             # Add it to our multi-radio tracking if not already there
             legacy_id = "mesh-legacy"
             if legacy_id not in self._connections:
@@ -207,27 +231,15 @@ class MeshtasticAddon(SensorAddon):
         # Set self.connection as alias to primary (first/connected) radio
         self.connection = self._get_primary_connection()
 
-        # Store on app.state so they survive hot-reload
-        if hasattr(app, 'state'):
-            app.state.meshtastic_connection = self.connection
-            app.state.meshtastic_connections = self._connections
-            app.state.meshtastic_node_managers = self._node_managers
-            app.state.meshtastic_registry = self.registry
-
         # Device manager for config/firmware/control (uses primary connection)
         self.device_manager = DeviceManager(self.connection)
 
         # Message bridge — bidirectional mesh <-> Tritium messaging
-        mqtt_bridge = getattr(app, 'mqtt_bridge', None)
-        if mqtt_bridge is None:
-            mqtt_bridge = getattr(getattr(app, 'state', None), 'mqtt_bridge', None)
-        site_id = getattr(app, 'site_id', 'home')
-
         self.message_bridge = MessageBridge(
             connection=self.connection,
             node_manager=self.node_manager,
             event_bus=event_bus,
-            mqtt_bridge=mqtt_bridge,
+            mqtt_bridge=mqtt_client,
             site_id=site_id,
             data_store=self.data_store,
         )
@@ -239,13 +251,13 @@ class MeshtasticAddon(SensorAddon):
             connections=self._connections,
             node_managers=self._node_managers,
         )
-        if hasattr(app, 'include_router'):
-            app.include_router(router, prefix="/api/addons/meshtastic", tags=["meshtastic"])
+        if router_handler is not None and hasattr(router_handler, 'include_router'):
+            router_handler.include_router(router, prefix="/api/addons/meshtastic", tags=["meshtastic"])
 
             # Add device management routes
             from .device_manager import create_device_routes
             device_router = create_device_routes(self.device_manager)
-            app.include_router(device_router, prefix="/api/addons/meshtastic", tags=["meshtastic-device"])
+            router_handler.include_router(device_router, prefix="/api/addons/meshtastic", tags=["meshtastic-device"])
 
         # Initialize persistent data store
         self.data_store = MeshtasticDataStore()
@@ -289,15 +301,30 @@ class MeshtasticAddon(SensorAddon):
 
         # Update primary connection alias after auto-connect
         self.connection = self._get_primary_connection()
-        if hasattr(app, 'state'):
+
+        # Persist state for hot-reload via context or app.state
+        state_dict = {
+            "node_manager": self.node_manager,
+            "connection": self.connection,
+            "connections": self._connections,
+            "node_managers": self._node_managers,
+            "registry": self.registry,
+        }
+        if context is not None:
+            for key, value in state_dict.items():
+                context.set_state(key, value)
+        elif app is not None and hasattr(app, 'state'):
+            app.state.meshtastic_node_manager = self.node_manager
             app.state.meshtastic_connection = self.connection
+            app.state.meshtastic_connections = self._connections
+            app.state.meshtastic_node_managers = self._node_managers
+            app.state.meshtastic_registry = self.registry
 
         # Register message bridge callbacks after connection attempt
         self.message_bridge.register_callbacks()
 
         # Wire up MQTT bridge for remote Meshtastic radios (only if MQTT supports subscribe)
         self._mqtt_remote_bridge = None
-        mqtt_client = mqtt_bridge  # already resolved above
         if mqtt_client is not None and hasattr(mqtt_client, 'subscribe'):
             try:
                 from .mqtt_bridge import MeshtasticMQTTBridge
@@ -319,7 +346,7 @@ class MeshtasticAddon(SensorAddon):
         self._stats_task = asyncio.create_task(self._stats_loop())
         self._background_tasks.append(self._stats_task)
 
-    async def unregister(self, app):
+    async def unregister(self, app=None, *, context=None):
         # Stop MQTT remote bridge
         if self._mqtt_remote_bridge:
             self._mqtt_remote_bridge.stop()
@@ -342,6 +369,13 @@ class MeshtasticAddon(SensorAddon):
             await self.data_store.close()
             self.data_store = None
         self.node_manager = None
+
+        # Clean up persisted state
+        if context is not None:
+            for key in ("node_manager", "connection", "connections",
+                        "node_managers", "registry"):
+                context.set_state(key, None)
+
         await super().unregister(app)
 
     async def gather(self):

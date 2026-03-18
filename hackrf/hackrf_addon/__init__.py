@@ -9,6 +9,11 @@ using HackRF One hardware via subprocess wrappers (no Python bindings).
 
 from tritium_lib.sdk import SensorAddon, AddonInfo, AddonGeoLayer, DeviceRegistry, DeviceState, SubprocessManager
 
+try:
+    from tritium_lib.sdk.context import AddonContext
+except ImportError:
+    AddonContext = None  # SDK agent building in parallel — fall back to app pattern
+
 from .data_store import HackRFDataStore
 from .device import HackRFDevice, detect_all_hackrfs
 from .spectrum import SpectrumAnalyzer
@@ -64,7 +69,7 @@ class HackRFAddon(SensorAddon):
         self.target_tracker = None
         self._poll_task = None
 
-    async def register(self, app):
+    async def register(self, app=None, *, context=None):
         await super().register(app)
 
         import logging
@@ -74,13 +79,27 @@ class HackRFAddon(SensorAddon):
         self.subprocess_mgr.kill_all()
         self._kill_orphan_processes()
 
-        # Resolve target_tracker from app.state.amy (same pattern as meshtastic addon)
-        target_tracker = None
-        amy = getattr(getattr(app, 'state', None), 'amy', None)
-        if amy is not None:
-            target_tracker = getattr(amy, 'target_tracker', None)
-        if target_tracker is None:
-            target_tracker = getattr(app, 'target_tracker', None)
+        # --- Resolve dependencies from context (preferred) or app (legacy) ---
+        if context is not None:
+            target_tracker = context.target_tracker
+            mqtt_client = context.mqtt_client
+            site_id = context.site_id
+            router_handler = context.router_handler
+        else:
+            # Legacy fallback: fish attributes from app.state.amy
+            target_tracker = None
+            amy = getattr(getattr(app, 'state', None), 'amy', None)
+            if amy is not None:
+                target_tracker = getattr(amy, 'target_tracker', None)
+            if target_tracker is None:
+                target_tracker = getattr(app, 'target_tracker', None)
+
+            mqtt_client = getattr(getattr(app, 'state', None), 'mqtt_bridge', None)
+            if mqtt_client is None:
+                mqtt_client = getattr(app, 'mqtt_bridge', None)
+
+            site_id = getattr(app, 'site_id', 'home')
+            router_handler = app if (app and hasattr(app, 'include_router')) else None
 
         self.target_tracker = target_tracker
         # Wire ADS-B decoder to target tracker for live aircraft updates
@@ -183,18 +202,14 @@ class HackRFAddon(SensorAddon):
             radio_locks=self._radio_locks,
             signal_dbs=self._signal_dbs,
         )
-        if hasattr(app, 'include_router'):
-            app.include_router(router, prefix="/api/addons/hackrf", tags=["hackrf"])
+        if router_handler is not None and hasattr(router_handler, 'include_router'):
+            router_handler.include_router(router, prefix="/api/addons/hackrf", tags=["hackrf"])
 
         # Wire up MQTT bridge for remote HackRF devices (only if MQTT supports subscribe)
         self._mqtt_bridge = None
-        mqtt_client = getattr(getattr(app, 'state', None), 'mqtt_bridge', None)
-        if mqtt_client is None:
-            mqtt_client = getattr(app, 'mqtt_bridge', None)
         if mqtt_client is not None and hasattr(mqtt_client, 'subscribe'):
             try:
                 from .mqtt_bridge import HackRFMQTTBridge
-                site_id = getattr(app, 'site_id', 'home')
                 self._mqtt_bridge = HackRFMQTTBridge(
                     self.registry, self._spectrum_instances, self._signal_dbs,
                     site_id=site_id,
@@ -204,12 +219,27 @@ class HackRFAddon(SensorAddon):
             except Exception as e:
                 log.debug(f"HackRF MQTT bridge not started (non-fatal): {e}")
 
+        # Persist state for hot-reload via context or app.state
+        state_dict = {
+            "registry": self.registry,
+            "device_instances": self._device_instances,
+            "spectrum_instances": self._spectrum_instances,
+            "radio_locks": self._radio_locks,
+            "signal_dbs": self._signal_dbs,
+        }
+        if context is not None:
+            for key, value in state_dict.items():
+                context.set_state(key, value)
+        elif app is not None and hasattr(app, 'state'):
+            for key, value in state_dict.items():
+                setattr(app.state, f"hackrf_{key}", value)
+
         # Start background polling for spectrum data
         import asyncio
         self._poll_task = asyncio.create_task(self._poll_loop())
         self._background_tasks.append(self._poll_task)
 
-    async def unregister(self, app):
+    async def unregister(self, app=None, *, context=None):
         # Stop MQTT bridge
         if self._mqtt_bridge:
             self._mqtt_bridge.stop()
@@ -237,6 +267,12 @@ class HackRFAddon(SensorAddon):
         if self.data_store:
             await self.data_store.close()
             self.data_store = None
+
+        # Clean up persisted state
+        if context is not None:
+            for key in ("registry", "device_instances", "spectrum_instances",
+                        "radio_locks", "signal_dbs"):
+                context.set_state(key, None)
 
         # Kill all tracked subprocesses and disconnect devices
         self.subprocess_mgr.kill_all()

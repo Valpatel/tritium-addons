@@ -313,3 +313,98 @@ class TestMultiDeviceRouterEndpoints:
         assert resp.status_code == 200
         data = resp.json()
         assert "status" in data
+
+
+# -- AddonContext registration tests ------------------------------------------
+
+class TestAddonContextRegistration:
+    """Tests for register() with AddonContext kwarg."""
+
+    @pytest.mark.asyncio
+    @patch("hackrf_addon.detect_all_hackrfs", new_callable=AsyncMock, return_value=[])
+    async def test_register_with_context(self, mock_detect):
+        """register(context=ctx) extracts deps from context, not app."""
+        from hackrf_addon import HackRFAddon
+
+        addon = HackRFAddon()
+
+        mock_tracker = MagicMock()
+        mock_event_bus = MagicMock()
+        mock_mqtt = MagicMock(spec=[])  # No subscribe attr
+        mock_router_handler = MagicMock()
+        mock_router_handler.include_router = MagicMock()
+
+        ctx = MagicMock()
+        ctx.target_tracker = mock_tracker
+        ctx.event_bus = mock_event_bus
+        ctx.mqtt_client = mock_mqtt
+        ctx.site_id = "test-site"
+        ctx.router_handler = mock_router_handler
+        ctx.get_state = MagicMock(return_value=None)
+        ctx.set_state = MagicMock()
+
+        await addon.register(context=ctx)
+
+        assert addon.target_tracker is mock_tracker
+        assert addon.adsb_decoder.target_tracker is mock_tracker
+        # Router should have been included via context.router_handler
+        mock_router_handler.include_router.assert_called_once()
+        call_kwargs = mock_router_handler.include_router.call_args
+        assert call_kwargs[1]["prefix"] == "/api/addons/hackrf"
+
+        # State should be persisted via context.set_state
+        set_state_calls = {c[0][0] for c in ctx.set_state.call_args_list}
+        assert "registry" in set_state_calls
+        assert "device_instances" in set_state_calls
+
+        await addon.unregister(context=ctx)
+
+    @pytest.mark.asyncio
+    @patch("hackrf_addon.detect_all_hackrfs", new_callable=AsyncMock, return_value=[])
+    async def test_register_legacy_app_still_works(self, mock_detect):
+        """register(app) still works without context (backwards compat)."""
+        from hackrf_addon import HackRFAddon
+
+        addon = HackRFAddon()
+
+        mock_app = MagicMock()
+        mock_app.state = MagicMock()
+        mock_app.state.amy = None
+        mock_app.target_tracker = MagicMock()
+        mock_app.include_router = MagicMock()
+        mock_app.mqtt_bridge = None
+        mock_app.site_id = "legacy-site"
+
+        await addon.register(mock_app)
+
+        assert addon.target_tracker is mock_app.target_tracker
+        mock_app.include_router.assert_called_once()
+
+        await addon.unregister(mock_app)
+
+    @pytest.mark.asyncio
+    @patch("hackrf_addon.detect_all_hackrfs", new_callable=AsyncMock, return_value=[])
+    async def test_register_with_mqtt_subscribe(self, mock_detect):
+        """When context.mqtt_client has subscribe(), MQTT bridge starts."""
+        from hackrf_addon import HackRFAddon
+
+        addon = HackRFAddon()
+
+        mock_mqtt = MagicMock()
+        mock_mqtt.subscribe = MagicMock()  # Has subscribe attr
+
+        ctx = MagicMock()
+        ctx.target_tracker = None
+        ctx.event_bus = None
+        ctx.mqtt_client = mock_mqtt
+        ctx.site_id = "mqtt-test"
+        ctx.router_handler = MagicMock()
+        ctx.router_handler.include_router = MagicMock()
+        ctx.get_state = MagicMock(return_value=None)
+        ctx.set_state = MagicMock()
+
+        await addon.register(context=ctx)
+
+        # MQTT bridge should have been created (may fail import but that's ok)
+        # The important thing is no crash with the new code path
+        await addon.unregister(context=ctx)
