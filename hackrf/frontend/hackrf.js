@@ -1030,7 +1030,33 @@ export const HackRFPanelDef = {
 
         // ── SIGNALS tab ────────────────────────────────────────────
         function renderSignals() {
-            const filtered = (signals || []).filter(s => s.power_dbm >= signalThreshold);
+            // If no signals from API, derive peaks from live sweep data
+            let src = signals || [];
+            if (src.length === 0 && sweepData && sweepData.freqs && sweepData.freqs.length > 0) {
+                const now = Date.now() / 1000;
+                for (let i = 0; i < sweepData.freqs.length; i++) {
+                    const pwr = sweepData.powers[i];
+                    if (pwr >= signalThreshold) {
+                        src.push({
+                            freq_mhz: sweepData.freqs[i] / 1e6,
+                            power_dbm: pwr,
+                            first_seen: now,
+                            last_seen: now,
+                            duration_s: 0,
+                        });
+                    }
+                }
+                // Deduplicate: keep strongest per 1 MHz bucket
+                const buckets = {};
+                for (const s of src) {
+                    const key = Math.round(s.freq_mhz);
+                    if (!buckets[key] || s.power_dbm > buckets[key].power_dbm) {
+                        buckets[key] = s;
+                    }
+                }
+                src = Object.values(buckets);
+            }
+            const filtered = src.filter(s => s.power_dbm >= signalThreshold);
             filtered.sort((a, b) => {
                 const av = a[signalSortKey]; const bv = b[signalSortKey];
                 if (av == null && bv == null) return 0;
