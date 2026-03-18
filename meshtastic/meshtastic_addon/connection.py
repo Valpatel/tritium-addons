@@ -495,14 +495,40 @@ class ConnectionManager:
 
         log.warning(f"BLE connection failed after {max_retries} attempts")
         self.is_connected = False
-        # Fall through to the existing error handler below
-        e = Exception(f"BLE connection failed after {max_retries} attempts")
+        # Meshtastic library BLE failed — try direct bleak connection as fallback
+        log.info("BLE: meshtastic library failed, trying direct bleak connection...")
         try:
-            raise e
+            from .ble_direct import DirectBLEConnection
+            direct = DirectBLEConnection()
+            ok = await direct.connect(address=address, timeout=timeout, retries=2)
+            if ok and direct.nodes:
+                # Import nodes from direct BLE pull into our node_manager
+                if self.node_manager:
+                    for nid, node_data in direct.nodes.items():
+                        self.node_manager.nodes[nid] = node_data
+                    log.info(f"BLE direct: imported {len(direct.nodes)} nodes "
+                             f"({sum(1 for n in direct.nodes.values() if n.get('lat'))} GPS)")
+                self._is_connected = True
+                self.transport_type = "ble"
+                self.port = address or "auto"
+                self.device_info = direct.device_info
+                self.device_info["battery"] = direct.battery
+                self._direct_ble = direct  # Keep reference for later reads
+                if self.event_bus:
+                    self.event_bus.publish("meshtastic:connected", {
+                        "transport": "ble_direct", "address": address,
+                        "device": self.device_info,
+                        "node_count": len(direct.nodes),
+                    })
+                return
+            else:
+                await direct.disconnect()
+                log.warning("BLE direct: connection succeeded but no nodes received")
         except Exception as e:
-            log.warning(f"BLE connection failed: {e}")
-            self._close_interface()
-            self.is_connected = False
+            log.warning(f"BLE direct fallback also failed: {e}")
+
+        log.warning(f"BLE connection failed via all methods")
+        self.is_connected = False
 
     async def connect_mqtt(
         self,

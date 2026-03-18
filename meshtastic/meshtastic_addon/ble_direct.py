@@ -4,15 +4,22 @@
 """Direct BLE connection to Meshtastic devices using bleak.
 
 Bypasses the meshtastic library's BLEInterface which has service discovery
-race conditions on Linux/BlueZ. Speaks the meshtastic protobuf protocol
-directly over GATT characteristics.
+race conditions on Linux/BlueZ. Uses the proven approach: scan first to get
+a BLEDevice object, then pass it to BleakClient (not an address string).
+
+Usage::
+
+    conn = DirectBLEConnection()
+    if await conn.connect("10:20:BA:33:FF:39"):
+        nodes = conn.nodes
+        print(f"Got {len(nodes)} nodes, our position: {conn.my_position}")
+    await conn.disconnect()
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import struct
 import time
 from typing import Any, Callable
 
@@ -27,41 +34,51 @@ BATTERY_UUID = "00002a19-0000-1000-8000-00805f9b34fb"
 
 
 class DirectBLEConnection:
-    """Connect to a Meshtastic device via BLE using bleak directly.
+    """Connect to a Meshtastic device via BLE and pull node data.
 
-    Usage::
-
-        conn = DirectBLEConnection()
-        await conn.connect("D8:85:AC:A9:DF:7D")
-        nodes = await conn.request_nodes()
-        await conn.disconnect()
+    This implementation:
+    1. Scans for BLE devices to get a BLEDevice object (critical for BlueZ)
+    2. Connects using the BLEDevice object (not address string)
+    3. Sends want_config to trigger the meshtastic protocol exchange
+    4. Drains all fromradio packets and parses with meshtastic protobuf
+    5. Extracts nodes, positions, device info
     """
 
     def __init__(self):
         self._client = None
         self._address: str = ""
         self._connected: bool = False
-        self._node_id: str = ""
+        self._my_node_num: int | None = None
+        self._nodes: dict[str, dict] = {}
         self._device_info: dict = {}
-        self._nodes: dict = {}
-        self._on_packet: Callable | None = None
-        self._fromradio_buffer: list[bytes] = []
+        self._battery: int | None = None
+        self._firmware: str = ""
 
     @property
     def is_connected(self) -> bool:
         return self._connected and self._client is not None and self._client.is_connected
 
     @property
-    def address(self) -> str:
-        return self._address
+    def nodes(self) -> dict[str, dict]:
+        return self._nodes
+
+    @property
+    def my_position(self) -> tuple[float, float] | None:
+        """Our node's GPS position as (lat, lng), or None."""
+        if self._my_node_num:
+            nid = f"!{self._my_node_num:08x}"
+            node = self._nodes.get(nid)
+            if node and node.get("lat") and node["lat"] != 0:
+                return (node["lat"], node["lng"])
+        return None
 
     @property
     def device_info(self) -> dict:
         return self._device_info
 
     @property
-    def nodes(self) -> dict:
-        return self._nodes
+    def battery(self) -> int | None:
+        return self._battery
 
     async def scan(self, timeout: float = 8.0) -> list[dict]:
         """Scan for Meshtastic BLE devices."""
@@ -75,64 +92,109 @@ class DirectBLEConnection:
                     "address": dev.address,
                     "name": dev.name or "",
                     "rssi": adv.rssi,
+                    "_ble_device": dev,  # Keep BLEDevice for connection
                 })
         return results
 
-    async def connect(self, address: str, timeout: float = 15.0) -> bool:
+    async def connect(self, address: str = "", timeout: float = 15.0, retries: int = 3) -> bool:
         """Connect to a Meshtastic device via BLE.
 
-        Handles the BlueZ service discovery race by:
-        1. Connecting without service discovery timeout
-        2. Reading battery char to verify GATT is working
-        3. Starting meshtastic protocol exchange
+        Args:
+            address: BLE address (e.g., "10:20:BA:33:FF:39"). If empty, connects to first found.
+            timeout: Connection timeout per attempt.
+            retries: Number of connection attempts.
         """
         from bleak import BleakClient
 
-        self._address = address
-        logger.info(f"BLE direct: connecting to {address}...")
+        # Step 1: Scan to get BLEDevice (critical for BlueZ reliability)
+        logger.info(f"BLE: scanning for {address or 'any Meshtastic device'}...")
+        devices = await self.scan(timeout=8.0)
+        if not devices:
+            logger.warning("BLE: no Meshtastic devices found")
+            return False
+
+        target = None
+        if address:
+            addr_upper = address.upper()
+            for d in devices:
+                if d["address"].upper() == addr_upper:
+                    target = d
+                    break
+        if not target:
+            # Pick strongest signal
+            target = max(devices, key=lambda d: d["rssi"])
+
+        ble_device = target["_ble_device"]
+        self._address = target["address"]
+        logger.info(f"BLE: connecting to {target['name']} ({target['address']}) RSSI={target['rssi']}")
+
+        # Step 2: Connect with retries (BLE is inherently unreliable)
+        for attempt in range(1, retries + 1):
+            try:
+                self._client = BleakClient(ble_device, timeout=timeout)
+                await self._client.connect()
+                if self._client.is_connected:
+                    self._connected = True
+                    logger.info(f"BLE: connected on attempt {attempt}")
+                    break
+            except Exception as e:
+                logger.warning(f"BLE: attempt {attempt}/{retries} failed: {e}")
+                if attempt < retries:
+                    await asyncio.sleep(2)
+
+        if not self._connected:
+            logger.warning("BLE: all connection attempts failed")
+            return False
+
+        # Step 3: Read battery
+        try:
+            bat_data = await self._client.read_gatt_char(BATTERY_UUID)
+            self._battery = int(bat_data[0]) if bat_data else None
+        except Exception:
+            pass
+
+        # Step 4: Subscribe to notifications and send want_config
+        notify_event = asyncio.Event()
+        try:
+            await self._client.start_notify(FROMNUM_UUID, lambda s, d: notify_event.set())
+        except Exception:
+            pass
 
         try:
-            self._client = BleakClient(address, timeout=timeout)
-            await self._client.connect()
-
-            if not self._client.is_connected:
-                logger.warning("BLE connect returned but not connected")
-                return False
-
-            self._connected = True
-            logger.info(f"BLE direct: connected to {address}")
-
-            # Read battery to verify GATT works
-            try:
-                bat_data = await self._client.read_gatt_char(BATTERY_UUID)
-                self._device_info["battery"] = int(bat_data[0]) if bat_data else None
-                logger.info(f"BLE direct: battery={self._device_info['battery']}%")
-            except Exception as e:
-                logger.debug(f"Battery read skipped: {e}")
-
-            # Subscribe to fromnum notifications (tells us when data is available)
-            try:
-                await self._client.start_notify(FROMNUM_UUID, self._on_fromnum)
-            except Exception as e:
-                logger.debug(f"FromNum notify skipped: {e}")
-
-            # Send want_config to start protocol exchange
-            await self._send_want_config()
-
-            # Read initial responses
-            await self._drain_fromradio(max_reads=50, timeout=5.0)
-
-            return True
-
+            await self._client.write_gatt_char(TORADIO_UUID, b"\x18\x01", response=True)
+            logger.debug("BLE: want_config sent")
         except Exception as e:
-            logger.warning(f"BLE direct connect failed: {e}")
-            self._connected = False
-            if self._client:
-                try:
-                    await self._client.disconnect()
-                except Exception:
-                    pass
-            return False
+            logger.warning(f"BLE: want_config failed: {e}")
+            return True  # Still connected, just can't pull config
+
+        # Step 5: Wait for notification then drain all packets
+        try:
+            await asyncio.wait_for(notify_event.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            pass
+
+        packets = []
+        empty_count = 0
+        for _ in range(500):
+            try:
+                data = await self._client.read_gatt_char(FROMRADIO_UUID)
+                if not data or len(data) == 0:
+                    empty_count += 1
+                    if empty_count > 5 and packets:
+                        break
+                    await asyncio.sleep(0.05)
+                    continue
+                empty_count = 0
+                packets.append(data)
+            except Exception:
+                await asyncio.sleep(0.1)
+
+        logger.info(f"BLE: received {len(packets)} packets")
+
+        # Step 6: Parse with meshtastic protobuf
+        self._parse_packets(packets)
+
+        return True
 
     async def disconnect(self):
         """Disconnect from the BLE device."""
@@ -143,80 +205,62 @@ class DirectBLEConnection:
             except Exception:
                 pass
             self._client = None
-        logger.info(f"BLE direct: disconnected from {self._address}")
+        logger.info(f"BLE: disconnected from {self._address}")
 
-    async def _send_want_config(self):
-        """Send a want_config_id packet to start the meshtastic handshake."""
-        # ToRadio protobuf: field 3 (want_config_id) = uint32
-        # Protobuf encoding: field 3, wire type 0 (varint), value 1
-        want_config = b"\x18\x01"  # field_number=3, varint=1
+    def _parse_packets(self, packets: list[bytes]):
+        """Parse meshtastic fromradio packets into nodes and device info."""
         try:
-            await self._client.write_gatt_char(TORADIO_UUID, want_config, response=True)
-            logger.debug("Sent want_config")
-        except Exception as e:
-            logger.warning(f"Failed to send want_config: {e}")
+            from meshtastic.protobuf import mesh_pb2
+        except ImportError:
+            logger.warning("meshtastic protobuf not available — can't parse packets")
+            return
 
-    async def _drain_fromradio(self, max_reads: int = 100, timeout: float = 10.0):
-        """Read all available fromradio packets."""
-        start = time.monotonic()
-        empty_count = 0
-
-        for _ in range(max_reads):
-            if time.monotonic() - start > timeout:
-                break
+        for pkt in packets:
             try:
-                data = await self._client.read_gatt_char(FROMRADIO_UUID)
-                if not data or len(data) == 0:
-                    empty_count += 1
-                    if empty_count > 3:
-                        break
-                    await asyncio.sleep(0.1)
-                    continue
-                empty_count = 0
-                self._process_fromradio(data)
+                fr = mesh_pb2.FromRadio()
+                fr.ParseFromString(pkt)
+                variant = fr.WhichOneof("payload_variant")
+
+                if variant == "my_info":
+                    self._my_node_num = fr.my_info.my_node_num
+                    self._device_info["my_node_num"] = fr.my_info.my_node_num
+                    self._device_info["node_id"] = f"!{fr.my_info.my_node_num:08x}"
+
+                elif variant == "node_info":
+                    ni = fr.node_info
+                    u = ni.user
+                    p = ni.position
+                    dm = ni.device_metrics
+                    nid = f"!{ni.num:08x}"
+
+                    self._nodes[nid] = {
+                        "node_id": nid,
+                        "num": ni.num,
+                        "long_name": u.long_name,
+                        "short_name": u.short_name,
+                        "hw_model": str(u.hw_model),
+                        "lat": p.latitude_i / 1e7 if p.latitude_i else None,
+                        "lng": p.longitude_i / 1e7 if p.longitude_i else None,
+                        "altitude": p.altitude if p.altitude else None,
+                        "battery": dm.battery_level if dm.battery_level else None,
+                        "voltage": dm.voltage if dm.voltage else None,
+                        "snr": ni.snr if ni.snr else None,
+                        "last_heard": ni.last_heard if ni.last_heard else int(time.time()),
+                        "channel_util": dm.channel_utilization if dm.channel_utilization else None,
+                        "air_util": dm.air_util_tx if dm.air_util_tx else None,
+                    }
+
+                elif variant == "metadata":
+                    m = fr.metadata
+                    self._firmware = m.firmware_version
+                    self._device_info["firmware"] = m.firmware_version
+                    self._device_info["hw_model"] = str(m.hw_model)
+
+                elif variant == "config_complete_id":
+                    logger.debug("BLE: config exchange complete")
+
             except Exception as e:
-                logger.debug(f"FromRadio read error: {e}")
-                break
+                logger.debug(f"BLE: packet parse error: {e}")
 
-    def _process_fromradio(self, data: bytes):
-        """Parse a fromradio protobuf packet (simplified)."""
-        # This is a simplified parser — it extracts node info from the raw bytes
-        # without needing the full protobuf library
-        self._fromradio_buffer.append(data)
-
-        # Try to extract node info from the raw data
-        try:
-            self._extract_node_info(data)
-        except Exception as e:
-            logger.debug(f"Packet parse error: {e}")
-
-    def _extract_node_info(self, data: bytes):
-        """Extract node information from raw meshtastic packet bytes."""
-        # Look for string patterns that indicate node names
-        # This is a heuristic approach — full protobuf parsing would be better
-        # but works for basic node discovery
-        pass
-
-    def _on_fromnum(self, sender, data: bytearray):
-        """Notification handler for fromnum characteristic."""
-        # fromnum tells us new data is available — trigger a read
-        pass
-
-    async def send_text(self, text: str, destination: int = 0xFFFFFFFF, channel: int = 0) -> bool:
-        """Send a text message over the mesh."""
-        if not self.is_connected:
-            return False
-        # Build text message protobuf
-        # For now, this is a stub — full implementation needs protobuf encoding
-        logger.warning("send_text via direct BLE not yet implemented — use serial connection")
-        return False
-
-    async def get_battery(self) -> int | None:
-        """Read battery level from BLE battery service."""
-        if not self.is_connected:
-            return None
-        try:
-            data = await self._client.read_gatt_char(BATTERY_UUID)
-            return int(data[0]) if data else None
-        except Exception:
-            return None
+        gps_count = sum(1 for n in self._nodes.values() if n.get("lat") and n["lat"] != 0)
+        logger.info(f"BLE: parsed {len(self._nodes)} nodes ({gps_count} with GPS)")

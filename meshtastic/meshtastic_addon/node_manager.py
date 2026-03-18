@@ -9,6 +9,11 @@ import logging
 import time
 from typing import Any, Optional
 
+try:
+    from tritium_lib.models.position_anchor import PositionAnchor
+except ImportError:
+    PositionAnchor = None  # type: ignore[assignment,misc]
+
 log = logging.getLogger("meshtastic.nodes")
 
 # Role names from the meshtastic protobuf
@@ -37,6 +42,7 @@ class NodeManager:
         self._last_update = 0.0
         self._local_node_id: str | None = None  # our own node ID
         self._hop_counts: dict[str, int] = {}  # node_id → estimated hop count
+        self._position_anchors: dict[str, Any] = {}  # anchor_id → PositionAnchor
 
     def set_local_node(self, node_id: str):
         """Set our own node ID for hop count estimation."""
@@ -77,6 +83,10 @@ class NodeManager:
                     self.target_tracker.update_from_mesh(t)
                 except Exception as e:
                     log.debug(f"Failed to update target tracker for {t.get('target_id')}: {e}")
+
+        # Create position anchors from GPS-equipped nodes
+        if updated > 0:
+            self._update_position_anchors()
 
         if self.event_bus and updated > 0:
             self.event_bus.publish("meshtastic:nodes_updated", {
@@ -128,6 +138,84 @@ class NodeManager:
                         self._hop_counts[node_id] = 2
                     else:
                         self._hop_counts[node_id] = 3
+
+    def _update_position_anchors(self):
+        """Create PositionAnchors from GPS-equipped mesh nodes."""
+        if PositionAnchor is None:
+            return
+
+        now = time.time()
+        anchors_created = 0
+
+        for node_id, node in self.nodes.items():
+            lat = node.get("lat")
+            lng = node.get("lng")
+            if lat is None or lng is None:
+                continue
+
+            anchor_id = f"mesh_{node_id.replace('!', '')}"
+            is_local = node_id == self._local_node_id
+
+            # GPS quality indicators
+            has_gps_time = node.get("gps_time") is not None
+            sats = node.get("gps_sats", 0)
+
+            # Confidence: local node > nodes with many sats > nodes with GPS time > others
+            if is_local:
+                confidence = 0.95
+            elif sats and sats >= 6:
+                confidence = 0.9
+            elif has_gps_time:
+                confidence = 0.85
+            else:
+                confidence = 0.7
+
+            # Stale positions lose confidence
+            last_heard = node.get("last_heard") or 0
+            age_s = now - last_heard if last_heard > 0 else 999999
+            if age_s > 3600:  # > 1 hour old
+                confidence *= 0.5
+            elif age_s > 600:  # > 10 min old
+                confidence *= 0.8
+
+            anchor = PositionAnchor(
+                anchor_id=anchor_id,
+                lat=lat,
+                lng=lng,
+                alt=node.get("altitude"),
+                source="gps",
+                confidence=round(min(1.0, confidence), 3),
+                timestamp=last_heard if last_heard > 0 else now,
+                device_id=node_id,
+                fixed=False,
+                label=node.get("long_name", node_id),
+            )
+
+            self._position_anchors[anchor_id] = anchor
+            anchors_created += 1
+
+            # Emit event for each new/updated anchor
+            if self.event_bus:
+                self.event_bus.publish("addon:meshtastic:position_anchor", {
+                    "anchor_id": anchor_id,
+                    "lat": lat,
+                    "lng": lng,
+                    "alt": node.get("altitude"),
+                    "confidence": anchor.confidence,
+                    "device_id": node_id,
+                    "label": anchor.label,
+                    "is_local": is_local,
+                })
+
+        if anchors_created > 0:
+            log.debug(
+                f"Updated {anchors_created} position anchors "
+                f"({len(self._position_anchors)} total)"
+            )
+
+    def get_position_anchors(self) -> list:
+        """Return all current position anchors from GPS-equipped nodes."""
+        return list(self._position_anchors.values())
 
     def get_targets(self) -> list[dict]:
         """Convert all nodes to Tritium target format."""
