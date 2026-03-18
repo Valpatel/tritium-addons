@@ -1,0 +1,35 @@
+[addon]
+id = "hackrf"
+name = "HackRF One SDR"
+version = "1.0.0"
+description = "Software Defined Radio with HackRF One — spectrum analyzer, FM receiver, signal monitoring"
+author = "Valpatel Software LLC"
+license = "AGPL-3.0"
+addon_api = ">=1.0, <2.0"
+
+[addon.category]
+window = "radio"
+tab_order = 2
+icon = "📻"
+
+[hardware]
+devices = ["hackrf-one"]
+auto_detect = true
+serial_vid_pid = ["1d50:6089"]
+
+[permissions]
+serial = false
+network = false
+usb = true
+
+[backend]
+module = "hackrf_addon"
+router_prefix = "/api/addons/hackrf"
+
+[frontend]
+panels = [
+    { id = "hackrf", title = "HACKRF SDR", file = "hackrf.js", tab_order = 1 },
+]
+layers = [
+    { id = "rfSpectrum", label = "RF Spectrum", category = "SDR", color = "#b060ff" },
+]

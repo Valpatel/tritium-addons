@@ -1,0 +1,1963 @@
+// Created by Matthew Valancy
+// Copyright 2026 Valpatel Software LLC
+// Licensed under AGPL-3.0 — see LICENSE for details.
+// MESHTASTIC — Full-featured management panel modeled on official Meshtastic apps.
+// Tabs: RADIO | MESSAGES | NODES | CHANNELS | CONFIG | MODULES
+// Auto-detects serial ports on open; auto-connects if exactly one radio found.
+
+import { EventBus } from '/static/js/command/events.js';
+import { _esc } from '/static/js/command/panel-utils.js';
+
+const API = '/api/addons/meshtastic';
+const REFRESH_MS = 5000;
+const MSG_CHAR_LIMIT = 228;
+
+// ─── Tab definitions ────────────────────────────────────────────────
+const TABS = [
+    { id: 'radio',    label: 'RADIO',    tip: 'Radio connection and device overview' },
+    { id: 'messages', label: 'MESSAGES', tip: 'Send and receive mesh messages' },
+    { id: 'nodes',    label: 'NODES',    tip: 'All discovered mesh nodes' },
+    { id: 'channels', label: 'CHANNELS', tip: 'Configure channel slots and encryption' },
+    { id: 'config',   label: 'CONFIG',   tip: 'Device settings: user, LoRa, position, power' },
+    { id: 'modules',  label: 'MODULES',  tip: 'Module configuration: MQTT, telemetry, serial' },
+    { id: 'firmware', label: 'FIRMWARE', tip: 'Firmware version, updates, and flashing' },
+];
+
+// ─── Node table columns ─────────────────────────────────────────────
+const NODE_COLS = [
+    { key: 'short_name', label: 'NAME',     width: '70px' },
+    { key: 'long_name',  label: 'LONG NAME', width: '120px' },
+    { key: 'hw_model',   label: 'HARDWARE',  width: '90px' },
+    { key: 'snr',        label: 'SNR',       width: '50px',  align: 'right' },
+    { key: 'battery',    label: 'BAT',       width: '50px',  align: 'right' },
+    { key: 'last_heard', label: 'LAST',      width: '60px',  align: 'right' },
+    { key: 'hopsAway',   label: 'HOPS',      width: '40px',  align: 'right' },
+    { key: 'distance',   label: 'DIST',      width: '60px',  align: 'right' },
+];
+
+// ─── Device role options (from meshtastic protobuf) ──────────────────
+const DEVICE_ROLES = [
+    'CLIENT', 'CLIENT_MUTE', 'ROUTER', 'ROUTER_CLIENT', 'REPEATER',
+    'TRACKER', 'SENSOR', 'TAK', 'CLIENT_HIDDEN', 'LOST_AND_FOUND', 'TAK_TRACKER',
+];
+
+const REGIONS = [
+    'UNSET', 'US', 'EU_433', 'EU_868', 'CN', 'JP', 'ANZ', 'KR', 'TW', 'RU',
+    'IN', 'NZ_865', 'TH', 'LORA_24', 'UA_433', 'UA_868', 'MY_433', 'MY_919',
+    'SG_923',
+];
+
+const MODEM_PRESETS = [
+    'LONG_FAST', 'LONG_SLOW', 'LONG_MODERATE', 'VERY_LONG_SLOW',
+    'SHORT_FAST', 'SHORT_SLOW', 'MEDIUM_FAST', 'MEDIUM_SLOW',
+];
+
+// ─── Panel definition ────────────────────────────────────────────────
+export const MeshtasticPanelDef = {
+    id: 'meshtastic',
+    title: 'MESHTASTIC',
+    defaultPosition: { x: 60, y: 80 },
+    defaultSize: { w: 600, h: 700 },
+
+    create(panel) {
+        const el = document.createElement('div');
+        el.className = 'msh-panel';
+        el.style.cssText = 'display:flex;flex-direction:column;height:100%;font-family:var(--font-mono,"JetBrains Mono",monospace);';
+
+        const tabHtml = TABS.map((t, i) =>
+            `<button class="msh-tab${i === 0 ? ' msh-tab-active' : ''}" data-tab="${t.id}" title="${t.tip}">${t.label}</button>`
+        ).join('');
+
+        el.innerHTML = `
+            <div class="msh-conn-bar">
+                <span class="msh-dot" data-bind="dot"></span>
+                <span class="msh-conn-label" data-bind="conn-label">DISCONNECTED</span>
+                <span style="flex:1"></span>
+                <span class="msh-conn-device" data-bind="conn-device"></span>
+                <span class="msh-conn-transport" data-bind="conn-transport"></span>
+                <select class="msh-port-select" data-bind="port-select" style="display:none"></select>
+                <button class="msh-btn msh-btn-connect" data-action="connect">CONNECT</button>
+                <button class="msh-btn msh-btn-disconnect" data-action="disconnect" style="display:none">DISCONNECT</button>
+            </div>
+            <div class="msh-tabs">${tabHtml}</div>
+            <div class="msh-body" data-bind="body"></div>
+        `;
+
+        return el;
+    },
+
+    mount(bodyEl, panel) {
+        const dot = bodyEl.querySelector('[data-bind="dot"]');
+        const connLabel = bodyEl.querySelector('[data-bind="conn-label"]');
+        const connDevice = bodyEl.querySelector('[data-bind="conn-device"]');
+        const connTransport = bodyEl.querySelector('[data-bind="conn-transport"]');
+        const portSelect = bodyEl.querySelector('[data-bind="port-select"]');
+        const connectBtn = bodyEl.querySelector('[data-action="connect"]');
+        const disconnectBtn = bodyEl.querySelector('[data-action="disconnect"]');
+        const tabContainer = bodyEl.querySelector('.msh-tabs');
+        const body = bodyEl.querySelector('[data-bind="body"]');
+
+        let activeTab = 'radio';
+        let connected = false;
+        let status = {};
+        let nodes = [];
+        let messages = [];
+        let deviceInfo = {};
+        let channels = [];
+        let moduleConfig = {};
+        let ports = [];
+        let bleDevices = [];
+        let firmwareInfo = {};
+        let firmwareVersions = [];
+        let nodeSortKey = 'last_heard';
+        let nodeSortDir = -1;
+        let selectedChannel = 0; // for message channel selector
+        let channelEditIndex = -1; // which channel slot is being edited
+        let chatOnlyFilter = true; // filter system messages by default
+        let deviceInfoFetched = false; // track if we've fetched device info this session
+        let nodeSearchText = '';
+        let selectedNodeId = null; // for detail overlay
+
+        _injectStyles();
+
+        // Load cached data from localStorage
+        const cached = localStorage.getItem('tritium.meshtastic.cache');
+        if (cached) {
+            try {
+                const c = JSON.parse(cached);
+                if (c.deviceInfo) deviceInfo = c.deviceInfo;
+                if (c.nodes) nodes = c.nodes;
+                if (c.status) updateConnection(c.status);
+            } catch (_) {}
+        }
+
+        // ── Tab switching ───────────────────────────────────────
+        tabContainer.addEventListener('click', (e) => {
+            const btn = e.target.closest('.msh-tab');
+            if (btn === null) return;
+            activeTab = btn.dataset.tab;
+            tabContainer.querySelectorAll('.msh-tab').forEach(t =>
+                t.classList.toggle('msh-tab-active', t.dataset.tab === activeTab)
+            );
+            renderBody();
+        });
+
+        // ── Connect button ──────────────────────────────────────
+        connectBtn.addEventListener('click', async () => {
+            connectBtn.disabled = true;
+            connectBtn.textContent = 'CONNECTING...';
+            try {
+                const payload = { transport: 'serial', timeout: 60 };
+                if (portSelect.style.display !== 'none' && portSelect.value) {
+                    payload.port = portSelect.value;
+                }
+                const r = await fetch(API + '/connect', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                });
+                if (r.ok) {
+                    const d = await r.json();
+                    updateConnection(d);
+                    fetchAll();
+                    fetchDeviceInfo();
+                    fetchChannels();
+                    fetchModuleConfig();
+                }
+            } catch (_) { /* network error */ }
+            connectBtn.disabled = false;
+            connectBtn.textContent = 'CONNECT';
+        });
+
+        disconnectBtn.addEventListener('click', async () => {
+            try { await fetch(API + '/disconnect', { method: 'POST' }); } catch (_) { /* ok */ }
+            updateConnection({ connected: false, transport: 'none', port: '', device: {} });
+        });
+
+        // ── Connection state ────────────────────────────────────
+        function updateConnection(d) {
+            if (d === null || d === undefined) return;
+            connected = d.connected || false;
+            status = d;
+            dot.className = connected ? 'msh-dot msh-dot-on' : 'msh-dot';
+            dot.title = connected ? `Connected via ${_esc(d.transport || 'unknown')}` : 'Disconnected';
+            connLabel.textContent = connected ? 'CONNECTED' : 'DISCONNECTED';
+            connLabel.style.color = connected ? '#05ffa1' : '#888';
+            const dev = d.device || {};
+            connDevice.textContent = connected ? _esc(dev.long_name || dev.short_name || dev.hw_model || '') : '';
+            connTransport.textContent = connected ? `${_esc(d.transport || '')} ${_esc(d.port || '')}` : '';
+            connectBtn.style.display = connected ? 'none' : '';
+            disconnectBtn.style.display = connected ? '' : 'none';
+            portSelect.style.display = (connected || ports.length <= 1) ? 'none' : '';
+            // Save to saved radios if connected
+            if (connected && d.port) {
+                _saveRadioToHistory(d.port, d.transport || 'serial', dev.long_name || dev.short_name || '');
+            }
+        }
+
+        // ── Data fetching ───────────────────────────────────────
+        function _saveCache() {
+            try {
+                localStorage.setItem('tritium.meshtastic.cache', JSON.stringify({
+                    status, deviceInfo, nodes, timestamp: Date.now(),
+                }));
+            } catch (_) {}
+        }
+
+        // ── Saved radios (localStorage) ───────────────────────────
+        function _getSavedRadios() {
+            try {
+                const raw = localStorage.getItem('tritium.meshtastic.saved_radios');
+                return raw ? JSON.parse(raw) : [];
+            } catch (_) { return []; }
+        }
+
+        function _saveRadioToHistory(port, transport, name) {
+            try {
+                const saved = _getSavedRadios();
+                const existing = saved.findIndex(r => r.port === port);
+                const entry = { port, transport, name, lastSeen: Date.now() };
+                if (existing >= 0) saved[existing] = entry;
+                else saved.unshift(entry);
+                // Keep max 10 entries
+                localStorage.setItem('tritium.meshtastic.saved_radios', JSON.stringify(saved.slice(0, 10)));
+            } catch (_) {}
+        }
+
+        function _removeSavedRadio(port) {
+            try {
+                const saved = _getSavedRadios().filter(r => r.port !== port);
+                localStorage.setItem('tritium.meshtastic.saved_radios', JSON.stringify(saved));
+            } catch (_) {}
+        }
+
+        // ── Loading state helper ──────────────────────────────────
+        function _loading(msg) {
+            const m = msg || 'Loading...';
+            return '<div style="display:flex;align-items:center;justify-content:center;padding:40px;gap:8px;">' +
+                '<div class="msh-spinner"></div>' +
+                '<span style="color:#888;font-size:0.75rem;">' + _esc(m) + '</span>' +
+            '</div>';
+        }
+
+        async function fetchAll() {
+            try {
+                const [sRes, nRes] = await Promise.all([
+                    fetch(API + '/status').then(r => r.ok ? r.json() : null),
+                    fetch(API + '/nodes').then(r => r.ok ? r.json() : null),
+                ]);
+                if (sRes) updateConnection(sRes);
+                if (nRes) { nodes = nRes.nodes || []; }
+                _saveCache();
+                renderBody();
+            } catch (_) { /* network error */ }
+        }
+
+        async function fetchMessages() {
+            try {
+                const r = await fetch(API + '/messages?limit=100');
+                if (r.ok) {
+                    const d = await r.json();
+                    messages = d.messages || [];
+                }
+            } catch (_) { /* ok */ }
+        }
+
+        async function fetchDeviceInfo() {
+            try {
+                const r = await fetch(API + '/device/info');
+                if (r.ok) {
+                    deviceInfo = await r.json();
+                    deviceInfoFetched = true;
+                    _saveCache();
+                }
+            } catch (_) { /* ok */ }
+        }
+
+        async function fetchChannels() {
+            try {
+                const r = await fetch(API + '/device/channels');
+                if (r.ok) {
+                    const d = await r.json();
+                    channels = d.channels || d || [];
+                }
+            } catch (_) { /* ok */ }
+        }
+
+        async function fetchModuleConfig() {
+            try {
+                const r = await fetch(API + '/device/modules');
+                if (r.ok) moduleConfig = await r.json();
+            } catch (_) { /* ok */ }
+        }
+
+        async function fetchFirmware() {
+            try {
+                const [fwRes, versRes] = await Promise.all([
+                    fetch(API + '/device/firmware').then(r => r.ok ? r.json() : null),
+                    fetch(API + '/device/firmware/versions').then(r => r.ok ? r.json() : null),
+                ]);
+                if (fwRes) firmwareInfo = fwRes;
+                if (versRes) firmwareVersions = versRes.versions || versRes || [];
+            } catch (_) { /* ok */ }
+        }
+
+        async function fetchPorts() {
+            try {
+                const r = await fetch(API + '/ports');
+                if (r.ok) {
+                    const d = await r.json();
+                    ports = d.ports || [];
+                }
+            } catch (_) { /* ok */ }
+        }
+
+        // ── Port auto-detect on open ────────────────────────────
+        async function initAutoDetect() {
+            const sRes = await fetch(API + '/status').then(r => r.ok ? r.json() : null).catch(() => null);
+            if (sRes && sRes.connected) {
+                updateConnection(sRes);
+                fetchAll();
+                fetchDeviceInfo();
+                fetchChannels();
+                fetchModuleConfig();
+                fetchFirmware();
+                return;
+            }
+            await fetchPorts();
+            if (ports.length === 0) {
+                connDevice.textContent = '';
+                connTransport.textContent = 'No radio found';
+                connTransport.style.color = '#ff2a6d';
+            } else if (ports.length === 1) {
+                connLabel.textContent = 'AUTO-CONNECTING...';
+                connLabel.style.color = '#fcee0a';
+                try {
+                    const cr = await fetch(API + '/connect', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ transport: 'serial', port: ports[0].port || ports[0], timeout: 60 }),
+                    });
+                    if (cr.ok) {
+                        const cd = await cr.json();
+                        updateConnection(cd);
+                        fetchAll();
+                        fetchDeviceInfo();
+                        fetchChannels();
+                        fetchModuleConfig();
+                        fetchFirmware();
+                    } else {
+                        connLabel.textContent = 'DISCONNECTED';
+                        connLabel.style.color = '#888';
+                    }
+                } catch (_) {
+                    connLabel.textContent = 'DISCONNECTED';
+                    connLabel.style.color = '#888';
+                }
+            } else {
+                // Multiple ports - show dropdown
+                portSelect.innerHTML = ports.map(p => {
+                    const port = typeof p === 'string' ? p : (p.port || '');
+                    const desc = typeof p === 'object' && p.description ? ` (${_esc(p.description)})` : '';
+                    return `<option value="${_esc(port)}">${_esc(port)}${desc}</option>`;
+                }).join('');
+                portSelect.style.display = '';
+                connTransport.textContent = `${ports.length} radios found`;
+                connTransport.style.color = '#fcee0a';
+            }
+        }
+
+        // ── Render active tab ───────────────────────────────────
+        function renderBody() {
+            if (body === null) return;
+            switch (activeTab) {
+                case 'radio':    renderRadio(); break;
+                case 'messages': renderMessages(); break;
+                case 'nodes':    renderNodes(); break;
+                case 'channels': renderChannels(); break;
+                case 'config':   renderConfig(); break;
+                case 'modules':  renderModules(); break;
+                case 'firmware': renderFirmware(); break;
+            }
+        }
+
+        // =====================================================================
+        //  RADIO TAB
+        // =====================================================================
+        function renderRadio() {
+            const di = deviceInfo;
+            const connStatus = connected ? 'CONNECTED' : 'DISCONNECTED';
+            const connColor = connected ? '#05ffa1' : '#ff2a6d';
+            const withGps = nodes.filter(n => n.lat != null && (n.lat !== 0 || n.lng !== 0)).length;
+            const batts = nodes.map(n => n.battery).filter(b => b != null && b > 0);
+            const avgBat = batts.length ? Math.round(batts.reduce((a, b) => a + b, 0) / batts.length) : null;
+            const utils = nodes.map(n => n.channel_util).filter(u => u != null);
+            const avgUtil = utils.length ? (utils.reduce((a, b) => a + b, 0) / utils.length).toFixed(1) : null;
+            const airUtils = nodes.map(n => n.air_util).filter(u => u != null);
+            const avgAirUtil = airUtils.length ? (airUtils.reduce((a, b) => a + b, 0) / airUtils.length).toFixed(1) : null;
+            const savedRadios = _getSavedRadios();
+
+            body.innerHTML = `
+                <div class="msh-radio-status">
+                    <div class="msh-radio-indicator" style="border-color:${connColor}">
+                        <div class="msh-radio-dot-big" style="background:${connColor};box-shadow:0 0 12px ${connColor}88;"></div>
+                        <div class="msh-radio-status-text" style="color:${connColor}">${connStatus}</div>
+                    </div>
+                </div>
+                ${connected ? `
+                <div class="msh-radio-disconnect-bar">
+                    <button class="msh-btn msh-btn-disconnect msh-btn-lg" data-action="radio-disconnect" style="width:100%;" title="Disconnect from current radio">DISCONNECT</button>
+                </div>
+                <div class="msh-section-label">DEVICE INFO</div>
+                <div class="msh-config-grid">
+                    <div class="msh-cfg-row" title="Unique node identifier on the mesh"><span class="msh-cfg-lbl">Node ID</span><span class="msh-cfg-val">${_esc(di.node_id || di.nodeId || '--')}</span></div>
+                    <div class="msh-cfg-row" title="Display name broadcast to the mesh"><span class="msh-cfg-lbl">Long Name</span><span class="msh-cfg-val">${_esc(di.long_name || '--')}</span></div>
+                    <div class="msh-cfg-row" title="Short 4-char name shown on device screens"><span class="msh-cfg-lbl">Short Name</span><span class="msh-cfg-val">${_esc(di.short_name || '--')}</span></div>
+                    <div class="msh-cfg-row" title="Hardware model of the radio"><span class="msh-cfg-lbl">Hardware</span><span class="msh-cfg-val">${_esc(di.hw_model || '--')}</span></div>
+                    <div class="msh-cfg-row" title="Meshtastic firmware version running on device"><span class="msh-cfg-lbl">Firmware</span><span class="msh-cfg-val">${_esc(di.firmware_version || '--')}</span></div>
+                    <div class="msh-cfg-row" title="Device role determines routing behavior"><span class="msh-cfg-lbl">Role</span><span class="msh-cfg-val">${_esc(di.role || '--')}</span></div>
+                    <div class="msh-cfg-row" title="LoRa frequency band region"><span class="msh-cfg-lbl">Region</span><span class="msh-cfg-val">${_esc(di.region || '--')}</span></div>
+                    <div class="msh-cfg-row" title="LoRa modem speed/range trade-off"><span class="msh-cfg-lbl">Modem Preset</span><span class="msh-cfg-val${_isModemPresetRecommended(di.modem_preset) ? '' : ' msh-cfg-warn'}">${_esc(di.modem_preset || '--')}</span></div>
+                    ${(_isModemPresetRecommended(di.modem_preset) === false) && di.modem_preset && di.modem_preset !== '--' ? '<div class="msh-preset-warning">Bay Area Meshtastic recommends MEDIUM_FAST for this region</div>' : ''}
+                    <div class="msh-cfg-row" title="Transmit power in decibel-milliwatts"><span class="msh-cfg-lbl">TX Power</span><span class="msh-cfg-val">${di.tx_power != null ? di.tx_power + ' dBm' : '--'}</span></div>
+                    <div class="msh-cfg-row" title="Number of configured channel slots"><span class="msh-cfg-lbl">Channels</span><span class="msh-cfg-val">${di.num_channels || channels.length || '--'}</span></div>
+                </div>
+                <div class="msh-section-label" style="margin-top:10px">MESH OVERVIEW</div>
+                <div class="msh-stats">
+                    <div class="msh-stat" title="Total nodes discovered on the mesh"><div class="msh-stat-val" style="color:#00f0ff">${nodes.length}</div><div class="msh-stat-lbl">NODES</div></div>
+                    <div class="msh-stat" title="Nodes reporting GPS coordinates"><div class="msh-stat-val" style="color:#05ffa1">${withGps}</div><div class="msh-stat-lbl">WITH GPS</div></div>
+                    <div class="msh-stat" title="Average battery level across all nodes"><div class="msh-stat-val" style="color:#fcee0a">${avgBat != null ? avgBat + '%' : '--'}</div><div class="msh-stat-lbl">AVG BATTERY</div></div>
+                    <div class="msh-stat" title="Average channel utilization (airtime usage)"><div class="msh-stat-val" style="color:#ff2a6d">${avgUtil != null ? avgUtil + '%' : '--'}</div><div class="msh-stat-lbl">CH UTIL</div></div>
+                </div>
+                <div class="msh-radio-actions">
+                    <button class="msh-btn" data-action="refresh-all" title="Refresh all data from device">REFRESH</button>
+                    <button class="msh-btn msh-btn-warn" data-action="reboot" title="Reboot the connected radio">REBOOT DEVICE</button>
+                </div>
+                ` : `
+                <div class="msh-radio-ports">
+                    <div class="msh-section-label">AVAILABLE RADIOS</div>
+                    <div class="msh-port-list">
+                        ${ports.length === 0 && bleDevices.length === 0 ? '<div class="msh-empty" style="padding:12px 10px">No radios detected. Click SCAN USB or SCAN BLE.</div>' : ''}
+                        ${ports.map(p => {
+                            const port = typeof p === 'string' ? p : (p.port || '');
+                            const desc = typeof p === 'object' ? (p.description || p.manufacturer || '') : '';
+                            return '<div class="msh-port-row" data-port="' + _esc(port) + '">' +
+                                '<span class="msh-port-icon" title="USB Serial">USB</span>' +
+                                '<span class="msh-port-name">' + _esc(port) + '</span>' +
+                                '<span class="msh-port-desc">' + _esc(desc) + '</span>' +
+                                '<button class="msh-btn msh-btn-connect msh-btn-sm" data-action="connect-port" data-port="' + _esc(port) + '" title="Connect to this radio via USB serial">CONNECT</button>' +
+                            '</div>';
+                        }).join('')}
+                        ${bleDevices.map(d => {
+                            return '<div class="msh-port-row">' +
+                                '<span class="msh-port-icon" style="color:#b060ff" title="Bluetooth LE">BLE</span>' +
+                                '<span class="msh-port-name" style="color:#b060ff">' + _esc(d.name) + '</span>' +
+                                '<span class="msh-port-desc">' + d.rssi + ' dBm — ' + _esc(d.address) + '</span>' +
+                                '<button class="msh-btn msh-btn-connect msh-btn-sm" data-action="connect-ble" data-address="' + _esc(d.address) + '" title="Connect via Bluetooth LE">CONNECT</button>' +
+                            '</div>';
+                        }).join('')}
+                    </div>
+                    <div style="padding:8px 10px;display:flex;gap:6px;flex-wrap:wrap;">
+                        <button class="msh-btn" data-action="scan-ports" title="Rescan USB serial ports">SCAN USB</button>
+                        <button class="msh-btn" data-action="scan-ble" title="Scan for Meshtastic BLE radios (~6 seconds)">SCAN BLE</button>
+                    </div>
+                </div>
+                ${savedRadios.length > 0 ? `
+                <div class="msh-radio-ports" style="margin-top:4px;">
+                    <div class="msh-section-label">SAVED RADIOS</div>
+                    <div class="msh-port-list">
+                        ${savedRadios.map(r => {
+                            const label = r.name ? (r.name + ' (' + _esc(r.port) + ')') : _esc(r.port);
+                            const ago = r.lastSeen ? _age(Math.floor((Date.now() - r.lastSeen) / 1000)) + ' ago' : '';
+                            return '<div class="msh-port-row msh-saved-row">' +
+                                '<span class="msh-port-name">' + _esc(label) + '</span>' +
+                                '<span class="msh-port-desc" style="color:#666;font-size:0.6rem">' + _esc(r.transport || 'serial') + (ago ? ' - ' + ago : '') + '</span>' +
+                                '<button class="msh-btn msh-btn-connect msh-btn-sm" data-action="connect-saved" data-port="' + _esc(r.port) + '" data-transport="' + _esc(r.transport || 'serial') + '" title="Reconnect to this saved radio">CONNECT</button>' +
+                                '<button class="msh-btn msh-btn-sm" data-action="remove-saved" data-port="' + _esc(r.port) + '" title="Remove from saved radios" style="color:#ff2a6d;border-color:rgba(255,42,109,0.2);padding:2px 4px;">X</button>' +
+                            '</div>';
+                        }).join('')}
+                    </div>
+                </div>` : ''}
+                `}
+            `;
+
+            // Wire radio tab actions
+            body.querySelectorAll('[data-action="connect-port"]').forEach(btn => {
+                btn.addEventListener('click', async () => {
+                    const port = btn.dataset.port;
+                    btn.disabled = true;
+                    btn.textContent = 'CONNECTING...';
+                    try {
+                        const cr = await fetch(API + '/connect', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ transport: 'serial', port, timeout: 60 }),
+                        });
+                        if (cr.ok) {
+                            const cd = await cr.json();
+                            updateConnection(cd);
+                            fetchAll();
+                            fetchDeviceInfo();
+                            fetchChannels();
+                            fetchModuleConfig();
+                            fetchFirmware();
+                        }
+                    } catch (_) { /* ok */ }
+                    btn.disabled = false;
+                    btn.textContent = 'CONNECT';
+                });
+            });
+            body.querySelectorAll('[data-action="connect-ble"]').forEach(btn => {
+                btn.addEventListener('click', async () => {
+                    const address = btn.dataset.address;
+                    btn.disabled = true;
+                    btn.textContent = 'CONNECTING...';
+                    try {
+                        const cr = await fetch(API + '/connect', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ transport: 'ble', address, timeout: 45 }),
+                        });
+                        if (cr.ok) {
+                            const cd = await cr.json();
+                            updateConnection(cd);
+                            fetchAll(); fetchDeviceInfo(); fetchChannels(); fetchModuleConfig(); fetchFirmware();
+                        }
+                    } catch (_) {}
+                    btn.disabled = false;
+                    btn.textContent = 'CONNECT';
+                });
+            });
+            body.querySelectorAll('[data-action="connect-saved"]').forEach(btn => {
+                btn.addEventListener('click', async () => {
+                    const port = btn.dataset.port;
+                    const transport = btn.dataset.transport || 'serial';
+                    btn.disabled = true;
+                    btn.textContent = 'CONNECTING...';
+                    try {
+                        const cr = await fetch(API + '/connect', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ transport, port, timeout: 60 }),
+                        });
+                        if (cr.ok) {
+                            const cd = await cr.json();
+                            updateConnection(cd);
+                            fetchAll();
+                            fetchDeviceInfo();
+                            fetchChannels();
+                            fetchModuleConfig();
+                            fetchFirmware();
+                        }
+                    } catch (_) { /* ok */ }
+                    btn.disabled = false;
+                    btn.textContent = 'CONNECT';
+                });
+            });
+            body.querySelectorAll('[data-action="remove-saved"]').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    _removeSavedRadio(btn.dataset.port);
+                    renderRadio();
+                });
+            });
+            body.querySelector('[data-action="scan-ports"]')?.addEventListener('click', async (e) => {
+                const btn = e.currentTarget;
+                btn.disabled = true;
+                btn.textContent = 'SCANNING...';
+                btn.style.color = '#fcee0a';
+                await fetchPorts();
+                btn.textContent = ports.length > 0 ? `FOUND ${ports.length}` : 'NONE FOUND';
+                btn.style.color = ports.length > 0 ? '#05ffa1' : '#ff2a6d';
+                renderRadio();
+            });
+            body.querySelector('[data-action="scan-ble"]')?.addEventListener('click', async (e) => {
+                const btn = e.currentTarget;
+                btn.disabled = true;
+                btn.textContent = 'SCANNING BLE...';
+                btn.style.color = '#fcee0a';
+                try {
+                    const r = await fetch(API + '/ble-scan');
+                    if (r.ok) {
+                        const d = await r.json();
+                        bleDevices = d.ble_devices || [];
+                        btn.textContent = bleDevices.length > 0
+                            ? `FOUND ${bleDevices.length} BLE`
+                            : 'NO BLE FOUND';
+                        btn.style.color = bleDevices.length > 0 ? '#05ffa1' : '#ff2a6d';
+                        // Re-render to show BLE devices in the list
+                        renderRadio();
+                    }
+                } catch (_) {
+                    btn.textContent = 'SCAN FAILED';
+                    btn.style.color = '#ff2a6d';
+                }
+            });
+            body.querySelector('[data-action="radio-disconnect"]')?.addEventListener('click', async () => {
+                try { await fetch(API + '/disconnect', { method: 'POST' }); } catch (_) { /* ok */ }
+                updateConnection({ connected: false, transport: 'none', port: '', device: {} });
+                await fetchPorts();
+                renderRadio();
+            });
+            body.querySelector('[data-action="refresh-all"]')?.addEventListener('click', () => {
+                fetchAll();
+                fetchDeviceInfo();
+                fetchChannels();
+                fetchModuleConfig();
+            });
+            body.querySelector('[data-action="reboot"]')?.addEventListener('click', async () => {
+                if (confirm('Reboot the Meshtastic device?') === false) return;
+                try {
+                    await fetch(API + '/device/reboot', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ delay: 5 }),
+                    });
+                } catch (_) { /* ok */ }
+                EventBus.emit('toast:show', { message: 'Reboot command sent (5s delay)', type: 'info' });
+            });
+        }
+
+        // =====================================================================
+        //  MESSAGES TAB
+        // =====================================================================
+        function renderMessages() {
+            if (messages.length === 0 && connected === false) {
+                body.innerHTML = '<div class="msh-empty" style="padding:40px;text-align:center">Connect a radio to see messages.</div>';
+                return;
+            }
+            const now = Math.floor(Date.now() / 1000);
+            const SYSTEM_TYPES = ['position', 'telemetry', 'nodeinfo', 'routing', 'admin'];
+            // Filter messages by selected channel
+            let filtered = messages.filter(m => {
+                if (m.channel == null) return selectedChannel === 0;
+                return m.channel === selectedChannel;
+            });
+            // Apply chat-only filter (hide system/position/telemetry packets)
+            if (chatOnlyFilter) {
+                filtered = filtered.filter(m => !m.type || m.type === 'text');
+            }
+            const visible = filtered.slice(-80);
+
+            // Channel selector options
+            const chOptions = [];
+            for (let i = 0; i < Math.max(channels.length, 1); i++) {
+                const ch = channels[i];
+                const name = ch ? (ch.name || (i === 0 ? 'Primary' : `Ch ${i}`)) : (i === 0 ? 'Primary' : `Ch ${i}`);
+                chOptions.push(`<option value="${i}"${i === selectedChannel ? ' selected' : ''}>${_esc(name)}</option>`);
+            }
+            // Add DM option
+            chOptions.push(`<option value="-1"${selectedChannel === -1 ? ' selected' : ''}>Direct Messages</option>`);
+
+            body.innerHTML = `
+                <div class="msh-msg-header">
+                    <select class="msh-channel-select" data-bind="channel-select">${chOptions.join('')}</select>
+                    <button class="msh-btn msh-btn-sm msh-msg-filter-btn${chatOnlyFilter ? ' msh-msg-filter-active' : ''}" data-action="toggle-msg-filter">${chatOnlyFilter ? 'CHAT ONLY' : 'ALL MESSAGES'}</button>
+                    <span class="msh-msg-count">${filtered.length} message${filtered.length !== 1 ? 's' : ''}</span>
+                </div>
+                <div class="msh-chat-log" data-bind="chat-log">
+                    ${visible.length === 0
+                        ? '<div class="msh-empty" style="padding:30px;text-align:center">No messages on this channel</div>'
+                        : visible.map(m => {
+                            const isSystem = m.type && SYSTEM_TYPES.includes(m.type);
+                            const sender = _esc(m.from_short || m.from_name || m.from || 'Unknown');
+                            const text = _esc(m.text || '');
+                            const time = m.timestamp
+                                ? new Date(m.timestamp * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+                                : '';
+                            const self = m.is_self;
+                            const ack = m.ack === true ? 'msh-msg-acked' : (m.ack === false ? 'msh-msg-nack' : '');
+                            const hops = m.hop_limit != null ? `<span class="msh-msg-hops">${m.hop_limit}h</span>` : '';
+                            const typeBadge = isSystem ? `<span class="msh-msg-type-badge">${_esc(m.type.toUpperCase())}</span>` : '';
+                            return `<div class="msh-msg${self ? ' msh-msg-self' : ''} ${ack}${isSystem ? ' msh-msg-system' : ''}">
+                                <div class="msh-msg-meta">
+                                    <span class="msh-msg-from">${sender}</span>
+                                    ${typeBadge}
+                                    ${hops}
+                                    <span class="msh-msg-time">${time}</span>
+                                    ${self && m.ack === true ? '<span class="msh-msg-delivery" title="Delivered">OK</span>' : ''}
+                                    ${self && m.ack === false ? '<span class="msh-msg-delivery msh-msg-delivery-fail" title="Not delivered">FAIL</span>' : ''}
+                                </div>
+                                <div class="msh-msg-text">${text}</div>
+                            </div>`;
+                        }).join('')}
+                </div>
+                <div class="msh-chat-input">
+                    <input type="text" class="msh-input" data-bind="chat-input" maxlength="${MSG_CHAR_LIMIT}" placeholder="${connected ? 'Type a message...' : 'Connect a radio to send'}" autocomplete="off" ${connected ? '' : 'disabled'} />
+                    <span class="msh-char-count" data-bind="char-count">${MSG_CHAR_LIMIT}</span>
+                    <button class="msh-btn msh-btn-send" data-action="send" ${connected ? '' : 'disabled'}>SEND</button>
+                </div>
+            `;
+
+            // Scroll chat to bottom
+            const log = body.querySelector('[data-bind="chat-log"]');
+            if (log) log.scrollTop = log.scrollHeight;
+
+            // Channel selector
+            const chSel = body.querySelector('[data-bind="channel-select"]');
+            if (chSel) {
+                chSel.addEventListener('change', () => {
+                    selectedChannel = parseInt(chSel.value, 10);
+                    renderMessages();
+                });
+            }
+
+            // Message filter toggle
+            body.querySelector('[data-action="toggle-msg-filter"]')?.addEventListener('click', () => {
+                chatOnlyFilter = !chatOnlyFilter;
+                renderMessages();
+            });
+
+            // Wire send
+            const input = body.querySelector('[data-bind="chat-input"]');
+            const sendBtn = body.querySelector('[data-action="send"]');
+            const charCount = body.querySelector('[data-bind="char-count"]');
+
+            if (input) {
+                input.focus();
+                input.addEventListener('input', () => {
+                    const rem = MSG_CHAR_LIMIT - input.value.length;
+                    if (charCount) {
+                        charCount.textContent = rem;
+                        charCount.style.color = rem < 20 ? '#ff2a6d' : '#888';
+                    }
+                });
+                input.addEventListener('keydown', (e) => {
+                    if (e.key === 'Enter' && e.shiftKey === false) {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        doSend(input);
+                    }
+                });
+            }
+            if (sendBtn) sendBtn.addEventListener('click', () => doSend(input));
+        }
+
+        async function doSend(input) {
+            if (input === null || input === undefined) return;
+            const text = input.value.trim();
+            if (text === '') return;
+            input.value = '';
+            const payload = { text };
+            if (selectedChannel >= 0) payload.channel = selectedChannel;
+            messages.push({
+                from: 'You', from_short: 'You', text,
+                timestamp: Math.floor(Date.now() / 1000),
+                is_self: true, channel: selectedChannel >= 0 ? selectedChannel : null,
+            });
+            renderMessages();
+            try {
+                await fetch(API + '/send', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                });
+            } catch (_) { /* ok */ }
+        }
+
+        // =====================================================================
+        //  NODES TAB
+        // =====================================================================
+        // ── Favorites helpers ──────────────────────────────────
+        function _getFavorites() {
+            try {
+                const raw = localStorage.getItem('tritium.meshtastic.favorites');
+                return raw ? JSON.parse(raw) : [];
+            } catch (_) { return []; }
+        }
+        function _setFavorites(arr) {
+            try { localStorage.setItem('tritium.meshtastic.favorites', JSON.stringify(arr)); } catch (_) {}
+        }
+        function _toggleFavorite(nodeId) {
+            const favs = _getFavorites();
+            const idx = favs.indexOf(nodeId);
+            if (idx >= 0) favs.splice(idx, 1);
+            else favs.push(nodeId);
+            _setFavorites(favs);
+        }
+        function _isFavorite(nodeId) {
+            return _getFavorites().indexOf(nodeId) >= 0;
+        }
+
+        // ── Haversine distance (km) ──────────────────────────────
+        function _haversine(lat1, lon1, lat2, lon2) {
+            const R = 6371; // km
+            const dLat = (lat2 - lat1) * Math.PI / 180;
+            const dLon = (lon2 - lon1) * Math.PI / 180;
+            const a = Math.sin(dLat / 2) ** 2 + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLon / 2) ** 2;
+            return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+        }
+
+        // ── Get our own position from deviceInfo or first matching node ──
+        function _getOwnPosition() {
+            if (deviceInfo && deviceInfo.latitude && deviceInfo.longitude) {
+                return { lat: deviceInfo.latitude, lng: deviceInfo.longitude };
+            }
+            const myId = deviceInfo && (deviceInfo.node_id || deviceInfo.my_node_num);
+            if (myId) {
+                const me = nodes.find(n => (n.node_id || n.num) === myId);
+                if (me && me.latitude && me.longitude) {
+                    return { lat: me.latitude, lng: me.longitude };
+                }
+            }
+            return null;
+        }
+
+        // ── Node detail overlay ──────────────────────────────────
+        function _renderNodeDetail(nodeId) {
+            const n = nodes.find(nd => (nd.node_id || nd.num || '') === nodeId);
+            if (n == null) return '';
+            const isFav = _isFavorite(nodeId);
+            const now = Math.floor(Date.now() / 1000);
+            const lastHeardSec = (n.last_heard != null && n.last_heard > 1000000000) ? (now - n.last_heard) : null;
+            const lastHeardStr = lastHeardSec != null && lastHeardSec < 86400 * 365 ? _age(lastHeardSec) + ' ago' : 'never';
+            const hasGps = n.lat != null && n.lng != null;
+            const ownPos = _getOwnPosition();
+            let distStr = '--';
+            if (hasGps && ownPos) {
+                const km = _haversine(ownPos.lat, ownPos.lng, n.lat, n.lng);
+                distStr = km < 1 ? Math.round(km * 1000) + ' m' : km.toFixed(2) + ' km';
+            }
+            const hops = n.hopsAway != null ? String(n.hopsAway) : (n.hops_away != null ? String(n.hops_away) : '--');
+            const uptimeStr = n.uptime != null ? _age(n.uptime) : '--';
+            const bat = n.battery != null ? Math.round(n.battery) + '%' : '--';
+            const volt = n.voltage != null ? n.voltage.toFixed(2) + 'V' : '--';
+            const snr = n.snr != null ? n.snr.toFixed(1) + ' dB' : '--';
+            const chUtil = n.channel_util != null ? n.channel_util.toFixed(1) + '%' : '--';
+            const airUtil = n.air_util != null ? n.air_util.toFixed(1) + '%' : '--';
+            const temp = n.temperature != null ? n.temperature.toFixed(1) + ' C' : null;
+            const humidity = n.humidity != null ? n.humidity.toFixed(0) + '%' : null;
+            const pressure = n.pressure != null ? n.pressure.toFixed(1) + ' hPa' : null;
+            const neighbors = n.neighbors || [];
+
+            let envRows = '';
+            if (temp) envRows += `<div class="msh-detail-row"><span class="msh-detail-lbl">TEMPERATURE</span><span class="msh-detail-val">${_esc(temp)}</span></div>`;
+            if (humidity) envRows += `<div class="msh-detail-row"><span class="msh-detail-lbl">HUMIDITY</span><span class="msh-detail-val">${_esc(humidity)}</span></div>`;
+            if (pressure) envRows += `<div class="msh-detail-row"><span class="msh-detail-lbl">PRESSURE</span><span class="msh-detail-val">${_esc(pressure)}</span></div>`;
+
+            let neighborsHtml = '';
+            if (neighbors.length > 0) {
+                neighborsHtml = `<div class="msh-detail-section">NEIGHBORS (${neighbors.length})</div>` +
+                    neighbors.map(nb => {
+                        const nbName = nb.long_name || nb.short_name || nb.node_id || 'Unknown';
+                        const nbSnr = nb.snr != null ? nb.snr.toFixed(1) + ' dB' : '';
+                        return `<div class="msh-detail-row"><span class="msh-detail-lbl">${_esc(nbName)}</span><span class="msh-detail-val">${nbSnr}</span></div>`;
+                    }).join('');
+            }
+
+            return `<div class="msh-node-detail">
+                <div class="msh-detail-header">
+                    <span class="msh-detail-fav" data-action="toggle-fav-detail" data-node-id="${_esc(nodeId)}" title="${isFav ? 'Remove from favorites' : 'Add to favorites'}" style="cursor:pointer;font-size:1.1rem;color:${isFav ? '#fcee0a' : '#555'}">${isFav ? '\u2605' : '\u2606'}</span>
+                    <span class="msh-detail-title">${_esc(n.long_name || n.short_name || nodeId)}</span>
+                    <span style="flex:1"></span>
+                    <button class="msh-btn msh-btn-sm" data-action="close-detail">CLOSE</button>
+                </div>
+                <div class="msh-detail-body">
+                    <div class="msh-detail-row"><span class="msh-detail-lbl">LONG NAME</span><span class="msh-detail-val">${_esc(n.long_name || '--')}</span></div>
+                    <div class="msh-detail-row"><span class="msh-detail-lbl">SHORT NAME</span><span class="msh-detail-val">${_esc(n.short_name || '--')}</span></div>
+                    <div class="msh-detail-row"><span class="msh-detail-lbl">NODE ID</span><span class="msh-detail-val" style="color:#00f0ff">${_esc(nodeId)}</span></div>
+                    <div class="msh-detail-row"><span class="msh-detail-lbl">HARDWARE</span><span class="msh-detail-val">${_esc(n.hw_model || '--')}</span></div>
+                    <div class="msh-detail-row"><span class="msh-detail-lbl">ROLE</span><span class="msh-detail-val">${_esc(n.role || '--')}</span></div>
+                    <div class="msh-detail-section">POSITION</div>
+                    <div class="msh-detail-row"><span class="msh-detail-lbl">LATITUDE</span><span class="msh-detail-val">${hasGps ? n.lat.toFixed(6) : '--'}</span></div>
+                    <div class="msh-detail-row"><span class="msh-detail-lbl">LONGITUDE</span><span class="msh-detail-val">${hasGps ? n.lng.toFixed(6) : '--'}</span></div>
+                    <div class="msh-detail-row"><span class="msh-detail-lbl">ALTITUDE</span><span class="msh-detail-val">${n.altitude != null ? Math.round(n.altitude) + ' m' : '--'}</span></div>
+                    <div class="msh-detail-row"><span class="msh-detail-lbl">DISTANCE</span><span class="msh-detail-val">${distStr}</span></div>
+                    ${hasGps ? `<div style="padding:4px 0"><button class="msh-btn msh-btn-primary msh-btn-sm" data-action="fly-to" data-lat="${n.lat}" data-lng="${n.lng}">FLY TO</button></div>` : ''}
+                    <div class="msh-detail-section">RADIO</div>
+                    <div class="msh-detail-row"><span class="msh-detail-lbl">BATTERY</span><span class="msh-detail-val">${bat}</span></div>
+                    <div class="msh-detail-row"><span class="msh-detail-lbl">VOLTAGE</span><span class="msh-detail-val">${volt}</span></div>
+                    <div class="msh-detail-row"><span class="msh-detail-lbl">SNR</span><span class="msh-detail-val">${snr}</span></div>
+                    <div class="msh-detail-row"><span class="msh-detail-lbl">HOPS</span><span class="msh-detail-val">${hops}</span></div>
+                    <div class="msh-detail-row"><span class="msh-detail-lbl">UPTIME</span><span class="msh-detail-val">${uptimeStr}</span></div>
+                    <div class="msh-detail-row"><span class="msh-detail-lbl">CH UTIL</span><span class="msh-detail-val">${chUtil}</span></div>
+                    <div class="msh-detail-row"><span class="msh-detail-lbl">AIR UTIL TX</span><span class="msh-detail-val">${airUtil}</span></div>
+                    <div class="msh-detail-row"><span class="msh-detail-lbl">LAST HEARD</span><span class="msh-detail-val">${lastHeardStr}</span></div>
+                    ${envRows ? `<div class="msh-detail-section">ENVIRONMENT</div>${envRows}` : ''}
+                    ${neighborsHtml}
+                </div>
+            </div>`;
+        }
+
+        function renderNodes() {
+            if (nodes.length === 0) {
+                if (connected) {
+                    body.innerHTML = _loading('Discovering nodes...');
+                } else {
+                    body.innerHTML = '<div class="msh-empty" style="padding:40px;text-align:center">Connect a radio to see nodes.</div>';
+                }
+                return;
+            }
+
+            const favs = _getFavorites();
+            const ownPos = _getOwnPosition();
+            const searchLower = nodeSearchText.toLowerCase().trim();
+
+            // Filter by search text
+            let filtered = nodes;
+            if (searchLower) {
+                filtered = nodes.filter(n => {
+                    const fields = [n.long_name, n.short_name, n.node_id, n.num, n.hw_model].map(v => String(v || '').toLowerCase());
+                    return fields.some(f => f.indexOf(searchLower) >= 0);
+                });
+            }
+
+            // Sort: favorites first, then by selected sort key
+            const sorted = [...filtered].sort((a, b) => {
+                const aFav = favs.indexOf(a.node_id || a.num || '') >= 0 ? 1 : 0;
+                const bFav = favs.indexOf(b.node_id || b.num || '') >= 0 ? 1 : 0;
+                if (aFav !== bFav) return bFav - aFav; // favorites first
+                let va = a[nodeSortKey], vb = b[nodeSortKey];
+                if (typeof va === 'string') return (va || '').localeCompare(vb || '') * nodeSortDir;
+                if (va == null) va = -Infinity;
+                if (vb == null) vb = -Infinity;
+                return (va - vb) * nodeSortDir;
+            });
+
+            const now = Math.floor(Date.now() / 1000);
+
+            // Add fav star column before the rest
+            const headerCells = `<th class="msh-th" style="width:26px;text-align:center">\u2605</th>` +
+                NODE_COLS.map(c =>
+                    `<th class="msh-th" data-sort="${c.key}" style="width:${c.width};text-align:${c.align || 'left'}">${c.label}${nodeSortKey === c.key ? (nodeSortDir < 0 ? ' \u25BC' : ' \u25B2') : ''}</th>`
+                ).join('');
+
+            const rows = sorted.map(n => {
+                const nid = n.node_id || n.num || '';
+                const isFav = favs.indexOf(nid) >= 0;
+                const lh = n.last_heard || 0;
+                const age = lh > 1000000000 && (now - lh) < 86400 * 365 ? _age(now - lh) : 'never';
+                const bat = n.battery != null ? Math.round(n.battery) + '%' : '';
+                const batColor = n.battery != null ? (n.battery > 50 ? '#05ffa1' : n.battery > 20 ? '#fcee0a' : '#ff2a6d') : '#888';
+                const snr = n.snr != null ? n.snr.toFixed(1) : '';
+                const snrColor = n.snr != null ? (n.snr > 5 ? '#05ffa1' : n.snr > 0 ? '#fcee0a' : '#ff2a6d') : '#888';
+                const hops = n.hopsAway != null ? String(n.hopsAway) : (n.hops_away != null ? String(n.hops_away) : '--');
+                // Compute distance from own position
+                let dist = '';
+                if (n.distance != null) {
+                    dist = _formatDist(n.distance);
+                } else if (ownPos && n.lat != null && n.lng != null) {
+                    const km = _haversine(ownPos.lat, ownPos.lng, n.lat, n.lng);
+                    dist = km < 1 ? Math.round(km * 1000) + 'm' : km.toFixed(1) + 'km';
+                }
+                const isSelected = selectedNodeId === nid;
+                return `<tr class="msh-tr${isSelected ? ' msh-tr-selected' : ''}" data-node-id="${_esc(nid)}" style="cursor:pointer">
+                    <td class="msh-td" style="text-align:center"><span class="msh-fav-star" data-action="toggle-fav" data-node-id="${_esc(nid)}" style="cursor:pointer;color:${isFav ? '#fcee0a' : '#333'}">${isFav ? '\u2605' : '\u2606'}</span></td>
+                    <td class="msh-td">${_esc(n.short_name || '')}</td>
+                    <td class="msh-td msh-td-long">${_esc(n.long_name || '')}</td>
+                    <td class="msh-td msh-td-hw">${_esc(n.hw_model || '')}</td>
+                    <td class="msh-td" style="text-align:right;color:${snrColor}">${snr}</td>
+                    <td class="msh-td" style="text-align:right;color:${batColor}">${bat}</td>
+                    <td class="msh-td" style="text-align:right">${age}</td>
+                    <td class="msh-td" style="text-align:right">${hops}</td>
+                    <td class="msh-td" style="text-align:right">${dist}</td>
+                </tr>`;
+            }).join('');
+
+            const online = nodes.filter(n => {
+                if (!n.last_heard || n.last_heard < 1000000000) return false;
+                return (now - n.last_heard) < 900; // 15 min
+            }).length;
+            const withGps = nodes.filter(n => n.lat != null && n.lng != null).length;
+            const favCount = favs.filter(fid => nodes.some(n => (n.node_id || n.num || '') === fid)).length;
+
+            const detailHtml = selectedNodeId ? _renderNodeDetail(selectedNodeId) : '';
+
+            body.innerHTML = `
+                ${detailHtml}
+                <div class="msh-node-header">
+                    <span class="msh-node-count">${nodes.length} node${nodes.length !== 1 ? 's' : ''} (${withGps} with GPS, ${favCount} favorited)</span>
+                    <span class="msh-node-online" style="color:#05ffa1">${online} online</span>
+                </div>
+                <input type="text" class="msh-input" placeholder="Search nodes by name, ID, or hardware..." data-bind="node-search" value="${_esc(nodeSearchText)}" style="margin:6px 10px;width:calc(100% - 20px);flex-shrink:0;" />
+                <div style="flex:1;overflow:auto;min-height:0;">
+                    <table class="msh-table">
+                        <thead><tr>${headerCells}</tr></thead>
+                        <tbody>${rows || '<tr><td colspan="9" class="msh-empty" style="text-align:center;padding:30px">No nodes match search</td></tr>'}</tbody>
+                    </table>
+                </div>
+            `;
+
+            // Search input handler
+            const searchInput = body.querySelector('[data-bind="node-search"]');
+            if (searchInput) {
+                searchInput.addEventListener('input', (e) => {
+                    nodeSearchText = e.target.value;
+                    renderNodes();
+                    // Re-focus and restore cursor after re-render
+                    const inp = body.querySelector('[data-bind="node-search"]');
+                    if (inp) { inp.focus(); inp.selectionStart = inp.selectionEnd = inp.value.length; }
+                });
+            }
+
+            // Sort headers
+            body.querySelector('thead')?.addEventListener('click', (e) => {
+                const th = e.target.closest('[data-sort]');
+                if (th === null) return;
+                if (nodeSortKey === th.dataset.sort) nodeSortDir *= -1;
+                else { nodeSortKey = th.dataset.sort; nodeSortDir = -1; }
+                renderNodes();
+            });
+
+            // Row click for detail + star toggle
+            body.querySelector('tbody')?.addEventListener('click', (e) => {
+                // Star toggle
+                const star = e.target.closest('[data-action="toggle-fav"]');
+                if (star) {
+                    e.stopPropagation();
+                    _toggleFavorite(star.dataset.nodeId);
+                    renderNodes();
+                    return;
+                }
+                // Row click -> show detail
+                const row = e.target.closest('.msh-tr');
+                if (row && row.dataset.nodeId) {
+                    selectedNodeId = selectedNodeId === row.dataset.nodeId ? null : row.dataset.nodeId;
+                    renderNodes();
+                }
+            });
+
+            // Detail panel actions
+            const closeBtn = body.querySelector('[data-action="close-detail"]');
+            if (closeBtn) {
+                closeBtn.addEventListener('click', () => { selectedNodeId = null; renderNodes(); });
+            }
+            const flyBtn = body.querySelector('[data-action="fly-to"]');
+            if (flyBtn) {
+                flyBtn.addEventListener('click', () => {
+                    const lat = parseFloat(flyBtn.dataset.lat);
+                    const lng = parseFloat(flyBtn.dataset.lng);
+                    if (lat && lng) EventBus.emit('map:fly-to', { lat, lng, zoom: 16 });
+                });
+            }
+            const favDetailBtn = body.querySelector('[data-action="toggle-fav-detail"]');
+            if (favDetailBtn) {
+                favDetailBtn.addEventListener('click', () => {
+                    _toggleFavorite(favDetailBtn.dataset.nodeId);
+                    renderNodes();
+                });
+            }
+        }
+
+        // =====================================================================
+        //  CHANNELS TAB
+        // =====================================================================
+        function renderChannels() {
+            if (channels.length === 0 && connected === false) {
+                body.innerHTML = '<div class="msh-empty" style="padding:40px;text-align:center">Connect a radio to see channels.</div>';
+                return;
+            }
+            if (channels.length === 0 && connected) {
+                body.innerHTML = _loading('Loading channels...');
+                return;
+            }
+            // Always show 8 channel slots
+            const slots = [];
+            for (let i = 0; i < 8; i++) {
+                slots.push(channels[i] || { index: i, name: '', role: 'DISABLED', psk: null });
+            }
+
+            body.innerHTML = `
+                <div class="msh-section-label">CHANNEL SLOTS (8)</div>
+                <div class="msh-channel-list">
+                    ${slots.map((ch, i) => {
+                        const name = ch.name || (i === 0 ? 'Default' : '');
+                        const role = _normalizeRole(ch.role, i);
+                        const roleColor = role === 'PRIMARY' ? '#05ffa1' : (role === 'SECONDARY' ? '#00f0ff' : '#555');
+                        const hasPsk = ch.psk && ch.psk !== '' && ch.psk !== 'AQ==';
+                        const pskLabel = hasPsk ? 'CUSTOM PSK' : (role !== 'DISABLED' ? 'DEFAULT PSK' : '--');
+                        const pskColor = hasPsk ? '#fcee0a' : '#666';
+                        const isEditing = channelEditIndex === i;
+
+                        if (isEditing) {
+                            return `<div class="msh-channel-slot msh-channel-editing">
+                                <div class="msh-channel-slot-header">
+                                    <span class="msh-channel-idx">${i}</span>
+                                    <span class="msh-channel-role" style="color:${roleColor}">${role}</span>
+                                </div>
+                                <div class="msh-channel-edit-form">
+                                    <label class="msh-edit-label">Name</label>
+                                    <input class="msh-input msh-edit-input" data-field="ch-name" value="${_esc(ch.name || '')}" placeholder="Channel name" maxlength="11" />
+                                    <label class="msh-edit-label">PSK (base64)</label>
+                                    <input class="msh-input msh-edit-input" data-field="ch-psk" value="${_esc(ch.psk || '')}" placeholder="Leave blank for default" />
+                                    <label class="msh-edit-label">Role</label>
+                                    <select class="msh-input msh-edit-input" data-field="ch-role">
+                                        ${i === 0 ? '<option value="PRIMARY" selected>PRIMARY</option>' : `
+                                        <option value="SECONDARY"${role === 'SECONDARY' ? ' selected' : ''}>SECONDARY</option>
+                                        <option value="DISABLED"${role === 'DISABLED' ? ' selected' : ''}>DISABLED</option>
+                                        `}
+                                    </select>
+                                    <div class="msh-channel-edit-actions">
+                                        <button class="msh-btn msh-btn-save" data-action="save-channel" data-idx="${i}">SAVE</button>
+                                        <button class="msh-btn" data-action="cancel-channel-edit">CANCEL</button>
+                                    </div>
+                                </div>
+                            </div>`;
+                        }
+
+                        return `<div class="msh-channel-slot${role === 'DISABLED' ? ' msh-channel-disabled' : ''}">
+                            <div class="msh-channel-slot-header">
+                                <span class="msh-channel-idx">${i}</span>
+                                <span class="msh-channel-name">${_esc(name) || '<span style="color:#555">unnamed</span>'}</span>
+                                <span class="msh-channel-role" style="color:${roleColor}">${role}</span>
+                            </div>
+                            <div class="msh-channel-slot-detail">
+                                <span class="msh-channel-psk" style="color:${pskColor}">${pskLabel}</span>
+                                <span style="flex:1"></span>
+                                ${connected ? `<button class="msh-btn msh-btn-sm" data-action="edit-channel" data-idx="${i}">EDIT</button>` : ''}
+                            </div>
+                        </div>`;
+                    }).join('')}
+                </div>
+                ${connected ? `
+                <div class="msh-channel-actions">
+                    <button class="msh-btn" data-action="share-url">SHARE CHANNEL URL</button>
+                    <button class="msh-btn" data-action="refresh-channels">REFRESH</button>
+                </div>` : ''}
+            `;
+
+            // Wire edit buttons
+            body.querySelectorAll('[data-action="edit-channel"]').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    channelEditIndex = parseInt(btn.dataset.idx, 10);
+                    renderChannels();
+                });
+            });
+            body.querySelector('[data-action="cancel-channel-edit"]')?.addEventListener('click', () => {
+                channelEditIndex = -1;
+                renderChannels();
+            });
+            body.querySelector('[data-action="save-channel"]')?.addEventListener('click', async (e) => {
+                const idx = parseInt(e.target.dataset.idx, 10);
+                const nameInput = body.querySelector('[data-field="ch-name"]');
+                const pskInput = body.querySelector('[data-field="ch-psk"]');
+                const roleSelect = body.querySelector('[data-field="ch-role"]');
+                const payload = {
+                    channel_index: idx,
+                    name: nameInput ? nameInput.value : '',
+                    psk: pskInput ? pskInput.value : '',
+                    role: roleSelect ? roleSelect.value : 'DISABLED',
+                };
+                e.target.disabled = true;
+                e.target.textContent = 'SAVING...';
+                try {
+                    await fetch(API + '/device/config', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ channel: payload }),
+                    });
+                    EventBus.emit('toast:show', { message: `Channel ${idx} saved`, type: 'success' });
+                } catch (_) {
+                    EventBus.emit('toast:show', { message: 'Failed to save channel', type: 'error' });
+                }
+                channelEditIndex = -1;
+                await fetchChannels();
+                renderChannels();
+            });
+            body.querySelector('[data-action="share-url"]')?.addEventListener('click', async () => {
+                try {
+                    const r = await fetch(API + '/device/channel-url');
+                    if (r.ok) {
+                        const d = await r.json();
+                        const url = d.url || d.channel_url || '';
+                        if (url) {
+                            if (navigator.clipboard) {
+                                await navigator.clipboard.writeText(url);
+                                EventBus.emit('toast:show', { message: 'Channel URL copied to clipboard', type: 'success' });
+                            } else {
+                                prompt('Channel URL:', url);
+                            }
+                        }
+                    }
+                } catch (_) {
+                    EventBus.emit('toast:show', { message: 'Failed to get channel URL', type: 'error' });
+                }
+            });
+            body.querySelector('[data-action="refresh-channels"]')?.addEventListener('click', async () => {
+                await fetchChannels();
+                renderChannels();
+            });
+        }
+
+        // =====================================================================
+        //  CONFIG TAB
+        // =====================================================================
+        function renderConfig() {
+            if (connected === false) {
+                body.innerHTML = '<div class="msh-empty" style="padding:40px;text-align:center">Connect a radio to configure settings.</div>';
+                return;
+            }
+            if (deviceInfoFetched === false) {
+                body.innerHTML = _loading('Loading device config...');
+                return;
+            }
+            const di = deviceInfo;
+
+            body.innerHTML = `
+                <div class="msh-config-scroll">
+                    <div class="msh-section-label">USER</div>
+                    <div class="msh-config-grid">
+                        ${_cfgInput('Long Name', 'cfg-long-name', di.long_name || '', 'text', 'Your node name')}
+                        ${_cfgInput('Short Name', 'cfg-short-name', di.short_name || '', 'text', '4 chars max', 4)}
+                        ${_cfgSelect('Role', 'cfg-role', di.role || 'CLIENT', DEVICE_ROLES)}
+                    </div>
+
+                    <div class="msh-section-label" style="margin-top:12px">LORA</div>
+                    <div class="msh-config-grid">
+                        ${_cfgSelect('Region', 'cfg-region', di.region || 'UNSET', REGIONS)}
+                        ${_cfgSelect('Modem Preset', 'cfg-modem-preset', di.modem_preset || 'LONG_FAST', MODEM_PRESETS)}
+                        ${!_isModemPresetRecommended(di.modem_preset) ? '<div class="msh-preset-warning" style="padding:2px 0 4px 108px">Bay Area Meshtastic recommends MEDIUM_FAST for this region</div>' : ''}
+                        ${_cfgInput('TX Power (dBm)', 'cfg-tx-power', di.tx_power != null ? String(di.tx_power) : '', 'number', '0-30')}
+                        ${_cfgInput('Hop Limit', 'cfg-hop-limit', di.hop_limit != null ? String(di.hop_limit) : '3', 'number', '1-7')}
+                    </div>
+
+                    <div class="msh-section-label" style="margin-top:12px">POSITION</div>
+                    <div class="msh-config-grid">
+                        ${_cfgToggle('Fixed Position', 'cfg-fixed-pos', di.fixed_position || false)}
+                        ${_cfgInput('Latitude', 'cfg-lat', di.latitude != null ? String(di.latitude) : '', 'number', 'Decimal degrees')}
+                        ${_cfgInput('Longitude', 'cfg-lon', di.longitude != null ? String(di.longitude) : '', 'number', 'Decimal degrees')}
+                        ${_cfgInput('Altitude (m)', 'cfg-alt', di.altitude != null ? String(di.altitude) : '', 'number', 'Meters')}
+                        ${_cfgInput('GPS Update Interval (s)', 'cfg-gps-interval', di.gps_update_interval != null ? String(di.gps_update_interval) : '', 'number', 'Seconds')}
+                    </div>
+
+                    <div class="msh-section-label" style="margin-top:12px">DISPLAY</div>
+                    <div class="msh-config-grid">
+                        ${_cfgInput('Screen On (s)', 'cfg-screen-on', di.screen_on_secs != null ? String(di.screen_on_secs) : '', 'number', 'Seconds')}
+                        ${_cfgToggle('Flip Screen', 'cfg-flip-screen', di.flip_screen || false)}
+                        ${_cfgToggle('Compass North Top', 'cfg-compass', di.compass_north_top || false)}
+                    </div>
+
+                    <div class="msh-section-label" style="margin-top:12px">POWER</div>
+                    <div class="msh-config-grid">
+                        ${_cfgToggle('Power Saving', 'cfg-power-saving', di.is_power_saving || false)}
+                        ${_cfgInput('Shutdown After (s)', 'cfg-shutdown', di.shutdown_on_power_loss != null ? String(di.shutdown_on_power_loss) : '', 'number', 'Seconds, 0=off')}
+                        ${_cfgInput('Min Wake (s)', 'cfg-min-wake', di.min_wake_secs != null ? String(di.min_wake_secs) : '', 'number', 'Seconds')}
+                        ${_cfgInput('SDS (s)', 'cfg-sds', di.sds_secs != null ? String(di.sds_secs) : '', 'number', 'Super Deep Sleep seconds')}
+                        ${_cfgInput('LS (s)', 'cfg-ls', di.ls_secs != null ? String(di.ls_secs) : '', 'number', 'Light Sleep seconds')}
+                    </div>
+
+                    <div class="msh-section-label" style="margin-top:12px">BLUETOOTH</div>
+                    <div class="msh-config-grid">
+                        ${_cfgToggle('BLE Enabled', 'cfg-ble-enabled', di.bluetooth_enabled !== false)}
+                        ${_cfgInput('BLE PIN', 'cfg-ble-pin', di.bluetooth_pin != null ? String(di.bluetooth_pin) : '123456', 'number', '6 digits')}
+                    </div>
+
+                    <div class="msh-section-label" style="margin-top:12px">NETWORK / WIFI</div>
+                    <div class="msh-config-grid">
+                        <div class="msh-cfg-edit-row" style="border-bottom:none;padding-bottom:0;">
+                            <span class="msh-cfg-lbl" style="color:${di.wifi_enabled ? '#05ffa1' : '#888'}">${di.wifi_enabled ? 'WiFi: ENABLED' : 'WiFi: DISABLED'}</span>
+                            <span style="font-size:0.6rem;color:#666;">Configure WiFi to enable TCP mode for wireless connection</span>
+                        </div>
+                        ${_cfgToggle('WiFi Enabled', 'cfg-wifi-enabled', di.wifi_enabled || false)}
+                        ${_cfgInput('WiFi SSID', 'cfg-wifi-ssid', di.wifi_ssid || '', 'text', 'Network name')}
+                        ${_cfgInput('WiFi Password', 'cfg-wifi-pass', di.wifi_password || '', 'password', 'Password')}
+                        <div class="msh-cfg-edit-row" style="border-bottom:none;">
+                            <span class="msh-cfg-lbl"></span>
+                            <button class="msh-btn msh-btn-sm" data-action="copy-wifi" title="Coming soon -- will detect this computer's WiFi network" style="font-size:0.6rem;">COPY FROM THIS PC</button>
+                        </div>
+                        ${_cfgInput('NTP Server', 'cfg-ntp', di.ntp_server || '', 'text', 'e.g. 0.pool.ntp.org')}
+                    </div>
+
+                    <div class="msh-section-label" style="margin-top:12px">SECURITY</div>
+                    <div class="msh-config-grid">
+                        ${_cfgToggle('Admin Channel Enabled', 'cfg-admin-ch', di.admin_channel_enabled || false)}
+                        ${_cfgToggle('Managed Mode', 'cfg-managed', di.is_managed || false)}
+                    </div>
+
+                    <div class="msh-config-save-bar">
+                        <button class="msh-btn msh-btn-save msh-btn-lg" data-action="save-config">SAVE ALL SETTINGS</button>
+                        <button class="msh-btn" data-action="refresh-config">REFRESH</button>
+                    </div>
+                </div>
+            `;
+
+            body.querySelector('[data-action="save-config"]')?.addEventListener('click', async (e) => {
+                const btn = e.target;
+                btn.disabled = true;
+                btn.textContent = 'SAVING...';
+                const payload = _gatherConfigValues(body);
+                try {
+                    const r = await fetch(API + '/device/config', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(payload),
+                    });
+                    if (r.ok) {
+                        EventBus.emit('toast:show', { message: 'Config saved to device', type: 'success' });
+                    } else {
+                        EventBus.emit('toast:show', { message: 'Config save failed', type: 'error' });
+                    }
+                } catch (_) {
+                    EventBus.emit('toast:show', { message: 'Config save failed', type: 'error' });
+                }
+                btn.disabled = false;
+                btn.textContent = 'SAVE ALL SETTINGS';
+                await fetchDeviceInfo();
+            });
+            body.querySelector('[data-action="refresh-config"]')?.addEventListener('click', async () => {
+                await fetchDeviceInfo();
+                renderConfig();
+            });
+            body.querySelector('[data-action="copy-wifi"]')?.addEventListener('click', () => {
+                EventBus.emit('toast:show', { message: 'Coming soon -- will detect this computer\'s WiFi network', type: 'info' });
+            });
+        }
+
+        function _gatherConfigValues(container) {
+            const val = (id) => {
+                const el = container.querySelector(`[data-cfg="${id}"]`);
+                if (el === null) return undefined;
+                if (el.type === 'checkbox') return el.checked;
+                if (el.type === 'number') return el.value !== '' ? Number(el.value) : undefined;
+                return el.value || undefined;
+            };
+            return {
+                long_name: val('cfg-long-name'),
+                short_name: val('cfg-short-name'),
+                role: val('cfg-role'),
+                region: val('cfg-region'),
+                modem_preset: val('cfg-modem-preset'),
+                tx_power: val('cfg-tx-power'),
+                hop_limit: val('cfg-hop-limit'),
+                fixed_position: val('cfg-fixed-pos'),
+                latitude: val('cfg-lat'),
+                longitude: val('cfg-lon'),
+                altitude: val('cfg-alt'),
+                gps_update_interval: val('cfg-gps-interval'),
+                screen_on_secs: val('cfg-screen-on'),
+                flip_screen: val('cfg-flip-screen'),
+                compass_north_top: val('cfg-compass'),
+                is_power_saving: val('cfg-power-saving'),
+                shutdown_on_power_loss: val('cfg-shutdown'),
+                min_wake_secs: val('cfg-min-wake'),
+                sds_secs: val('cfg-sds'),
+                ls_secs: val('cfg-ls'),
+                bluetooth_enabled: val('cfg-ble-enabled'),
+                bluetooth_pin: val('cfg-ble-pin'),
+                wifi_enabled: val('cfg-wifi-enabled'),
+                wifi_ssid: val('cfg-wifi-ssid'),
+                wifi_password: val('cfg-wifi-pass'),
+                ntp_server: val('cfg-ntp'),
+                admin_channel_enabled: val('cfg-admin-ch'),
+                is_managed: val('cfg-managed'),
+            };
+        }
+
+        // =====================================================================
+        //  MODULES TAB
+        // =====================================================================
+        function renderModules() {
+            if (connected === false) {
+                body.innerHTML = '<div class="msh-empty" style="padding:40px;text-align:center">Connect a radio to configure modules.</div>';
+                return;
+            }
+            const mc = moduleConfig || {};
+
+            body.innerHTML = `
+                <div class="msh-config-scroll">
+                    ${_moduleSection('MQTT', 'mqtt', [
+                        { type: 'toggle', key: 'mqtt_enabled', label: 'Enabled', val: mc.mqtt_enabled || false },
+                        { type: 'text', key: 'mqtt_address', label: 'Server Address', val: mc.mqtt_address || '', placeholder: 'mqtt.meshtastic.org' },
+                        { type: 'text', key: 'mqtt_username', label: 'Username', val: mc.mqtt_username || '' },
+                        { type: 'password', key: 'mqtt_password', label: 'Password', val: mc.mqtt_password || '' },
+                        { type: 'text', key: 'mqtt_root', label: 'Root Topic', val: mc.mqtt_root || 'msh', placeholder: 'msh' },
+                        { type: 'toggle', key: 'mqtt_encryption', label: 'Encryption Enabled', val: mc.mqtt_encryption !== false },
+                        { type: 'toggle', key: 'mqtt_json', label: 'JSON Enabled', val: mc.mqtt_json || false },
+                        { type: 'toggle', key: 'mqtt_tls', label: 'TLS Enabled', val: mc.mqtt_tls || false },
+                        { type: 'toggle', key: 'mqtt_proxy_to_client', label: 'Proxy to Client', val: mc.mqtt_proxy_to_client || false },
+                        { type: 'toggle', key: 'mqtt_map_reporting', label: 'Map Reporting', val: mc.mqtt_map_reporting || false },
+                    ])}
+
+                    ${_moduleSection('TELEMETRY', 'telemetry', [
+                        { type: 'number', key: 'telem_device_interval', label: 'Device Update (s)', val: mc.telem_device_interval || '', placeholder: '900' },
+                        { type: 'number', key: 'telem_env_interval', label: 'Environment Update (s)', val: mc.telem_env_interval || '', placeholder: '900' },
+                        { type: 'number', key: 'telem_air_interval', label: 'Air Quality Update (s)', val: mc.telem_air_interval || '', placeholder: '900' },
+                        { type: 'number', key: 'telem_power_interval', label: 'Power Update (s)', val: mc.telem_power_interval || '', placeholder: '900' },
+                        { type: 'toggle', key: 'telem_display_on_screen', label: 'Show on Screen', val: mc.telem_display_on_screen || false },
+                    ])}
+
+                    ${_moduleSection('SERIAL', 'serial', [
+                        { type: 'toggle', key: 'serial_enabled', label: 'Enabled', val: mc.serial_enabled || false },
+                        { type: 'toggle', key: 'serial_echo', label: 'Echo', val: mc.serial_echo || false },
+                        { type: 'number', key: 'serial_baud', label: 'Baud Rate', val: mc.serial_baud || '', placeholder: '38400' },
+                        { type: 'number', key: 'serial_timeout', label: 'Timeout (ms)', val: mc.serial_timeout || '', placeholder: '250' },
+                        { type: 'select', key: 'serial_mode', label: 'Mode', val: mc.serial_mode || 'DEFAULT', options: ['DEFAULT', 'SIMPLE', 'PROTO', 'TEXTMSG', 'NMEA', 'CALTOPO'] },
+                    ])}
+
+                    ${_moduleSection('RANGE TEST', 'rangetest', [
+                        { type: 'toggle', key: 'range_test_enabled', label: 'Enabled', val: mc.range_test_enabled || false },
+                        { type: 'number', key: 'range_test_sender', label: 'Send Interval (s)', val: mc.range_test_sender || '', placeholder: '0 = disabled' },
+                        { type: 'toggle', key: 'range_test_save', label: 'Save to CSV', val: mc.range_test_save || false },
+                    ])}
+
+                    ${_moduleSection('STORE & FORWARD', 'storeforward', [
+                        { type: 'toggle', key: 'store_forward_enabled', label: 'Enabled', val: mc.store_forward_enabled || false },
+                        { type: 'toggle', key: 'store_forward_heartbeat', label: 'Heartbeat', val: mc.store_forward_heartbeat || false },
+                        { type: 'number', key: 'store_forward_records', label: 'Max Records', val: mc.store_forward_records || '', placeholder: '0 = auto' },
+                        { type: 'number', key: 'store_forward_history_return_max', label: 'History Return Max', val: mc.store_forward_history_return_max || '', placeholder: '25' },
+                        { type: 'number', key: 'store_forward_history_return_window', label: 'History Window (s)', val: mc.store_forward_history_return_window || '', placeholder: '7200' },
+                    ])}
+
+                    ${_moduleSection('DETECTION SENSOR', 'detection', [
+                        { type: 'toggle', key: 'detection_enabled', label: 'Enabled', val: mc.detection_enabled || false },
+                        { type: 'text', key: 'detection_name', label: 'Name', val: mc.detection_name || '', placeholder: 'Sensor name' },
+                        { type: 'number', key: 'detection_minimum_broadcast_secs', label: 'Min Broadcast (s)', val: mc.detection_minimum_broadcast_secs || '', placeholder: '45' },
+                        { type: 'number', key: 'detection_state_broadcast_secs', label: 'State Broadcast (s)', val: mc.detection_state_broadcast_secs || '', placeholder: '3600' },
+                        { type: 'toggle', key: 'detection_send_bell', label: 'Send Bell Char', val: mc.detection_send_bell || false },
+                        { type: 'number', key: 'detection_monitor_pin', label: 'Monitor Pin (GPIO)', val: mc.detection_monitor_pin || '', placeholder: 'GPIO pin number' },
+                    ])}
+
+                    ${_moduleSection('CANNED MESSAGE', 'canned', [
+                        { type: 'toggle', key: 'canned_enabled', label: 'Enabled', val: mc.canned_enabled || false },
+                        { type: 'text', key: 'canned_messages', label: 'Messages (| separated)', val: mc.canned_messages || '', placeholder: 'Msg1|Msg2|Msg3' },
+                        { type: 'toggle', key: 'canned_rotary1', label: 'Rotary Encoder', val: mc.canned_rotary1 || false },
+                        { type: 'toggle', key: 'canned_updown1', label: 'Up/Down Buttons', val: mc.canned_updown1 || false },
+                        { type: 'number', key: 'canned_input_pin_a', label: 'Input Pin A', val: mc.canned_input_pin_a || '', placeholder: 'GPIO' },
+                        { type: 'number', key: 'canned_input_pin_b', label: 'Input Pin B', val: mc.canned_input_pin_b || '', placeholder: 'GPIO' },
+                        { type: 'number', key: 'canned_input_pin_press', label: 'Input Pin Press', val: mc.canned_input_pin_press || '', placeholder: 'GPIO' },
+                    ])}
+
+                    ${_moduleSection('NEIGHBOR INFO', 'neighborinfo', [
+                        { type: 'toggle', key: 'neighbor_info_enabled', label: 'Enabled', val: mc.neighbor_info_enabled || false },
+                        { type: 'number', key: 'neighbor_info_interval', label: 'Update Interval (s)', val: mc.neighbor_info_interval || '', placeholder: '900' },
+                    ])}
+
+                    ${_moduleSection('PAXCOUNTER', 'paxcounter', [
+                        { type: 'toggle', key: 'paxcounter_enabled', label: 'Enabled', val: mc.paxcounter_enabled || false },
+                        { type: 'number', key: 'paxcounter_update_interval', label: 'Update Interval (s)', val: mc.paxcounter_update_interval || '', placeholder: '900' },
+                    ])}
+
+                    <div class="msh-config-save-bar">
+                        <button class="msh-btn msh-btn-save msh-btn-lg" data-action="save-modules">SAVE ALL MODULES</button>
+                        <button class="msh-btn" data-action="refresh-modules">REFRESH</button>
+                    </div>
+                </div>
+            `;
+
+            // Wire collapsible sections
+            body.querySelectorAll('.msh-module-header').forEach(hdr => {
+                hdr.addEventListener('click', () => {
+                    const section = hdr.closest('.msh-module-section');
+                    if (section) section.classList.toggle('msh-module-collapsed');
+                });
+            });
+
+            body.querySelector('[data-action="save-modules"]')?.addEventListener('click', async (e) => {
+                const btn = e.target;
+                btn.disabled = true;
+                btn.textContent = 'SAVING...';
+                const payload = _gatherModuleValues(body);
+                try {
+                    const r = await fetch(API + '/device/config', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ modules: payload }),
+                    });
+                    if (r.ok) {
+                        EventBus.emit('toast:show', { message: 'Module config saved', type: 'success' });
+                    } else {
+                        EventBus.emit('toast:show', { message: 'Module save failed', type: 'error' });
+                    }
+                } catch (_) {
+                    EventBus.emit('toast:show', { message: 'Module save failed', type: 'error' });
+                }
+                btn.disabled = false;
+                btn.textContent = 'SAVE ALL MODULES';
+                await fetchModuleConfig();
+            });
+            body.querySelector('[data-action="refresh-modules"]')?.addEventListener('click', async () => {
+                await fetchModuleConfig();
+                renderModules();
+            });
+        }
+
+        function _gatherModuleValues(container) {
+            const result = {};
+            container.querySelectorAll('[data-mod]').forEach(el => {
+                const key = el.dataset.mod;
+                if (el.type === 'checkbox') {
+                    result[key] = el.checked;
+                } else if (el.type === 'number') {
+                    result[key] = el.value !== '' ? Number(el.value) : undefined;
+                } else {
+                    result[key] = el.value || undefined;
+                }
+            });
+            return result;
+        }
+
+        // ── Config/Module HTML helpers ────────────────────────────
+        function _cfgInput(label, id, value, type, placeholder, maxlength) {
+            const ml = maxlength ? ` maxlength="${maxlength}"` : '';
+            const tip = placeholder ? _esc(label + ': ' + placeholder) : _esc(label);
+            return `<div class="msh-cfg-edit-row" title="${tip}">
+                <label class="msh-cfg-lbl">${label}</label>
+                <input class="msh-input msh-cfg-input" data-cfg="${id}" type="${type || 'text'}" value="${_esc(String(value))}" placeholder="${_esc(placeholder || '')}"${ml} title="${tip}" />
+            </div>`;
+        }
+
+        function _cfgSelect(label, id, value, options) {
+            const opts = options.map(o =>
+                `<option value="${_esc(o)}"${o === value ? ' selected' : ''}>${_esc(o)}</option>`
+            ).join('');
+            return `<div class="msh-cfg-edit-row" title="${_esc(label)}">
+                <label class="msh-cfg-lbl">${label}</label>
+                <select class="msh-input msh-cfg-input" data-cfg="${id}" title="${_esc(label)}">${opts}</select>
+            </div>`;
+        }
+
+        function _cfgToggle(label, id, value) {
+            return `<div class="msh-cfg-edit-row" title="${_esc(label)}">
+                <label class="msh-cfg-lbl">${label}</label>
+                <label class="msh-toggle" title="Toggle ${_esc(label).toLowerCase()}">
+                    <input type="checkbox" data-cfg="${id}" ${value ? 'checked' : ''} />
+                    <span class="msh-toggle-slider"></span>
+                </label>
+            </div>`;
+        }
+
+        function _moduleSection(title, sectionId, fields) {
+            const fieldsHtml = fields.map(f => {
+                if (f.type === 'toggle') {
+                    return `<div class="msh-cfg-edit-row">
+                        <label class="msh-cfg-lbl">${f.label}</label>
+                        <label class="msh-toggle">
+                            <input type="checkbox" data-mod="${f.key}" ${f.val ? 'checked' : ''} />
+                            <span class="msh-toggle-slider"></span>
+                        </label>
+                    </div>`;
+                }
+                if (f.type === 'select') {
+                    const opts = (f.options || []).map(o =>
+                        `<option value="${_esc(o)}"${o === f.val ? ' selected' : ''}>${_esc(o)}</option>`
+                    ).join('');
+                    return `<div class="msh-cfg-edit-row">
+                        <label class="msh-cfg-lbl">${f.label}</label>
+                        <select class="msh-input msh-cfg-input" data-mod="${f.key}">${opts}</select>
+                    </div>`;
+                }
+                return `<div class="msh-cfg-edit-row">
+                    <label class="msh-cfg-lbl">${f.label}</label>
+                    <input class="msh-input msh-cfg-input" data-mod="${f.key}" type="${f.type || 'text'}" value="${_esc(String(f.val))}" placeholder="${_esc(f.placeholder || '')}" />
+                </div>`;
+            }).join('');
+
+            return `<div class="msh-module-section" data-section="${sectionId}">
+                <div class="msh-module-header">
+                    <span class="msh-module-arrow">\u25B6</span>
+                    <span class="msh-module-title">${title}</span>
+                </div>
+                <div class="msh-module-body">
+                    <div class="msh-config-grid">${fieldsHtml}</div>
+                </div>
+            </div>`;
+        }
+
+        // ─── FIRMWARE TAB ────────────────────────────────────────
+        let availableVersions = [];
+
+        async function fetchFirmwareInfo() {
+            fwLoading = true;
+            if (activeTab === 'firmware') renderFirmware();
+            try {
+                const [fwRes, verRes] = await Promise.all([
+                    fetch(API + '/device/firmware').then(r => r.ok ? r.json() : null),
+                    fetch(API + '/device/firmware/versions').then(r => r.ok ? r.json() : null),
+                ]);
+                if (fwRes) firmwareInfo = fwRes;
+                if (verRes) availableVersions = verRes.versions || [];
+            } catch (_) {}
+            fwLoading = false;
+            if (activeTab === 'firmware') renderFirmware();
+        }
+
+        let fwLoading = false;
+
+        function renderFirmware() {
+            if (fwLoading) {
+                body.innerHTML = _loading('Checking firmware info...');
+                return;
+            }
+            const fw = firmwareInfo;
+            const current = fw.current_version || deviceInfo.firmware_version || '--';
+            const latest = fw.latest_version || '--';
+            const hwModel = fw.hw_model || deviceInfo.hw_model || '--';
+            const updateAvail = fw.update_available;
+            const hasEsptool = fw.esptool_available;
+            const esptoolPio = fw.esptool_platformio;
+            const hasCli = fw.meshtastic_cli_available;
+            // Build esptool display: check platformio path too
+            let esptoolHtml;
+            if (hasEsptool) {
+                esptoolHtml = '<span style="color:#05ffa1">INSTALLED</span>';
+            } else if (esptoolPio) {
+                esptoolHtml = '<span style="color:#05ffa1">INSTALLED</span> <span style="color:#888;font-size:0.6rem">(via PlatformIO)</span>';
+            } else {
+                esptoolHtml = '<span style="color:#ff2a6d">NOT FOUND</span>';
+            }
+
+            body.innerHTML = `
+                <div class="msh-section-label">CURRENT FIRMWARE</div>
+                <div class="msh-config-grid">
+                    <div class="msh-cfg-row" title="Firmware version currently running on the device"><span class="msh-cfg-lbl">Version</span><span class="msh-cfg-val">${_esc(current)}</span></div>
+                    <div class="msh-cfg-row" title="Hardware model of the connected radio"><span class="msh-cfg-lbl">Hardware</span><span class="msh-cfg-val">${_esc(hwModel)}</span></div>
+                    <div class="msh-cfg-row" title="Latest firmware version available from GitHub"><span class="msh-cfg-lbl">Latest Available</span><span class="msh-cfg-val${updateAvail ? ' msh-cfg-warn' : ''}">${_esc(latest)}${updateAvail ? ' (UPDATE AVAILABLE)' : ''}</span></div>
+                    <div class="msh-cfg-row" title="esptool.py is required for flashing ESP32 devices"><span class="msh-cfg-lbl">esptool</span><span class="msh-cfg-val">${esptoolHtml}</span></div>
+                    <div class="msh-cfg-row" title="Meshtastic Python CLI for advanced operations"><span class="msh-cfg-lbl">meshtastic CLI</span><span class="msh-cfg-val">${hasCli ? '<span style="color:#05ffa1">INSTALLED</span>' : '<span style="color:#ff2a6d">NOT FOUND</span>'}</span></div>
+                </div>
+
+                ${updateAvail ? `
+                <div style="padding:8px 10px;">
+                    <button class="msh-btn msh-btn-primary" data-action="flash-latest" style="width:100%;padding:8px;font-size:0.8rem;">
+                        FLASH LATEST FIRMWARE (${_esc(latest)})
+                    </button>
+                    <div style="font-size:0.65rem;color:#888;margin-top:4px;text-align:center;">
+                        This will erase settings and install a fresh copy. Back up your channels first.
+                    </div>
+                </div>` : ''}
+
+                <div class="msh-section-label" style="margin-top:12px">FLASH CUSTOM FIRMWARE</div>
+                <div style="padding:6px 10px;">
+                    <div style="display:flex;gap:6px;align-items:center;margin-bottom:6px;">
+                        <input type="text" class="msh-input" data-bind="fw-path" placeholder="/path/to/firmware.bin or URL" style="flex:1" />
+                        <button class="msh-btn" data-action="flash-custom">FLASH</button>
+                    </div>
+                    <div style="font-size:0.65rem;color:#888;">
+                        Provide a local .bin path or upload from this machine. For ESP32-S3 boards, use the .factory.bin for full installs.
+                    </div>
+                </div>
+
+                ${availableVersions.length > 0 ? `
+                <div class="msh-section-label" style="margin-top:12px">AVAILABLE VERSIONS</div>
+                <div style="padding:0 6px 6px;max-height:200px;overflow-y:auto;">
+                    ${availableVersions.map(v => `
+                        <div class="msh-recent-row" style="cursor:pointer;" data-flash-version="${_esc(v.tag)}">
+                            <span style="color:${v.prerelease ? '#fcee0a' : '#05ffa1'};flex:0 0 100px">${_esc(v.tag)}</span>
+                            <span style="color:#888;flex:1;font-size:0.65rem">${_esc(v.name || '')}</span>
+                            <span style="color:#666;font-size:0.6rem">${v.prerelease ? 'PRE' : 'STABLE'}</span>
+                        </div>
+                    `).join('')}
+                </div>` : '<div style="padding:10px;color:#666;font-size:0.72rem;">Click REFRESH to load available versions from GitHub.</div>'}
+
+                <div style="padding:8px 10px;display:flex;gap:6px;">
+                    <button class="msh-btn" data-action="refresh-firmware">REFRESH</button>
+                </div>
+
+                <div class="msh-fw-progress" data-bind="fw-progress" style="display:none;padding:8px 10px;">
+                    <div style="font-size:0.72rem;color:#fcee0a;" data-bind="fw-status">Preparing...</div>
+                    <div style="height:4px;background:#1a1a2e;border-radius:2px;margin-top:4px;">
+                        <div data-bind="fw-bar" style="height:100%;background:#00f0ff;border-radius:2px;width:0%;transition:width 0.3s;"></div>
+                    </div>
+                </div>
+            `;
+
+            // Wire firmware actions
+            body.querySelector('[data-action="flash-latest"]')?.addEventListener('click', async () => {
+                if (!confirm('Flash latest firmware? This will ERASE all device settings. Back up channels first.')) return;
+                _showFwProgress('Downloading and flashing latest firmware...');
+                try {
+                    const r = await fetch(API + '/device/flash-latest', { method: 'POST' });
+                    const d = await r.json();
+                    _showFwProgress(d.success ? 'Flash complete! Device rebooting...' : `Flash failed: ${d.error || 'unknown'}`, d.success ? 100 : 0);
+                } catch (e) { _showFwProgress(`Error: ${e.message}`, 0); }
+            });
+
+            body.querySelector('[data-action="flash-custom"]')?.addEventListener('click', async () => {
+                const pathInput = body.querySelector('[data-bind="fw-path"]');
+                const fwPath = (pathInput?.value || '').trim();
+                if (!fwPath) { EventBus.emit('toast:show', { message: 'Enter a firmware path', type: 'alert' }); return; }
+                if (!confirm(`Flash ${fwPath}? This may erase settings.`)) return;
+                _showFwProgress(`Flashing ${fwPath}...`);
+                try {
+                    const r = await fetch(API + '/device/flash', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ firmware_path: fwPath }),
+                    });
+                    const d = await r.json();
+                    _showFwProgress(d.success ? 'Flash complete!' : `Failed: ${d.error || d.detail || 'unknown'}`, d.success ? 100 : 0);
+                } catch (e) { _showFwProgress(`Error: ${e.message}`, 0); }
+            });
+
+            body.querySelector('[data-action="refresh-firmware"]')?.addEventListener('click', async () => {
+                await fetchFirmwareInfo();
+                renderFirmware();
+            });
+
+            // Click a version to flash it
+            body.querySelectorAll('[data-flash-version]').forEach(el => {
+                el.addEventListener('click', async () => {
+                    const tag = el.dataset.flashVersion;
+                    if (!confirm(`Flash ${tag}? This will erase settings.`)) return;
+                    _showFwProgress(`Downloading ${tag}...`);
+                    // TODO: flash specific version via API
+                    EventBus.emit('toast:show', { message: `Flashing specific version (${tag}) not yet supported via API`, type: 'info' });
+                });
+            });
+        }
+
+        function _showFwProgress(msg, pct) {
+            const el = body.querySelector('[data-bind="fw-progress"]');
+            if (!el) return;
+            el.style.display = '';
+            const statusEl = el.querySelector('[data-bind="fw-status"]');
+            const barEl = el.querySelector('[data-bind="fw-bar"]');
+            if (statusEl) statusEl.textContent = msg;
+            if (barEl && pct !== undefined) barEl.style.width = pct + '%';
+        }
+
+        // ── EventBus ────────────────────────────────────────────
+        const unsubs = [
+            EventBus.on('mesh:text', (d) => {
+                if (d) { messages.push(d); if (activeTab === 'messages') renderMessages(); }
+            }),
+            EventBus.on('mesh:connected', () => { fetchAll(); fetchDeviceInfo(); fetchChannels(); fetchModuleConfig(); fetchFirmwareInfo(); }),
+            EventBus.on('mesh:disconnected', fetchAll),
+        ];
+
+        // ── Auto-refresh loop ───────────────────────────────────
+        let refreshTick = 0;
+        const timer = setInterval(() => {
+            fetchAll();
+            if (activeTab === 'messages') fetchMessages();
+            // Refresh device info every 30s (6 ticks at 5s interval)
+            refreshTick++;
+            if (refreshTick % 6 === 0 && connected) {
+                fetchDeviceInfo();
+            }
+        }, REFRESH_MS);
+
+        // ── Init ─────────────────────────────────────────────────
+        fetchMessages();
+        initAutoDetect();
+
+        // ── Cleanup ref ─────────────────────────────────────────
+        panel._mshCleanup = { timer, unsubs };
+    },
+
+    unmount(bodyEl, panel) {
+        if (panel._mshCleanup) {
+            clearInterval(panel._mshCleanup.timer);
+            panel._mshCleanup.unsubs.forEach(fn => { if (typeof fn === 'function') fn(); });
+            panel._mshCleanup = null;
+        }
+    },
+};
+
+// ── Helpers ─────────────────────────────────────────────────────────
+function _isModemPresetRecommended(preset) {
+    if (!preset || preset === '--') return true; // unknown, don't warn
+    // Modem preset enum: 4 = MEDIUM_FAST (string or numeric)
+    return preset === 'MEDIUM_FAST' || preset === '4' || preset === 4;
+}
+
+function _age(seconds) {
+    if (seconds === null || seconds === undefined || seconds < 0) return '--';
+    if (seconds < 60) return seconds + 's';
+    if (seconds < 3600) return Math.floor(seconds / 60) + 'm';
+    if (seconds < 86400) return Math.floor(seconds / 3600) + 'h';
+    return Math.floor(seconds / 86400) + 'd';
+}
+
+function _formatDist(meters) {
+    if (meters == null) return '';
+    if (meters < 1000) return Math.round(meters) + 'm';
+    return (meters / 1000).toFixed(1) + 'km';
+}
+
+function _normalizeRole(role, index) {
+    if (role === 'PRIMARY' || role === '1' || (index === 0 && role !== 'DISABLED')) return 'PRIMARY';
+    if (role === 'SECONDARY' || role === '2') return 'SECONDARY';
+    if (role === 'DISABLED' || role === '0' || role === '' || role == null) return 'DISABLED';
+    return String(role).toUpperCase();
+}
+
+// ── Styles ───────────────────────────────────────────────────────────
+function _injectStyles() {
+    if (document.getElementById('msh-styles')) return;
+    const s = document.createElement('style');
+    s.id = 'msh-styles';
+    s.textContent = `
+        /* ── Spinner ────────────────────────────────────────────── */
+        @keyframes msh-spin { to { transform:rotate(360deg); } }
+        .msh-spinner { width:16px; height:16px; border:2px solid #333; border-top-color:#00f0ff; border-radius:50%; animation:msh-spin 0.8s linear infinite; flex-shrink:0; }
+
+        /* ── Connection bar ─────────────────────────────────────── */
+        .msh-conn-bar { display:flex; align-items:center; gap:8px; padding:6px 10px; border-bottom:1px solid #1a1a2e; background:#0a0a0f; flex-shrink:0; }
+        .msh-dot { width:10px; height:10px; border-radius:50%; background:#444; flex-shrink:0; transition:background 0.3s; cursor:help; }
+        .msh-dot-on { background:#05ffa1; box-shadow:0 0 8px #05ffa188; }
+        .msh-conn-label { font-size:0.72rem; color:#888; font-weight:bold; letter-spacing:1px; }
+        .msh-conn-device { font-size:0.72rem; color:#ccc; }
+        .msh-conn-transport { font-size:0.65rem; color:#666; }
+        .msh-port-select { background:#0e0e14; border:1px solid #1a1a2e; color:#ccc; font-family:inherit; font-size:0.7rem; padding:2px 4px; border-radius:3px; max-width:150px; }
+
+        /* ── Tab bar ────────────────────────────────────────────── */
+        .msh-tabs { display:flex; border-bottom:1px solid #1a1a2e; flex-shrink:0; background:#0e0e14; }
+        .msh-tab { flex:1; padding:7px 2px; background:none; border:none; border-bottom:2px solid transparent; color:#666; font-family:inherit; font-size:0.65rem; cursor:pointer; letter-spacing:0.5px; transition:color 0.15s,border-color 0.15s,background 0.15s; white-space:nowrap; }
+        .msh-tab:hover { color:#aaa; background:rgba(0,240,255,0.04); }
+        .msh-tab-active { color:#00f0ff; border-bottom-color:#00f0ff; }
+
+        /* ── Body ───────────────────────────────────────────────── */
+        .msh-body { flex:1; overflow-y:auto; min-height:0; display:flex; flex-direction:column; }
+
+        /* ── Buttons ────────────────────────────────────────────── */
+        .msh-btn { font-family:inherit; font-size:0.7rem; padding:4px 10px; background:rgba(0,240,255,0.06); border:1px solid rgba(0,240,255,0.2); color:#00f0ff; border-radius:3px; cursor:pointer; transition:background 0.15s,filter 0.15s,box-shadow 0.15s; }
+        .msh-btn:hover { background:rgba(0,240,255,0.15); filter:brightness(1.2); box-shadow:0 0 6px rgba(0,240,255,0.15); }
+        .msh-btn:disabled { opacity:0.4; cursor:not-allowed; filter:none; box-shadow:none; }
+        .msh-btn-sm { font-size:0.65rem; padding:2px 6px; }
+        .msh-btn-lg { font-size:0.75rem; padding:6px 16px; }
+        .msh-btn-connect { background:rgba(5,255,161,0.1); border-color:rgba(5,255,161,0.3); color:#05ffa1; }
+        .msh-btn-connect:hover { background:rgba(5,255,161,0.2); }
+        .msh-btn-disconnect { background:rgba(255,42,109,0.08); border-color:rgba(255,42,109,0.2); color:#ff2a6d; }
+        .msh-btn-disconnect:hover { background:rgba(255,42,109,0.15); }
+        .msh-btn-send { background:rgba(5,255,161,0.1); border-color:rgba(5,255,161,0.3); color:#05ffa1; }
+        .msh-btn-save { background:rgba(5,255,161,0.1); border-color:rgba(5,255,161,0.3); color:#05ffa1; }
+        .msh-btn-save:hover { background:rgba(5,255,161,0.2); }
+        .msh-btn-warn { background:rgba(255,42,109,0.08); border-color:rgba(255,42,109,0.2); color:#ff2a6d; }
+        .msh-btn-warn:hover { background:rgba(255,42,109,0.15); }
+        .msh-btn-primary { background:rgba(0,240,255,0.12); border-color:rgba(0,240,255,0.4); color:#00f0ff; font-weight:bold; }
+        .msh-btn-primary:hover { background:rgba(0,240,255,0.2); box-shadow:0 0 10px rgba(0,240,255,0.2); }
+
+        /* ── Stats grid ─────────────────────────────────────────── */
+        .msh-stats { display:grid; grid-template-columns:1fr 1fr; gap:8px; padding:10px; }
+        .msh-stat { text-align:center; }
+        .msh-stat-val { font-size:1.4rem; font-weight:bold; }
+        .msh-stat-lbl { font-size:0.65rem; color:#666; letter-spacing:1px; margin-top:2px; }
+
+        /* ── Section labels ─────────────────────────────────────── */
+        .msh-section-label { font-size:0.65rem; color:#00f0ff88; letter-spacing:2px; padding:6px 10px 2px; text-transform:uppercase; }
+
+        /* ── Empty state ────────────────────────────────────────── */
+        .msh-empty { color:#555; font-size:0.72rem; }
+
+        /* ── Radio tab ──────────────────────────────────────────── */
+        .msh-radio-status { display:flex; justify-content:center; padding:16px 10px 8px; }
+        .msh-radio-indicator { display:flex; flex-direction:column; align-items:center; gap:8px; padding:16px 24px; border:1px solid #1a1a2e; border-radius:8px; }
+        .msh-radio-dot-big { width:20px; height:20px; border-radius:50%; }
+        .msh-radio-status-text { font-size:0.8rem; font-weight:bold; letter-spacing:2px; }
+        .msh-radio-actions { display:flex; gap:6px; padding:12px 10px; flex-wrap:wrap; }
+        .msh-radio-ports { margin-top:8px; }
+        .msh-port-list { padding:0 10px; }
+        .msh-port-row { display:flex; align-items:center; gap:8px; padding:6px 6px; border-bottom:1px solid #ffffff08; transition:background 0.15s; }
+        .msh-port-row:hover { background:rgba(0,240,255,0.03); }
+        .msh-port-icon { font-size:0.6rem; font-weight:bold; color:#00f0ff; border:1px solid rgba(0,240,255,0.3); border-radius:2px; padding:1px 4px; flex-shrink:0; letter-spacing:0.5px; }
+        .msh-port-row:hover { background:rgba(0,240,255,0.03); }
+        .msh-port-name { font-size:0.75rem; color:#00f0ff; min-width:120px; }
+        .msh-port-desc { font-size:0.65rem; color:#888; flex:1; }
+        .msh-radio-disconnect-bar { padding:8px 10px; }
+        .msh-saved-row .msh-port-name { color:#888; }
+
+        /* ── Node table ─────────────────────────────────────────── */
+        .msh-node-header { display:flex; justify-content:space-between; padding:4px 10px; border-bottom:1px solid #1a1a2e; flex-shrink:0; }
+        .msh-node-count { font-size:0.72rem; color:#888; }
+        .msh-node-online { font-size:0.72rem; }
+        .msh-table { width:100%; border-collapse:collapse; font-size:0.72rem; }
+        .msh-th { padding:4px 6px; color:#888; border-bottom:1px solid #1a1a2e; cursor:pointer; user-select:none; white-space:nowrap; font-size:0.65rem; letter-spacing:0.5px; }
+        .msh-th:hover { color:#00f0ff; }
+        .msh-td { padding:3px 6px; color:#ccc; border-bottom:1px solid #ffffff06; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+        .msh-td-long { max-width:120px; }
+        .msh-td-hw { font-size:0.65rem; color:#999; }
+        .msh-tr:hover .msh-td { background:rgba(0,240,255,0.03); }
+        .msh-tr-selected .msh-td { background:rgba(0,240,255,0.08); }
+        .msh-fav-star { font-size:0.85rem; transition:color 0.15s; }
+        .msh-fav-star:hover { color:#fcee0a !important; }
+
+        /* ── Node detail overlay ───────────────────────────────── */
+        .msh-node-detail { border:1px solid #00f0ff33; border-radius:4px; margin:6px 10px; background:#0e0e14; flex-shrink:0; max-height:45%; overflow-y:auto; }
+        .msh-detail-header { display:flex; align-items:center; gap:8px; padding:6px 10px; border-bottom:1px solid #1a1a2e; position:sticky; top:0; background:#0e0e14; z-index:1; }
+        .msh-detail-title { font-size:0.8rem; color:#00f0ff; font-weight:bold; letter-spacing:0.5px; }
+        .msh-detail-body { padding:4px 10px 8px; }
+        .msh-detail-row { display:flex; justify-content:space-between; padding:2px 0; border-bottom:1px solid #ffffff06; font-size:0.7rem; }
+        .msh-detail-lbl { color:#888; font-size:0.65rem; min-width:90px; }
+        .msh-detail-val { color:#ccc; text-align:right; }
+        .msh-detail-section { font-size:0.6rem; color:#00f0ff88; letter-spacing:1.5px; padding:6px 0 2px; text-transform:uppercase; font-weight:bold; }
+
+        /* ── Messages tab ───────────────────────────────────────── */
+        .msh-msg-header { display:flex; align-items:center; gap:8px; padding:6px 10px; border-bottom:1px solid #1a1a2e; flex-shrink:0; }
+        .msh-channel-select { background:#0e0e14; border:1px solid #1a1a2e; color:#ccc; font-family:inherit; font-size:0.72rem; padding:3px 6px; border-radius:3px; }
+        .msh-msg-count { font-size:0.65rem; color:#666; margin-left:auto; }
+        .msh-chat-log { flex:1; overflow-y:auto; padding:6px 10px; min-height:0; }
+        .msh-msg { margin-bottom:8px; }
+        .msh-msg-self { text-align:right; }
+        .msh-msg-meta { display:flex; align-items:center; gap:4px; margin-bottom:1px; }
+        .msh-msg-self .msh-msg-meta { justify-content:flex-end; }
+        .msh-msg-from { font-size:0.65rem; font-weight:bold; color:#00f0ff; }
+        .msh-msg-self .msh-msg-from { color:#05ffa1; }
+        .msh-msg-hops { font-size:0.6rem; color:#555; }
+        .msh-msg-time { font-size:0.6rem; color:#555; }
+        .msh-msg-delivery { font-size:0.55rem; color:#05ffa1; font-weight:bold; }
+        .msh-msg-delivery-fail { color:#ff2a6d; }
+        .msh-msg-text { color:#ccc; word-break:break-word; font-size:0.72rem; }
+        .msh-msg-acked { }
+        .msh-msg-nack .msh-msg-text { color:#888; }
+        .msh-chat-input { display:flex; gap:4px; padding:6px 10px; border-top:1px solid #1a1a2e; align-items:center; flex-shrink:0; }
+        .msh-input { flex:1; background:#0a0a0f; border:1px solid #1a1a2e; color:#ccc; padding:5px 8px; font-family:inherit; font-size:0.72rem; border-radius:3px; outline:none; }
+        .msh-input:focus { border-color:#00f0ff66; }
+        .msh-char-count { font-size:0.6rem; color:#888; min-width:24px; text-align:right; }
+
+        /* ── Channels tab ───────────────────────────────────────── */
+        .msh-channel-list { padding:4px 10px; }
+        .msh-channel-slot { border:1px solid #1a1a2e; border-radius:4px; margin-bottom:4px; padding:6px 8px; background:#0e0e14; }
+        .msh-channel-disabled { opacity:0.5; }
+        .msh-channel-editing { border-color:#00f0ff44; }
+        .msh-channel-slot-header { display:flex; align-items:center; gap:8px; }
+        .msh-channel-idx { font-size:0.65rem; color:#555; min-width:14px; font-weight:bold; }
+        .msh-channel-name { font-size:0.72rem; color:#ccc; flex:1; }
+        .msh-channel-role { font-size:0.65rem; font-weight:bold; letter-spacing:0.5px; }
+        .msh-channel-slot-detail { display:flex; align-items:center; gap:8px; margin-top:3px; padding-left:22px; }
+        .msh-channel-psk { font-size:0.65rem; }
+        .msh-channel-edit-form { padding:6px 0 4px 22px; display:flex; flex-direction:column; gap:4px; }
+        .msh-channel-edit-actions { display:flex; gap:6px; margin-top:4px; }
+        .msh-channel-actions { display:flex; gap:6px; padding:8px 10px; }
+        .msh-edit-label { font-size:0.65rem; color:#888; margin-top:2px; }
+        .msh-edit-input { max-width:200px; }
+
+        /* ── Config & Module shared ─────────────────────────────── */
+        .msh-config-scroll { flex:1; overflow-y:auto; min-height:0; padding-bottom:8px; }
+        .msh-config-grid { padding:0 10px; }
+        .msh-cfg-row { display:flex; justify-content:space-between; padding:3px 0; border-bottom:1px solid #ffffff06; font-size:0.72rem; align-items:center; transition:background 0.15s; }
+        .msh-cfg-row:hover { background:rgba(0,240,255,0.02); }
+        .msh-cfg-lbl { color:#888; font-size:0.65rem; min-width:100px; flex-shrink:0; }
+        .msh-cfg-val { color:#ccc; font-size:0.72rem; text-align:right; }
+        .msh-cfg-edit-row { display:flex; justify-content:space-between; align-items:center; padding:3px 0; border-bottom:1px solid #ffffff06; gap:8px; transition:background 0.15s; }
+        .msh-cfg-edit-row:hover { background:rgba(0,240,255,0.02); }
+        .msh-cfg-input { max-width:180px; flex:0 0 180px; font-size:0.72rem; padding:3px 6px; }
+        .msh-config-save-bar { display:flex; gap:8px; padding:12px 10px; border-top:1px solid #1a1a2e; margin-top:8px; }
+
+        /* ── Toggle switch ──────────────────────────────────────── */
+        .msh-toggle { position:relative; display:inline-block; width:32px; height:18px; flex-shrink:0; }
+        .msh-toggle input { opacity:0; width:0; height:0; }
+        .msh-toggle-slider { position:absolute; cursor:pointer; top:0; left:0; right:0; bottom:0; background:#333; transition:0.2s; border-radius:18px; }
+        .msh-toggle-slider::before { content:""; position:absolute; height:14px; width:14px; left:2px; bottom:2px; background:#888; transition:0.2s; border-radius:50%; }
+        .msh-toggle input:checked + .msh-toggle-slider { background:rgba(5,255,161,0.3); }
+        .msh-toggle input:checked + .msh-toggle-slider::before { transform:translateX(14px); background:#05ffa1; }
+
+        /* ── Module sections (collapsible) ──────────────────────── */
+        .msh-module-section { border:1px solid #1a1a2e; border-radius:4px; margin:4px 10px; overflow:hidden; }
+        .msh-module-header { display:flex; align-items:center; gap:6px; padding:6px 8px; background:#0e0e14; cursor:pointer; user-select:none; }
+        .msh-module-header:hover { background:#12121a; }
+        .msh-module-arrow { font-size:0.6rem; color:#666; transition:transform 0.2s; display:inline-block; }
+        .msh-module-title { font-size:0.72rem; color:#00f0ff; letter-spacing:1px; font-weight:bold; }
+        .msh-module-body { padding:4px 8px 8px; }
+        .msh-module-collapsed .msh-module-body { display:none; }
+        .msh-module-collapsed .msh-module-arrow { transform:rotate(0deg); }
+        .msh-module-section:not(.msh-module-collapsed) .msh-module-arrow { transform:rotate(90deg); }
+
+        /* ── Modem preset warning ──────────────────────────────── */
+        .msh-cfg-warn { color:#fcee0a !important; }
+        .msh-preset-warning { font-size:0.6rem; color:#fcee0a; padding:2px 10px; background:rgba(252,238,10,0.06); border-left:2px solid #fcee0a; margin:2px 10px 4px; }
+
+        /* ── Recent row (firmware versions etc) ────────────────── */
+        .msh-recent-row { display:flex; align-items:center; gap:8px; padding:4px 6px; border-bottom:1px solid #ffffff06; transition:background 0.15s; }
+        .msh-recent-row:hover { background:rgba(0,240,255,0.04); }
+
+        /* ── Message filter button ─────────────────────────────── */
+        .msh-msg-filter-btn { font-size:0.6rem !important; letter-spacing:0.5px; }
+        .msh-msg-filter-active { background:rgba(5,255,161,0.12); border-color:rgba(5,255,161,0.3); color:#05ffa1; }
+
+        /* ── System messages (dimmed) ──────────────────────────── */
+        .msh-msg-system { opacity:0.55; }
+        .msh-msg-system .msh-msg-text { font-size:0.65rem; }
+        .msh-msg-type-badge { font-size:0.55rem; color:#fcee0a; background:rgba(252,238,10,0.1); border:1px solid rgba(252,238,10,0.2); border-radius:2px; padding:0 3px; letter-spacing:0.5px; }
+    `;
+    document.head.appendChild(s);
+}
