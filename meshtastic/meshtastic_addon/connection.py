@@ -343,6 +343,33 @@ class ConnectionManager:
             self._close_interface()
             self.is_connected = False
 
+    @staticmethod
+    def _patch_ble_service_discovery():
+        """Monkey-patch meshtastic's BLEClient.has_characteristic to handle
+        the bleak 'Service Discovery has not been performed yet' race condition.
+
+        The meshtastic library calls bleak_client.services before BlueZ
+        finishes GATT resolution.  This patch catches the BleakError and
+        returns False so the optional log-radio characteristics are simply
+        skipped instead of crashing the entire connection.
+        """
+        try:
+            import meshtastic.ble_interface as ble_mod
+            _orig = ble_mod.BLEClient.has_characteristic
+
+            def _safe_has_characteristic(self, specifier):
+                try:
+                    return _orig(self, specifier)
+                except Exception:
+                    return False
+
+            if not getattr(ble_mod.BLEClient.has_characteristic, '_patched', False):
+                ble_mod.BLEClient.has_characteristic = _safe_has_characteristic
+                ble_mod.BLEClient.has_characteristic._patched = True
+                log.debug("Patched BLEClient.has_characteristic for service discovery race")
+        except Exception:
+            pass
+
     async def connect_ble(
         self,
         address: str = "",
@@ -367,6 +394,9 @@ class ConnectionManager:
             )
             self.is_connected = False
             return
+
+        # Patch the service discovery race condition before connecting
+        self._patch_ble_service_discovery()
 
         try:
             log.info(
