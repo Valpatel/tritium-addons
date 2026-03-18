@@ -344,31 +344,59 @@ class ConnectionManager:
             self.is_connected = False
 
     @staticmethod
-    def _patch_ble_service_discovery():
-        """Monkey-patch meshtastic's BLEClient.has_characteristic to handle
-        the bleak 'Service Discovery has not been performed yet' race condition.
+    def _patch_ble_library():
+        """Monkey-patch the meshtastic BLE library for Linux reliability.
 
-        The meshtastic library calls bleak_client.services before BlueZ
-        finishes GATT resolution.  This patch catches the BleakError and
-        returns False so the optional log-radio characteristics are simply
-        skipped instead of crashing the entire connection.
+        Two fixes:
+        1. BLEInterface.connect() passes device.address (string) to BleakClient
+           instead of the BLEDevice object from scanning.  Bleak's BlueZ backend
+           handles BLEDevice objects much more reliably — it skips the redundant
+           device lookup that causes 'failed to discover services'.
+
+        2. BLEClient.has_characteristic accesses bleak_client.services before
+           service discovery finishes, throwing BleakError.  We catch and return
+           False so optional characteristics are skipped gracefully.
         """
         try:
             import meshtastic.ble_interface as ble_mod
-            _orig = ble_mod.BLEClient.has_characteristic
 
-            def _safe_has_characteristic(self, specifier):
-                try:
-                    return _orig(self, specifier)
-                except Exception:
-                    return False
+            # --- Patch 1: pass BLEDevice, not address string ---
+            _orig_connect = ble_mod.BLEInterface.connect
+            if not getattr(_orig_connect, '_patched', False):
+                def _patched_connect(self, address=None):
+                    """Connect using BLEDevice from scan (not address string)."""
+                    device = self.find_device(address)
+                    # KEY FIX: pass the BLEDevice object, not device.address string
+                    client = ble_mod.BLEClient(
+                        device,  # BLEDevice object, not device.address!
+                        disconnected_callback=lambda _: self.close(),
+                    )
+                    client.connect()
+                    try:
+                        client.discover()
+                    except Exception:
+                        pass  # discover() may fail but services are already resolved
+                    return client
 
-            if not getattr(ble_mod.BLEClient.has_characteristic, '_patched', False):
-                ble_mod.BLEClient.has_characteristic = _safe_has_characteristic
-                ble_mod.BLEClient.has_characteristic._patched = True
+                _patched_connect._patched = True
+                ble_mod.BLEInterface.connect = _patched_connect
+                log.info("Patched BLEInterface.connect to pass BLEDevice object (not address string)")
+
+            # --- Patch 2: safe has_characteristic ---
+            _orig_has = ble_mod.BLEClient.has_characteristic
+            if not getattr(_orig_has, '_patched', False):
+                def _safe_has(self, specifier):
+                    try:
+                        return _orig_has(self, specifier)
+                    except Exception:
+                        return False
+
+                _safe_has._patched = True
+                ble_mod.BLEClient.has_characteristic = _safe_has
                 log.debug("Patched BLEClient.has_characteristic for service discovery race")
-        except Exception:
-            pass
+
+        except Exception as e:
+            log.debug(f"BLE patch failed (non-fatal): {e}")
 
     async def connect_ble(
         self,
@@ -395,45 +423,82 @@ class ConnectionManager:
             self.is_connected = False
             return
 
-        # Patch the service discovery race condition before connecting
-        self._patch_ble_service_discovery()
+        # Patch the meshtastic BLE library for Linux reliability
+        self._patch_ble_library()
 
+        # On Linux, scan for BLEDevice first — passing BLEDevice (not string)
+        # to BleakClient is critical for reliable service discovery on ESP32.
+        ble_device = None
         try:
-            log.info(
-                f"Connecting to Meshtastic via BLE "
-                f"(address={address or 'auto-discover'}, timeout={timeout}s)..."
-            )
-            self._close_interface()
+            from bleak import BleakScanner
+            log.info(f"BLE: scanning for device {address or 'any'}...")
+            devices = await BleakScanner.discover(timeout=8.0, return_adv=True)
+            for dev, adv in devices.values():
+                if address and dev.address.upper() == address.upper():
+                    ble_device = dev
+                    log.info(f"BLE: found {dev.name} RSSI={adv.rssi}")
+                    break
+                elif not address and dev.name and "Meshtastic" in dev.name:
+                    ble_device = dev
+                    log.info(f"BLE: found {dev.name} ({dev.address}) RSSI={adv.rssi}")
+                    break
+            if not ble_device:
+                log.warning(f"BLE: device {address or 'Meshtastic'} not found in scan")
+                self.is_connected = False
+                return
+        except Exception as e:
+            log.warning(f"BLE scan failed: {e}")
 
-            loop = asyncio.get_event_loop()
+        max_retries = 3
+        per_attempt_timeout = min(timeout / max_retries, 20)
 
-            def _connect():
-                kwargs: dict[str, Any] = {
-                    "noNodes": noNodes,
-                }
-                if address:
-                    kwargs["address"] = address
-                return meshtastic.ble_interface.BLEInterface(**kwargs)
+        for attempt in range(1, max_retries + 1):
+            try:
+                log.info(
+                    f"BLE connect attempt {attempt}/{max_retries} to "
+                    f"{address or 'auto-discover'} (timeout={per_attempt_timeout:.0f}s)..."
+                )
+                self._close_interface()
 
-            self.interface = await asyncio.wait_for(
-                loop.run_in_executor(None, _connect),
-                timeout=timeout,
-            )
-            self.is_connected = True
-            self.transport_type = "ble"
-            self.port = address or "auto"
-            self._read_device_info()
-            log.info(
-                f"Connected to {self.device_info.get('long_name', address)} via BLE"
-            )
-            if self.event_bus:
-                self.event_bus.publish("meshtastic:connected", {
-                    "transport": "ble", "address": address, "device": self.device_info,
-                })
-        except asyncio.TimeoutError:
-            log.warning(f"BLE connection timed out after {timeout}s")
-            self._close_interface()
-            self.is_connected = False
+                loop = asyncio.get_event_loop()
+
+                def _connect():
+                    kwargs: dict[str, Any] = {"noNodes": noNodes}
+                    if address:
+                        kwargs["address"] = address
+                    return meshtastic.ble_interface.BLEInterface(**kwargs)
+
+                self.interface = await asyncio.wait_for(
+                    loop.run_in_executor(None, _connect),
+                    timeout=per_attempt_timeout,
+                )
+                self.is_connected = True
+                self.transport_type = "ble"
+                self.port = address or "auto"
+                self._read_device_info()
+                log.info(
+                    f"Connected to {self.device_info.get('long_name', address)} via BLE "
+                    f"(attempt {attempt})"
+                )
+                if self.event_bus:
+                    self.event_bus.publish("meshtastic:connected", {
+                        "transport": "ble", "address": address, "device": self.device_info,
+                    })
+                return  # Success!
+            except asyncio.TimeoutError:
+                log.warning(f"BLE attempt {attempt}/{max_retries} timed out")
+                self._close_interface()
+            except Exception as e:
+                log.warning(f"BLE attempt {attempt}/{max_retries} failed: {e}")
+                self._close_interface()
+            await asyncio.sleep(2)  # Brief pause between retries
+
+        log.warning(f"BLE connection failed after {max_retries} attempts")
+        self.is_connected = False
+        # Fall through to the existing error handler below
+        e = Exception(f"BLE connection failed after {max_retries} attempts")
+        try:
+            raise e
         except Exception as e:
             log.warning(f"BLE connection failed: {e}")
             self._close_interface()
