@@ -491,6 +491,29 @@ def create_router(
             })
         return {"type": "FeatureCollection", "features": features}
 
+    @router.post("/nodes/import")
+    async def import_nodes(body: dict):
+        """Import nodes from an external source (BLE pull, JSON file, etc.).
+
+        Body: { "nodes": [ { "node_id": "!aabb1122", "long_name": "...", "lat": 37.7, "lng": -121.9, ... } ] }
+        """
+        if not node_manager:
+            return {"error": "node_manager not available", "imported": 0}
+
+        imported = 0
+        nodes_list = body.get("nodes", [])
+        if isinstance(nodes_list, dict):
+            nodes_list = list(nodes_list.values())
+
+        for node_data in nodes_list:
+            nid = node_data.get("node_id", "")
+            if not nid:
+                continue
+            node_manager.nodes[nid] = node_data
+            imported += 1
+
+        return {"imported": imported, "total_nodes": len(node_manager.nodes)}
+
     @router.get("/center")
     async def mesh_center():
         """Return map center and bounds for the mesh network.
