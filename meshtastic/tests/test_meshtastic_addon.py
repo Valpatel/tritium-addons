@@ -236,3 +236,27 @@ class TestConnection:
         cm = ConnectionManager()
         asyncio.run(cm.disconnect())
         assert not cm.is_connected
+
+
+# ---------------------------------------------------------------------------
+# AddonContext registration tests
+# ---------------------------------------------------------------------------
+
+class TestAddonContextRegistration:
+    """Tests for register() with AddonContext kwarg."""
+
+    def test_register_signature_accepts_context(self):
+        """register() accepts context as keyword argument."""
+        from meshtastic_addon import MeshtasticAddon
+        import inspect
+        sig = inspect.signature(MeshtasticAddon.register)
+        params = list(sig.parameters.keys())
+        assert "context" in params
+
+    def test_unregister_signature_accepts_context(self):
+        """unregister() accepts context as keyword argument."""
+        from meshtastic_addon import MeshtasticAddon
+        import inspect
+        sig = inspect.signature(MeshtasticAddon.unregister)
+        params = list(sig.parameters.keys())
+        assert "context" in params
