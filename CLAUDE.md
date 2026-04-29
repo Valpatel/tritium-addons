@@ -1,6 +1,6 @@
 # Tritium Addons — Plugin Ecosystem
 
-Addons for the Tritium tactical operating platform. Each addon is a self-contained folder with backend, frontend, runner, and tests.
+Addons for the Tritium tactical operating platform. Two addons are functional (hackrf, meshtastic) with full backend, frontend, runner, and tests. Ten comms addons (discord, telegram, irc, matrix, signal, slack, email, sms_gateway, satellite, webhooks) are stubs. wifi_csi is an empty placeholder.
 
 **Parent context:** See [../CLAUDE.md](../CLAUDE.md) for full system architecture and conventions.
 
@@ -33,7 +33,7 @@ tritium-addons/
 │   │   └── decoders/           # Signal decoders (FM, TPMS, ISM, ADS-B, rtl_433)
 │   ├── frontend/               # Vanilla JS UI panels
 │   │   └── hackrf.js           # 7-tab panel (Radio, Spectrum, Signals, etc.)
-│   ├── tests/                  # pytest tests (311 tests)
+│   ├── tests/                  # pytest tests (314 tests)
 │   ├── tritium_addon.toml      # Addon manifest
 │   ├── setup.sh                # Install dependencies (hackrf tools, rtl_433, etc.)
 │   └── docs/                   # Addon-specific docs
@@ -50,7 +50,7 @@ tritium-addons/
 │   │   └── data_store.py       # Persistent SQLite store
 │   ├── frontend/               # Vanilla JS UI panels
 │   │   └── meshtastic.js       # 7-tab panel (Radio, Nodes, Messages, etc.)
-│   ├── tests/                  # pytest tests (516 tests)
+│   ├── tests/                  # pytest tests (522 tests)
 │   ├── tritium_addon.toml      # Addon manifest
 │   └── docs/                   # Hard-won API notes
 └── CLAUDE.md                   # This file
@@ -78,7 +78,7 @@ Addons depend on:
 - Cyberpunk aesthetic: cyan #00f0ff, magenta #ff2a6d, green #05ffa1, yellow #fcee0a
 - Background: #0a0a0f, surfaces #0e0e14/#12121a
 - Type hints on all public Python functions
-- Every addon must have tests — no untested code ships
+- Functional addons must have tests — hackrf (314 tests) and meshtastic (522 tests) are covered; comms stubs have none
 
 ## Testing
 
