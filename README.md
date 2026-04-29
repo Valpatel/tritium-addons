@@ -39,7 +39,8 @@ flowchart LR
 | sms_gateway/ | Stub | — | SMS gateway (scaffolding only) |
 | satellite/ | Stub | — | Satellite tracking (scaffolding only) |
 | webhooks/ | Stub | — | Generic webhooks (scaffolding only) |
-| wifi_csi/ | Empty | ESP32 | WiFi CSI extraction (placeholder) |
+
+> Previously listed `wifi_csi/` as an empty placeholder; deleted in W203 because it was a lying manifest. See `tritium-sc/docs/technical-brief-ruview-csi-analysis.md` for the planned RuView-based implementation.
 
 The stubs share the same pattern: a plugin class that logs "started (stub)" and a `send_message()` that returns `True` without connecting to anything. They exist as scaffolding for future implementation.
 
