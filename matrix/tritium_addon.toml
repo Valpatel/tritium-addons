@@ -1,0 +1,23 @@
+# Matrix Communication Addon
+[addon]
+id = "matrix"
+name = "Matrix"
+version = "0.1.0"
+description = "Matrix/Element bridge — federated, encrypted messaging for distributed operations"
+author = "Matthew Valancy"
+license = "AGPL-3.0"
+category = "communications"
+
+[addon.capabilities]
+chat_bridge = true
+alert_relay = true
+
+[[frontend.tabs]]
+container = "comms-container"
+id = "matrix-tab"
+title = "MATRIX"
+file = "frontend/matrix_tab.js"
+
+[[api.routes]]
+prefix = "/api/comms/matrix"
+tags = ["matrix"]

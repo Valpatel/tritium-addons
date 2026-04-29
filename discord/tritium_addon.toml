@@ -1,0 +1,23 @@
+# Discord Communication Addon
+[addon]
+id = "discord"
+name = "Discord"
+version = "0.1.0"
+description = "Discord bot integration — post embeds to channels, receive commands, voice channel status"
+author = "Matthew Valancy"
+license = "AGPL-3.0"
+category = "communications"
+
+[addon.capabilities]
+chat_bridge = true
+alert_relay = true
+
+[[frontend.tabs]]
+container = "comms-container"
+id = "discord-tab"
+title = "DISCORD"
+file = "frontend/discord_tab.js"
+
+[[api.routes]]
+prefix = "/api/comms/discord"
+tags = ["discord"]

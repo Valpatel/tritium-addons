@@ -1,0 +1,23 @@
+# Signal Communication Addon
+[addon]
+id = "signal"
+name = "Signal"
+version = "0.1.0"
+description = "Signal messenger bridge via signal-cli — secure end-to-end encrypted messaging for field operators"
+author = "Matthew Valancy"
+license = "AGPL-3.0"
+category = "communications"
+
+[addon.capabilities]
+chat_bridge = true
+alert_relay = true
+
+[[frontend.tabs]]
+container = "comms-container"
+id = "signal-tab"
+title = "SIGNAL"
+file = "frontend/signal_tab.js"
+
+[[api.routes]]
+prefix = "/api/comms/signal"
+tags = ["signal"]

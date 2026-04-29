@@ -1,0 +1,23 @@
+# SMS Gateway Communication Addon
+[addon]
+id = "sms-gateway"
+name = "SMS Gateway"
+version = "0.1.0"
+description = "SMS/text message gateway via Twilio or local GSM modem — send alerts to phone numbers"
+author = "Matthew Valancy"
+license = "AGPL-3.0"
+category = "communications"
+
+[addon.capabilities]
+chat_bridge = true
+alert_relay = true
+
+[[frontend.tabs]]
+container = "comms-container"
+id = "sms_gateway-tab"
+title = "SMS GATEWAY"
+file = "frontend/sms_gateway_tab.js"
+
+[[api.routes]]
+prefix = "/api/comms/sms_gateway"
+tags = ["sms_gateway"]

@@ -1,0 +1,23 @@
+# Telegram Communication Addon
+[addon]
+id = "telegram"
+name = "Telegram"
+version = "0.1.0"
+description = "Telegram Bot API bridge — relay alerts, commands, and chat to/from Telegram groups and channels"
+author = "Matthew Valancy"
+license = "AGPL-3.0"
+category = "communications"
+
+[addon.capabilities]
+chat_bridge = true
+alert_relay = true
+
+[[frontend.tabs]]
+container = "comms-container"
+id = "telegram-tab"
+title = "TELEGRAM"
+file = "frontend/telegram_tab.js"
+
+[[api.routes]]
+prefix = "/api/comms/telegram"
+tags = ["telegram"]

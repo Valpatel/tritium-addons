@@ -1,0 +1,23 @@
+# Satellite Communication Addon
+[addon]
+id = "satellite"
+name = "Satellite"
+version = "0.1.0"
+description = "Satellite communication bridge — Iridium, Starlink, or Inmarsat for beyond-line-of-sight operations"
+author = "Matthew Valancy"
+license = "AGPL-3.0"
+category = "communications"
+
+[addon.capabilities]
+chat_bridge = true
+alert_relay = true
+
+[[frontend.tabs]]
+container = "comms-container"
+id = "satellite-tab"
+title = "SATELLITE"
+file = "frontend/satellite_tab.js"
+
+[[api.routes]]
+prefix = "/api/comms/satellite"
+tags = ["satellite"]

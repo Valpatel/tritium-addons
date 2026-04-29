@@ -1,0 +1,23 @@
+# Slack Communication Addon
+[addon]
+id = "slack"
+name = "Slack"
+version = "0.1.0"
+description = "Slack workspace integration — post alerts to channels, receive commands via slash commands"
+author = "Matthew Valancy"
+license = "AGPL-3.0"
+category = "communications"
+
+[addon.capabilities]
+chat_bridge = true
+alert_relay = true
+
+[[frontend.tabs]]
+container = "comms-container"
+id = "slack-tab"
+title = "SLACK"
+file = "frontend/slack_tab.js"
+
+[[api.routes]]
+prefix = "/api/comms/slack"
+tags = ["slack"]

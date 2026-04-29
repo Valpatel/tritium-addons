@@ -1,0 +1,29 @@
+# WiFi CSI Human Detection Addon
+[addon]
+id = "wifi-csi"
+name = "WiFi CSI"
+version = "0.1.0"
+description = "Through-wall human detection via WiFi Channel State Information. Based on RuView research."
+author = "Matthew Valancy"
+license = "AGPL-3.0"
+category = "sensing"
+
+[addon.capabilities]
+data_source = true
+human_detection = true
+
+[[frontend.tabs]]
+container = "sensors-container"
+id = "wifi-csi-tab"
+title = "WIFI CSI"
+file = "frontend/wifi_csi_tab.js"
+
+[[api.routes]]
+prefix = "/api/wifi-csi"
+tags = ["wifi-csi"]
+
+[integration]
+edge_hal = "hal_wifi_csi"
+mqtt_topics = ["tritium/+/csi/detection", "tritium/+/csi/pose", "tritium/+/csi/vitals"]
+target_tracker = true
+map_layer = "wifi_presence"

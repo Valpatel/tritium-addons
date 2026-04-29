@@ -1,0 +1,23 @@
+# IRC Communication Addon
+[addon]
+id = "irc"
+name = "IRC"
+version = "0.1.0"
+description = "IRC bridge — connect to IRC networks for low-bandwidth, high-reliability text comms"
+author = "Matthew Valancy"
+license = "AGPL-3.0"
+category = "communications"
+
+[addon.capabilities]
+chat_bridge = true
+alert_relay = true
+
+[[frontend.tabs]]
+container = "comms-container"
+id = "irc-tab"
+title = "IRC"
+file = "frontend/irc_tab.js"
+
+[[api.routes]]
+prefix = "/api/comms/irc"
+tags = ["irc"]

@@ -1,0 +1,23 @@
+# Email Communication Addon
+[addon]
+id = "email"
+name = "Email"
+version = "0.1.0"
+description = "Email notification bridge — SMTP relay for alert digests and daily reports"
+author = "Matthew Valancy"
+license = "AGPL-3.0"
+category = "communications"
+
+[addon.capabilities]
+chat_bridge = true
+alert_relay = true
+
+[[frontend.tabs]]
+container = "comms-container"
+id = "email-tab"
+title = "EMAIL"
+file = "frontend/email_tab.js"
+
+[[api.routes]]
+prefix = "/api/comms/email"
+tags = ["email"]

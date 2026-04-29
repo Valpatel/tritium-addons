@@ -1,0 +1,23 @@
+# Webhooks Communication Addon
+[addon]
+id = "webhooks"
+name = "Webhooks"
+version = "0.1.0"
+description = "Generic webhook bridge — POST JSON payloads to any URL on events, alerts, or state changes"
+author = "Matthew Valancy"
+license = "AGPL-3.0"
+category = "communications"
+
+[addon.capabilities]
+chat_bridge = true
+alert_relay = true
+
+[[frontend.tabs]]
+container = "comms-container"
+id = "webhooks-tab"
+title = "WEBHOOKS"
+file = "frontend/webhooks_tab.js"
+
+[[api.routes]]
+prefix = "/api/comms/webhooks"
+tags = ["webhooks"]
