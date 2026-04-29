@@ -53,14 +53,47 @@ def create_router(device, spectrum, receiver, fm_decoder=None, tpms_decoder=None
         """Full device info from hackrf_info.
 
         Runs hackrf_info and returns parsed output. Refreshes cached info.
+
+        Honesty contract: ``connected`` is ``True`` only when ``hackrf_info``
+        exits 0 AND the parsed output yields a non-empty serial number from
+        a real HackRF. Any error path (missing binary, non-zero exit,
+        timeout, or unparseable output) returns ``connected: False`` with
+        ``error_reason`` populated so the UI cannot misreport hardware
+        presence.
         """
+        # device.detect() returns:
+        #   None           → "Found HackRF" missing AND no Serial number line
+        #   {"connected": False, "error": ...} → tool error / non-zero exit / no binary
+        #   {... parsed info ...}                → success (also sets device._info)
         result = await device.detect()
+
         if result is None:
             return {
                 "available": device.is_available,
                 "connected": False,
                 "error": "HackRF not detected. Is the device connected?",
+                "error_reason": "no_hackrf_signature_in_output",
             }
+
+        # An explicit error envelope from device.detect() — never claim connected.
+        if isinstance(result, dict) and result.get("connected") is False:
+            return {
+                "available": device.is_available,
+                "connected": False,
+                "error": result.get("error", "HackRF detection failed"),
+                "error_reason": "hackrf_info_error",
+            }
+
+        # Real connection requires a non-empty serial from a parsed payload.
+        serial = (result.get("serial") or "").replace(" ", "") if isinstance(result, dict) else ""
+        if not serial:
+            clean = {k: v for k, v in result.items() if k != "raw_output"} if isinstance(result, dict) else {}
+            clean["available"] = device.is_available
+            clean["connected"] = False
+            clean["error"] = "HackRF reported but no serial number parsed"
+            clean["error_reason"] = "missing_serial"
+            return clean
+
         # Remove raw output from API response (it's large)
         clean = {k: v for k, v in result.items() if k != "raw_output"}
         clean["connected"] = True
