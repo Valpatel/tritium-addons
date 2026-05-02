@@ -1,5 +1,11 @@
 # Tritium Addons — Plugin Ecosystem
 
+> **North Star:** *Build a fun simulator for the purpose of testing and validating the software stack that drives independent machines.*
+
+Every addon is dual-use: it lights up real-world capability (a sensor, a comms channel, a data feed) AND becomes a playable element in the simulator (a layer, a panel, a mission trigger, a narrated event). If a new addon doesn't have both surfaces, it's incomplete.
+
+Tritium addons (this repo) are **open-source under AGPL-3.0** and define the public extension points. Closed-source intelligence plugins — including the Graphlings cognition stack which drives the *mind* of the machines — load against the same SDK without forking it. See top-level [../CLAUDE.md](../CLAUDE.md) and `project_north_star.md`.
+
 Addons for the Tritium tactical operating platform. Two addons are functional (hackrf, meshtastic) with full backend, frontend, runner, and tests. Ten comms addons (discord, telegram, irc, matrix, signal, slack, email, sms_gateway, satellite, webhooks) are stubs.
 
 > **wifi_csi removed pending real implementation.** The previous `wifi_csi/` directory shipped a manifest declaring routes, frontend tabs, and an edge HAL but only contained a 4-line `__init__.py`. Deleted in W203 along with the matching SC plugin (`tritium-sc/plugins/wifi_csi/`) and frontend tab (`sensing-wifi-csi-tab.js`). Reintroduce only when there is a working edge `hal_wifi_csi`, real CSI capture, and a backend that actually serves `/api/wifi-csi/status`. See `docs/technical-brief-ruview-csi-analysis.md` (W199 RuView research note) for the planned architecture.
