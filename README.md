@@ -2,6 +2,8 @@
 
 Drop-in sensor addons for the [Tritium](https://github.com/Valpatel/tritium) system. Each addon works three ways:
 
+> **New here?** Start with the parent repo's [`docs/QUICKSTART.md`](https://github.com/Valpatel/tritium/blob/main/docs/QUICKSTART.md). Public SDK for closed-source cognition: [`tritium-sc/docs/EMBODIMENTS.md`](https://github.com/Valpatel/tritium-sc/blob/main/docs/EMBODIMENTS.md). Glossary: [`docs/GLOSSARY.md`](https://github.com/Valpatel/tritium/blob/main/docs/GLOSSARY.md).
+
 ```mermaid
 flowchart LR
     subgraph Addon
