@@ -476,7 +476,9 @@ class TestFirmwareInfo:
                 assert fw.meshtastic_cli_available is False
 
     def test_firmware_tools_available(self, connected_dm):
-        def fake_which(name):
+        def fake_which(name, path=None):
+            # Real shutil.which is also called with path=<venv bin> — the
+            # fake must accept that kwarg or get_firmware_info blows up.
             if name == "meshtastic":
                 return "/usr/bin/meshtastic"
             return None
