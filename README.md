@@ -35,9 +35,9 @@ flowchart LR
 | telegram/ | Stub | — | Telegram bot (scaffolding only) |
 | irc/ | Stub | — | IRC bridge (scaffolding only) |
 | matrix/ | Stub | — | Matrix chat (scaffolding only) |
-| signal/ | Stub | — | Signal messenger (scaffolding only) |
+| signal_bridge/ | Stub | — | Signal messenger (scaffolding only; dir renamed — `signal/` shadowed the Python stdlib `signal` module) |
 | slack/ | Stub | — | Slack integration (scaffolding only) |
-| email/ | Stub | — | Email notifications (scaffolding only) |
+| email_bridge/ | Stub | — | Email notifications (scaffolding only; dir renamed — `email/` shadowed the Python stdlib `email` package) |
 | sms_gateway/ | Stub | — | SMS gateway (scaffolding only) |
 | satellite/ | Stub | — | Satellite tracking (scaffolding only) |
 | webhooks/ | Stub | — | Generic webhooks (scaffolding only) |
