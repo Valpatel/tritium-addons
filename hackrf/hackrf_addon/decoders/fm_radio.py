@@ -172,8 +172,6 @@ class FMRadioDecoder:
         Returns:
             Float32 numpy array of audio samples at audio_rate.
         """
-        from scipy.signal import firwin, lfilter, decimate
-
         # Load from file if needed
         if isinstance(iq_data, (str, Path)):
             raw = np.fromfile(str(iq_data), dtype=np.int8)
@@ -195,6 +193,10 @@ class FMRadioDecoder:
 
         if len(iq) < 100:
             raise ValueError(f"IQ data too short: {len(iq)} samples")
+
+        # Lazy DSP import after input validation — bad inputs raise their
+        # own errors even on hosts where scipy (setup.sh dep) is missing.
+        from scipy.signal import firwin, lfilter, decimate
 
         log.info(f"Demodulating {len(iq)} IQ samples at {sample_rate} SPS")
 

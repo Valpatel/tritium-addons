@@ -46,6 +46,7 @@ class TestFMRadioDecoder:
 
     def test_demodulate_synthetic_sine(self):
         """Test FM demodulation with a synthetic FM-modulated sine wave."""
+        pytest.importorskip("scipy", reason="scipy is an optional DSP dep installed by setup.sh")
         fm = FMRadioDecoder()
         sample_rate = 2_000_000
         duration = 0.1  # 100ms for speed
@@ -65,6 +66,7 @@ class TestFMRadioDecoder:
 
     def test_demodulate_interleaved_int8(self):
         """Test demodulation from interleaved int8 IQ data."""
+        pytest.importorskip("scipy", reason="scipy is an optional DSP dep installed by setup.sh")
         fm = FMRadioDecoder()
         # Create simple interleaved I/Q data
         n = 10000

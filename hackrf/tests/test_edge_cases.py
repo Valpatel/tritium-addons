@@ -218,7 +218,8 @@ class TestStateConsistency:
         db = SignalDatabase()
         sa = SpectrumAnalyzer(signal_db=db)
         sa._sweep_count = 100  # Old value
-        with patch("asyncio.create_subprocess_exec") as mock_exec:
+        with patch("shutil.which", return_value="/usr/bin/hackrf_sweep"), \
+             patch("asyncio.create_subprocess_exec") as mock_exec:
             mock_proc = AsyncMock()
             mock_proc.stdout = AsyncMock()
             mock_proc.stderr = AsyncMock()
@@ -231,7 +232,8 @@ class TestStateConsistency:
         """get_status should show the actual sweep range."""
         db = SignalDatabase()
         sa = SpectrumAnalyzer(signal_db=db)
-        with patch("asyncio.create_subprocess_exec") as mock_exec:
+        with patch("shutil.which", return_value="/usr/bin/hackrf_sweep"), \
+             patch("asyncio.create_subprocess_exec") as mock_exec:
             mock_proc = AsyncMock()
             mock_proc.stdout = AsyncMock()
             mock_proc.stderr = AsyncMock()
