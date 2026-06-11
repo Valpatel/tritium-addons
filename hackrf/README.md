@@ -76,3 +76,22 @@ cd tritium-sc && ./start.sh                   # Panel in WINDOWS > RADIO menu
 | SMA adapter | Optional | For external/directional antennas |
 
 The addon runs in degraded mode without hardware (no live data, tests still pass).
+
+## Feeding the Command Center tactical map (runbook)
+
+The SC `sdr_monitor` plugin is the single writer for SDR-derived map targets and
+owns `/api/sdr` (the endpoints the ADS-B overlay and Sensing tables poll). The
+hardware SDR plugin's own endpoints live under `/api/sdr/hw`. Real receivers feed
+the map over MQTT:
+
+- **ADS-B**: run a `dump1090 --net` feeder and bridge its JSON frames (one
+  object per aircraft, `hex`/`flight`/`lat`/`lon`/`altitude`/`speed`/`track`/
+  `squawk`) to `tritium/{site}/sdr/{id}/adsb`. Each frame becomes an
+  `adsb_{icao}` TrackedTarget with `source=adsb`.
+- **ISM devices**: stock `rtl_433 -F mqtt://BROKER:1883` publishes
+  `rtl_433/{hostname}/events` — `sdr_monitor` subscribes to both
+  `rtl_433/events` and `rtl_433/+/events`.
+
+No hardware? `POST /api/sdr/demo/start` (or demo mode) drives the same ingest
+pipeline with synthetic aircraft and ISM devices, and
+`POST /api/sdr/ingest/adsb` accepts dump1090-format frames over HTTP for testing.
