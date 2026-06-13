@@ -46,6 +46,31 @@ flowchart LR
 
 The stubs share the same pattern: a plugin class that logs "started (stub)" and a `send_message()` that returns `True` without connecting to anything. They exist as scaffolding for future implementation.
 
+## Verified addon index (public + private catalog)
+
+[`addon-index.json`](addon-index.json) is the catalog of **all known
+addons across repos** — public ones here, plus advanced/premium ones in
+private repos (e.g. `tritium-addon-priv`). Each entry carries `name`,
+short `description`, `license`, `owner`, source `repo`, `status`, and a
+`verified` flag. The Command Center reads it to present a searchable
+verified-addon list and **grays out** any addon whose source repo isn't
+installed — so you can see what's available and where to get it without
+the code being present (Blender-style).
+
+| Addon | Repo | License | Owner | Status |
+|-------|------|---------|-------|--------|
+| nav-pro | tritium-addon-priv (private) | Proprietary | Valpatel Software LLC | functional |
+| hackrf | tritium-addons | AGPL-3.0 | Valpatel Software LLC | functional |
+| meshtastic | tritium-addons | AGPL-3.0 | Valpatel Software LLC | functional |
+| (10 comms stubs) | tritium-addons | AGPL-3.0 | Valpatel Software LLC | stub |
+
+The index is **extensible**: add a `repos[]` entry to advertise a
+third-party addon source, then list its addons. A private addon may be
+**promoted to public** by moving its directory into this repo, switching
+its manifest `license` to `AGPL-3.0`, and updating its index entry's
+`repo`/`license` — the addon code already targets only the open SDK, so
+no code change is needed.
+
 ## Quick start
 
 ```bash
