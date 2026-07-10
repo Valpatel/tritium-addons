@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import threading
 from pathlib import Path
 from typing import Any, Optional
 
@@ -263,9 +264,59 @@ class ConnectionManager:
                         timeout=connect_timeout,
                     )
 
+                # Run the blocking connect on a DEDICATED DAEMON thread,
+                # not loop.run_in_executor(None, ...).  asyncio.wait_for
+                # cancels the await but cannot interrupt the blocked
+                # thread; a default-executor thread then gets JOINED by
+                # loop.shutdown_default_executor() at loop close, which
+                # froze app/TestClient shutdown for the full meshtastic
+                # _waitConnected timeout (observed: 4 x 120s teardown
+                # hangs in the amy test tier, 2026-07-10).  A daemon
+                # thread bridged to a future keeps the timeout semantics
+                # without ever blocking shutdown; a late success after
+                # we gave up is closed, not leaked.
+                connect_fut: asyncio.Future = loop.create_future()
+
+                def _connect_worker():
+                    try:
+                        iface = _connect()
+                    except BaseException as exc:  # bridge ALL failures
+                        def _fail(e=exc):
+                            if not connect_fut.done():
+                                connect_fut.set_exception(e)
+                        try:
+                            loop.call_soon_threadsafe(_fail)
+                        except RuntimeError:
+                            pass  # loop already closed
+                        return
+
+                    def _deliver():
+                        if not connect_fut.done():
+                            connect_fut.set_result(iface)
+                        else:
+                            # We timed out and moved on — close the
+                            # late-arriving interface instead of leaking
+                            # its reader threads.
+                            try:
+                                iface.close()
+                            except Exception:
+                                pass
+                    try:
+                        loop.call_soon_threadsafe(_deliver)
+                    except RuntimeError:
+                        try:
+                            iface.close()
+                        except Exception:
+                            pass
+
+                threading.Thread(
+                    target=_connect_worker,
+                    name="meshtastic-serial-connect",
+                    daemon=True,
+                ).start()
+
                 self.interface = await asyncio.wait_for(
-                    loop.run_in_executor(None, _connect),
-                    timeout=timeout,
+                    connect_fut, timeout=timeout,
                 )
                 self.is_connected = True
                 self.transport_type = "serial"
