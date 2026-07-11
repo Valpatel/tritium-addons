@@ -8,7 +8,13 @@ captures an RGB frame. This is the real-GPU proof that the map->3D-scene
 pipeline renders in Isaac Sim.
 """
 import argparse
+import os
 import sys
+
+# Accept the Omniverse EULA in-process (before any Kit import) so a headless /
+# detached launch never blocks on the interactive prompt. Override by exporting
+# OMNI_KIT_ACCEPT_EULA=NO if you must see the notice.
+os.environ.setdefault("OMNI_KIT_ACCEPT_EULA", "YES")
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--usd", required=True)
