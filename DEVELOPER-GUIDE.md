@@ -29,26 +29,31 @@ licensed** (not the repo-wide AGPL-3.0), on purpose: proprietary /
 closed-source addons may import it freely. See the license banner in
 [`tritium-lib/src/tritium_lib/sdk/__init__.py:5-7`](https://github.com/Valpatel/tritium-lib).
 
-**An addon is not a connector.** An addon *imports the SDK* and runs
-either inside the Command Center or as an SDK-based runner. A pure
-external system that must never import Tritium at all (e.g. a physics
-sim or a third-party stack talking a wire protocol) is a *connector* —
-it speaks MQTT / CoT / an HTTP seam and appears as a device, not as a
-loaded addon. If you are writing something that never `import`s
-`tritium_lib`, you want the MQTT device path
-([`tritium-sc/docs/EMBODIMENTS.md`](https://github.com/Valpatel/tritium-sc/blob/main/docs/EMBODIMENTS.md)),
-not this guide.
+**The addon folder is the packaging bin** for *any* optional external
+integration that the core runs fine without and that brings heavy or
+specialized dependencies (see [`CLAUDE.md`](CLAUDE.md) → "What qualifies
+as an addon"). Two flavors live in that bin:
 
-Two addons in this repo are fully functional and are the worked
-examples used throughout: **`hackrf/`** (SDR) and **`meshtastic/`**
-(LoRa mesh). The other ten dirs are comms stubs.
+- **In-process SDK addons** — the payload imports `tritium_lib.sdk`,
+  the loader `register()`s it inside the Command Center. `hackrf/` (SDR)
+  and `meshtastic/` (LoRa mesh) are the worked examples used through §2–§10.
+- **Connector addons** — the manifest is discoverable, but the payload
+  runs on a *separate host* in its own Python and **imports nothing from
+  Tritium**, talking only neutral wire seams. `isaac_sim/` (NVIDIA Isaac
+  Sim) is the worked example — see §10.
+
+If the code runs on the robot's own compute, it is **not** an addon at
+all — that is `tritium-edge/ros2`.
+
+The other ten dirs (`discord/`, `slack/`, …) are comms stubs.
 
 ---
 
-## 2. The three modes one addon can run in
+## 2. The three modes an in-process addon can run in
 
-The same addon folder serves up to three deployment shapes. You do not
-have to implement all three; a sensor-only addon is common.
+An in-process SDK addon folder serves up to three deployment shapes. You
+do not have to implement all three; a sensor-only addon is common.
+(Connector addons are a different kind — §10.)
 
 ```mermaid
 graph TB
@@ -430,7 +435,79 @@ SDK does not ship a CLI for you.
 
 ---
 
-## 10. Persistence, hot-reload, and the dev loop
+## 10. Connector addons — payload on a remote host (`isaac_sim`)
+
+Some integrations are too heavy to import into the Command Center at all
+— an 8 GB, GPU-pinned simulator, say. These become **connector addons**:
+the folder + manifest are discoverable, but the Python payload runs on a
+different box, imports **nothing** from Tritium, and talks only neutral
+wire seams. `isaac_sim/` (NVIDIA Isaac Sim) is the reference.
+
+```mermaid
+flowchart LR
+    subgraph lib["Reusable geometry — tritium-lib"]
+        SC3["geo.scene3d.build_scene3d()<br/>→ Scene3D JSON"]
+    end
+    subgraph sc["Command Center :8000 — tritium-sc"]
+        EP["GET /api/gis/scene3d"]
+        CF["camera_feeds MJPEGSource<br/>→ FrameDetectionManager → det_* tracks"]
+    end
+    subgraph host["Render host (Isaac Python) — isaac_sim/connectors/"]
+        USD["usd_scene_builder.py<br/>Scene3D → USD"]
+        CAM["camera_server.py<br/>Isaac camera → MJPEG"]
+        DOG["isaac_quadruped_server.py<br/>robot body ← JSON-lines TCP"]
+    end
+    BRAIN["robot-template brain<br/><i>tritium-sc/examples/robot-template</i>"]
+
+    SC3 --> EP -->|Scene3D JSON over LAN| USD
+    CAM -->|MJPEG over LAN| CF
+    BRAIN <-->|TCP seam| DOG
+
+    style lib fill:#0e1a2b,stroke:#00f0ff,color:#00f0ff
+    style sc fill:#0e1a2b,stroke:#ff2a6d,color:#ff2a6d
+    style host fill:#0e1a2b,stroke:#fcee0a,color:#fcee0a
+```
+
+Three neutral seams cross the boundary
+([`isaac_sim/README.md`](isaac_sim/README.md),
+[`isaac_sim/isaac_sim_addon/__init__.py:11-15`](isaac_sim/isaac_sim_addon/__init__.py)):
+
+1. **Scene3D JSON** — `tritium_lib.geo.scene3d.build_scene3d()` (DEM +
+   buildings + roads) is served at `GET /api/gis/scene3d` and turned
+   into a USD stage by `connectors/usd_scene_builder.py`.
+2. **Camera MJPEG** — `connectors/camera_server.py` exposes an Isaac
+   camera behind the *same* MJPEG-over-HTTP transport a real IP camera
+   uses, so `plugins/camera_feeds` ingests it generically — nothing in
+   `tritium-sc` knows it is Isaac.
+3. **Robot-body TCP seam** — `connectors/isaac_quadruped_server.py` is
+   the physics body; the unchanged `robot-template` brain drives it over
+   a JSON-lines TCP wire.
+
+Two things make this pattern rigorous, and both are worth copying:
+
+- **The manifest declares the quarantine, not routes.** `isaac-sim`'s
+  `[backend] module = "isaac_sim_addon"` points at a package that
+  "intentionally imports nothing from tritium and nothing heavy at
+  module import time" — so it stays inspectable in CI without a GPU, and
+  it is *not* meant to be `register()`ed as an in-process plugin (it
+  exposes no `AddonBase` subclass). `python_packages =
+  ["isaacsim[all]==6.0.1.0"]` and `[permissions] gpu = true` document
+  that the weight lives on the render host only
+  ([`isaac_sim/tritium_addon.toml`](isaac_sim/tritium_addon.toml)).
+- **The invariant is a test, not a comment.**
+  [`isaac_sim/tests/test_no_gpu.py:127-132`](isaac_sim/tests/test_no_gpu.py)
+  reads each `connectors/*.py` source and asserts `"import tritium"` and
+  `"from tritium"` are absent. If a future connector reaches into the
+  library, CI fails. (Examples that run on the Tritium *side*, like
+  `examples/smoke_detect.py`, may import `tritium_lib` — the invariant
+  is scoped to `connectors/`.)
+
+Reach for a connector addon when the dependency is heavy, host-pinned,
+or third-party and you want the core to stay runnable without it. Reach
+for an in-process SDK addon (§3–§9) for everything that can live inside
+the Command Center.
+
+## 11. Persistence, hot-reload, and the dev loop
 
 - **Persistence** — subclass `AsyncBaseStore` (`sdk/async_store.py`) for
   a WAL-mode SQLite store under `context.data_dir`. Real examples:
@@ -446,7 +523,7 @@ SDK does not ship a CLI for you.
 
 ---
 
-## 11. Publishing & the catalog
+## 12. Publishing & the catalog
 
 Every known addon — public here and private elsewhere — is listed in
 [`addon-index.json`](addon-index.json) (schema
@@ -470,7 +547,7 @@ boundary).
 
 ---
 
-## 12. Testing
+## 13. Testing
 
 ```bash
 # from the tritium-addons repo root, with tritium-lib installed:
@@ -487,7 +564,7 @@ clean and idempotent.
 
 ---
 
-## 13. Your first addon — the checklist
+## 14. Your first addon — the checklist
 
 1. `mkdir my-addon && cd my-addon`
 2. Write `tritium_addon.toml` (§4) — id, name, version, a `[frontend]`
@@ -502,7 +579,7 @@ clean and idempotent.
 7. `tests/test_my_addon.py`.
 8. Drop the folder in `tritium-addons/`, restart the Command Center (or
    `POST /api/addons/rediscover`), and watch the log line
-   `Discovered N addon(s): …, my-addon` from `main.py:2429`.
+   `Discovered N addon(s): …, my-addon` from `main.py:2430`.
 
 ---
 
