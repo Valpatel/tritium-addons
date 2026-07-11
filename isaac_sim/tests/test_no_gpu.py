@@ -89,6 +89,41 @@ def test_camera_server_synthetic_source_frames():
     assert not np.array_equal(f1, f2), "subject should move between frames"
 
 
+# -- isaac_quadruped_server: integrator + protocol WITHOUT isaacsim --------
+
+def test_quadruped_server_imports_without_isaacsim():
+    """Module import must not require isaacsim (it is lazy inside run_isaac)."""
+    mod = _load("isaac_quadruped_server")
+    assert hasattr(mod, "GaitIntegrator") and hasattr(mod, "footfalls")
+    assert hasattr(mod, "BodyServer") and hasattr(mod, "_selftest")
+
+
+def test_quadruped_gait_integrator_trots_north():
+    """The gait contract (walk/trot thresholds + north-is-y) holds in pure python."""
+    mod = _load("isaac_quadruped_server")
+    integ = mod.GaitIntegrator()
+    for _ in range(100):
+        integ.step(0.02, 0.5, 0.5)          # forward=0.5 -> 1.5 m/s -> trot
+    assert integ.gait == "trot"
+    assert abs(integ.speed - 1.5) < 1e-6
+    assert integ.y > 1.0 and abs(integ.x) < 1e-9   # moved north, no east drift
+
+
+def test_quadruped_footfall_stance_rules():
+    """Footfall stance rules match the SC gait-diagram contract."""
+    mod = _load("isaac_quadruped_server")
+    assert mod.footfalls("trot", 0.25) == ["FL", "RR"]
+    assert mod.footfalls("trot", 0.75) == ["FR", "RL"]
+    assert mod.footfalls("bound", 0.1) == ["FL", "FR"]
+
+
+def test_quadruped_selftest_passes():
+    """The server's own pure-python self-test (integrator + protocol + TCP
+    loopback) returns 0 with no Isaac import and no GPU."""
+    mod = _load("isaac_quadruped_server")
+    assert mod._selftest() == 0
+
+
 # -- dependency hygiene: connectors never import tritium -------------------
 
 def test_connectors_do_not_import_tritium():

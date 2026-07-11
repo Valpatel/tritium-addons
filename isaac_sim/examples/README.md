@@ -9,3 +9,13 @@ render host (Isaac's Python 3.12 venv, `OMNI_KIT_ACCEPT_EULA=YES`):
 
 No-GPU equivalents for CI (plain python3): `usd_scene_builder.py --validate --obj`,
 `camera_server.py --selftest`. See [`../tests/test_no_gpu.py`](../tests/test_no_gpu.py).
+
+## Robot-dog body bridge
+
+`connectors/isaac_quadruped_server.py` is an Isaac physics body behind the same
+TCP seam the `tritium-sc/examples/robot-template` brain speaks — dispatch and
+fire a physics dog from the tactical map. First run `smoke_boot.py` (boots Isaac
+headless, steps 60 physics steps, prints `SMOKE OK`); no-GPU self-test is
+`isaac_quadruped_server.py --selftest` (integrator + footfalls + TCP loopback,
+no isaacsim). Full run recipe, JSON protocol, and Jetson mapping:
+[`robot_bridge.md`](robot_bridge.md).

@@ -39,14 +39,21 @@ isaac_sim/
       usd_scene_builder.py           # Scene3D JSON -> USD stage (per-kind materials)
       render_city.py                 # headless render of a USD twin -> PNG
       camera_server.py               # Isaac camera as an MJPEG IP camera
+      isaac_quadruped_server.py      # robot-dog physics body behind the TCP seam
   examples/                          # run recipes
+      README.md                      # scene/camera recipes
+      robot_bridge.md                # robot-dog brain/body run recipe + protocol
+      smoke_boot.py                  # first-run Isaac launch validator (60 steps)
+      smoke_detect.py                # no-GPU camera->detector->track proof
   tests/                             # no-GPU gates (validate / OBJ / import guards)
 ```
 
-The robot-body connector (`isaac_quadruped_server.py`, currently in
-`tritium-sc/examples/isaac-bridge`) belongs here too and migrates in a
-coordinated step with the robotics lane; its on-robot twin lives in
-`tritium-edge/ros2/tritium_quadruped`.
+The robot-body connector (`isaac_quadruped_server.py`) is the physics half of
+the robot-dog brain/body seam: the `tritium-sc/examples/robot-template` brain
+runs unchanged over a JSON-lines TCP wire to this Isaac body. It moved here
+from `tritium-sc/examples/isaac-bridge` (see that repo's `examples/
+ISAAC-MOVED.md`); its on-robot twin lives in `tritium-edge/ros2/
+tritium_quadruped`. Run recipe + protocol: [`examples/robot_bridge.md`](examples/robot_bridge.md).
 
 ## The pipeline (map → 3D twin → perception)
 
