@@ -4,6 +4,17 @@
 
 Every addon is dual-use: it lights up real-world capability (a sensor, a comms channel, a data feed) AND becomes a playable element in the simulator (a layer, a panel, a mission trigger, a narrated event). If a new addon doesn't have both surfaces, it's incomplete.
 
+**What qualifies as an addon (the bin):** any OPTIONAL connector to an EXTERNAL
+system, tool, sensor, or simulator that the core runs fine without and that
+brings heavy or specialized dependencies. That includes **simulator / tool
+connectors** — e.g. **Isaac Sim lives here as `isaac_sim`** (USD builder,
+headless renderer, camera/robot connectors that `import isaacsim`/`pxr`, plus
+its own examples). Heavy deps are quarantined inside the addon so `tritium-lib`
+stays framework-free and `tritium-sc` stays a web app. If the code runs on the
+robot's own compute it is **not** an addon — that is `tritium-edge/ros2`. See
+the copper-roof placement rule in [`../CLAUDE.md`](../CLAUDE.md) →
+`docs/ARCHITECTURE.md` (parent repo).
+
 Tritium addons (this repo) are **open-source under AGPL-3.0** and define the public extension points. Closed-source intelligence plugins — including the Graphlings cognition stack which drives the *mind* of the machines — load against the same SDK without forking it. See top-level [../CLAUDE.md](../CLAUDE.md) and `project_north_star.md`.
 
 Addons for the Tritium tactical operating platform. Two addons are functional (hackrf, meshtastic) with full backend, frontend, runner, and tests. Ten comms addons (discord, telegram, irc, matrix, signal, slack, email, sms_gateway, satellite, webhooks) are stubs.

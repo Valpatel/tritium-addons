@@ -1,0 +1,46 @@
+[addon]
+id = "isaac-sim"
+name = "NVIDIA Isaac Sim Connector"
+version = "0.1.0"
+description = "Connect Tritium to NVIDIA Isaac Sim — render real map areas as 3D digital twins, drive simulated cameras and robot bodies, all over the LAN. Optional heavy-GPU integration; the core runs without it."
+author = "Valpatel Software LLC"
+license = "AGPL-3.0"
+addon_api = ">=1.0, <2.0"
+
+[addon.category]
+window = "simulation"
+tab_order = 5
+icon = "🎮"
+
+[dependencies]
+requires = []
+optional = []
+# Heavy Isaac Sim runtime is quarantined in THIS addon (never in tritium-lib
+# or tritium-sc). Installed on the render host only; needs Python 3.12.
+python_packages = ["isaacsim[all]==6.0.1.0"]
+
+[hardware]
+# Not a device — an external simulator reached over the LAN. Needs an
+# RTX-class GPU on the render host (RTX 4090 / RTX 3080 here).
+devices = []
+auto_detect = false
+
+[permissions]
+serial = false
+network = true
+usb = false
+gpu = true
+
+[backend]
+# This addon's payload is Isaac-SIDE connectors that run on the render host
+# (in Isaac's Python), not an in-process SC plugin. The neutral contracts it
+# consumes/produces (Scene3D geometry, camera MJPEG, robot TCP seam) live in
+# tritium-lib and tritium-sc; nothing here is imported by the SC process.
+module = "isaac_sim_addon"
+router_prefix = "/api/addons/isaac-sim"
+
+[isaac_sim]
+# The Isaac render host on the LAN (ollama stays on GB10; Isaac on the GPUs).
+render_host = "rtx3080"
+# Neutral scene contract fetched from tritium-sc.
+scene_endpoint = "/api/gis/scene3d"
