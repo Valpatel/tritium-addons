@@ -86,6 +86,11 @@ python3 -m pytest meshtastic/tests/ -v
 
 ## Creating a new addon
 
+**Follow the [Addon Developer Guide](DEVELOPER-GUIDE.md)** — the
+canonical, code-grounded walkthrough (manifest, entry-point class, the
+loader lifecycle, getting targets on the map, headless runner mode,
+publishing). The layout it expects:
+
 ```
 my-addon/
 ├── my_addon/
@@ -100,7 +105,7 @@ my-addon/
 └── tritium_addon.toml        # Manifest (metadata, routes, capabilities)
 ```
 
-The addon SDK lives in `tritium-lib` (`tritium_lib.sdk`). See [CLAUDE.md](CLAUDE.md) for the full manifest format and conventions.
+The addon SDK lives in `tritium-lib` (`tritium_lib.sdk`). Full walkthrough: [DEVELOPER-GUIDE.md](DEVELOPER-GUIDE.md). Manifest quick-reference and repo conventions: [CLAUDE.md](CLAUDE.md).
 
 ## How it grows
 

@@ -104,6 +104,11 @@ Tests require `tritium-lib` installed (`pip install -e ../tritium-lib`).
 
 ## Creating a New Addon
 
+> **Canonical guide:** [DEVELOPER-GUIDE.md](DEVELOPER-GUIDE.md) is the
+> full, code-grounded walkthrough (loader lifecycle, `AddonContext`, the
+> honest target-tracker path, headless runner, catalog publishing). The
+> steps and manifest below are the quick reference.
+
 1. Create a folder: `my-addon/`
 2. Create manifest: `my-addon/tritium_addon.toml`
 3. Create Python module: `my-addon/my_addon/__init__.py` with a class extending `SensorAddon` (or other type)
