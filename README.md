@@ -31,6 +31,7 @@ flowchart LR
 |-------|--------|----------|-------------|
 | [hackrf/](hackrf/) | **Functional** | HackRF One | Spectrum analysis, FM radio, ADS-B aircraft, TPMS vehicles, ISM bands |
 | [meshtastic/](meshtastic/) | **Functional** | Any Meshtastic radio | LoRa mesh — GPS tracking, messaging, device config |
+| [isaac_sim/](isaac_sim/) | **Connector** (in-progress) | RTX GPU render host | NVIDIA Isaac Sim digital twins — Scene3D→USD, MJPEG cameras, robot-body TCP seam (see [DEVELOPER-GUIDE.md §10](DEVELOPER-GUIDE.md)) |
 | discord/ | Stub | — | Discord bot (scaffolding only) |
 | telegram/ | Stub | — | Telegram bot (scaffolding only) |
 | irc/ | Stub | — | IRC bridge (scaffolding only) |
@@ -62,6 +63,7 @@ the code being present (Blender-style).
 | nav-pro | tritium-addon-priv (private) | Proprietary | Valpatel Software LLC | functional |
 | hackrf | tritium-addons | AGPL-3.0 | Valpatel Software LLC | functional |
 | meshtastic | tritium-addons | AGPL-3.0 | Valpatel Software LLC | functional |
+| isaac-sim | tritium-addons | AGPL-3.0 | Valpatel Software LLC | in-progress |
 | (10 comms stubs) | tritium-addons | AGPL-3.0 | Valpatel Software LLC | stub |
 
 The index is **extensible**: add a `repos[]` entry to advertise a
@@ -86,6 +88,11 @@ python3 -m pytest meshtastic/tests/ -v
 
 ## Creating a new addon
 
+**Follow the [Addon Developer Guide](DEVELOPER-GUIDE.md)** — the
+canonical, code-grounded walkthrough (manifest, entry-point class, the
+loader lifecycle, getting targets on the map, headless runner mode,
+publishing). The layout it expects:
+
 ```
 my-addon/
 ├── my_addon/
@@ -100,7 +107,7 @@ my-addon/
 └── tritium_addon.toml        # Manifest (metadata, routes, capabilities)
 ```
 
-The addon SDK lives in `tritium-lib` (`tritium_lib.sdk`). See [CLAUDE.md](CLAUDE.md) for the full manifest format and conventions.
+The addon SDK lives in `tritium-lib` (`tritium_lib.sdk`). Full walkthrough: [DEVELOPER-GUIDE.md](DEVELOPER-GUIDE.md). Manifest quick-reference and repo conventions: [CLAUDE.md](CLAUDE.md).
 
 ## How it grows
 
