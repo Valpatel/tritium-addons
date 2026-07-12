@@ -1,0 +1,51 @@
+# Fork-SAFE CI gate — GitHub-fidelity mermaid validation.
+# tritium-addons is a submodule of Valpatel/tritium; this is its own repo CI (GitHub
+# Actions checks out only this repo). Governance + rationale: docs/GOVERNANCE.md,
+# AGENTS.md. Same fork-safety model as the parent:
+#   * pull_request (NOT pull_request_target) -> fork PRs get a READ-ONLY token,
+#     no secrets. permissions: contents: read. concurrency cancel-in-progress.
+#   * The mermaid job validates every ```mermaid block against the EXACT mermaid
+#     core GitHub deploys (pinned in scripts/mermaid-github-check/) — green here
+#     means it renders on GitHub, unlike a bleeding-edge mmdc gate.
+name: ci
+
+on:
+  push:
+    branches: [dev]
+  pull_request:
+    branches: [dev, main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  mermaid-github-fidelity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: scripts/mermaid-github-check/package-lock.json
+      - name: Install pinned mermaid core (== GitHub's deployed version)
+        working-directory: scripts/mermaid-github-check
+        run: npm ci --no-audit --no-fund
+      - name: Self-test — prove the gate rejects newer-core drift
+        run: node scripts/mermaid-github-check/selftest.mjs
+      - name: Validate every mermaid block renders on GitHub
+        run: node scripts/mermaid_github_check.mjs
+
+  python-syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Byte-compile (syntax gate — no service/hardware deps)
+        run: python -m compileall -q .

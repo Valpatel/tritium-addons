@@ -1,0 +1,20 @@
+# Dependency update automation (val-ark governance: weekly, labeled, triaged).
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    labels: [dependencies, ci, needs-triage]
+
+  # The pinned mermaid-fidelity toolchain. `mermaid` is pinned EXACTLY to the
+  # version GitHub deploys — auto-bumping it would silently break the fidelity
+  # contract, so mermaid is IGNORED here and bumped MANUALLY only when GitHub
+  # advances (see scripts/mermaid-github-check/README.md). jsdom/security flow.
+  - package-ecosystem: npm
+    directory: "/scripts/mermaid-github-check"
+    schedule:
+      interval: weekly
+    labels: [dependencies, ci, needs-triage]
+    ignore:
+      - dependency-name: mermaid

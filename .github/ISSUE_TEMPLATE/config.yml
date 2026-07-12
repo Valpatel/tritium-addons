@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Vocabulary / glossary
+    url: https://github.com/Valpatel/tritium/blob/dev/docs/GLOSSARY.md
+    about: Check the term's operational meaning before filing.
+  - name: Superproject
+    url: https://github.com/Valpatel/tritium
+    about: tritium-addons is a submodule of Valpatel/tritium — cross-repo issues belong there.
