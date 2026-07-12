@@ -17,7 +17,7 @@ the copper-roof placement rule in [`../CLAUDE.md`](../CLAUDE.md) →
 
 Tritium addons (this repo) are **open-source under AGPL-3.0** and define the public extension points. Closed-source intelligence plugins — including the Graphlings cognition stack which drives the *mind* of the machines — load against the same SDK without forking it. See top-level [../CLAUDE.md](../CLAUDE.md) and `project_north_star.md`.
 
-Addons for the Tritium tactical operating platform. Two addons are functional (hackrf, meshtastic) with full backend, frontend, runner, and tests. Ten comms addons (discord, telegram, irc, matrix, signal, slack, email, sms_gateway, satellite, webhooks) are stubs.
+Addons for the Tritium tactical operating platform. Two addons are functional (hackrf, meshtastic) with full backend, frontend, runner, and tests. Ten `communications` addons form a **second archetype** — bare `*Plugin` classes (not `SensorAddon`) loaded by a `CommsDispatcher` to relay notifications *out*. Nine are pure stubs; `webhooks` is functional-when-configured (real `httpx` send). Full mechanism + honest per-addon status: [COMMS-BRIDGES.md](COMMS-BRIDGES.md).
 
 > **wifi_csi removed pending real implementation.** The previous `wifi_csi/` directory shipped a manifest declaring routes, frontend tabs, and an edge HAL but only contained a 4-line `__init__.py`. Deleted in W203 along with the matching SC plugin (`tritium-sc/plugins/wifi_csi/`) and frontend tab (`sensing-wifi-csi-tab.js`). Reintroduce only when there is a working edge `hal_wifi_csi`, real CSI capture, and a backend that actually serves `/api/wifi-csi/status`. See `docs/technical-brief-ruview-csi-analysis.md` (W199 RuView research note) for the planned architecture.
 
@@ -42,7 +42,8 @@ tritium-addons/
 │   │   ├── runner.py           # HackRFRunner(BaseRunner) — standalone Pi mode
 │   │   ├── mqtt_bridge.py      # Auto-discovers remote runners via MQTT
 │   │   ├── router.py           # FastAPI API routes + GeoJSON endpoints
-│   │   ├── device.py           # Device detection (multi-device)
+│   │   ├── device.py           # Control plane: detection/firmware/clock/antenna (dict API)
+│   │   ├── sdr_device.py       # Data plane: HackRFSDRDevice(SDRDevice ABC) real-hw adapter
 │   │   ├── spectrum.py         # Spectrum analyzer (hackrf_sweep wrapper)
 │   │   ├── fm_player.py        # FM radio demodulation + playback
 │   │   ├── signal_db.py        # In-memory signal ring buffer
@@ -52,7 +53,7 @@ tritium-addons/
 │   │   └── decoders/           # Signal decoders (FM, TPMS, ISM, ADS-B, rtl_433)
 │   ├── frontend/               # Vanilla JS UI panels
 │   │   └── hackrf.js           # 7-tab panel (Radio, Spectrum, Signals, etc.)
-│   ├── tests/                  # pytest tests (314 tests)
+│   ├── tests/                  # pytest tests (333 tests)
 │   ├── tritium_addon.toml      # Addon manifest
 │   ├── setup.sh                # Install dependencies (hackrf tools, rtl_433, etc.)
 │   └── docs/                   # Addon-specific docs
@@ -69,7 +70,7 @@ tritium-addons/
 │   │   └── data_store.py       # Persistent SQLite store
 │   ├── frontend/               # Vanilla JS UI panels
 │   │   └── meshtastic.js       # 7-tab panel (Radio, Nodes, Messages, etc.)
-│   ├── tests/                  # pytest tests (522 tests)
+│   ├── tests/                  # pytest tests (524 tests)
 │   ├── tritium_addon.toml      # Addon manifest
 │   └── docs/                   # Hard-won API notes
 └── CLAUDE.md                   # This file
@@ -82,6 +83,12 @@ Each addon has three modes:
 1. **SC Plugin** — Loaded by tritium-sc's AddonLoader, registers FastAPI routes, panels appear in WINDOWS menu, targets appear on tactical map
 2. **Standalone App** — Full-screen at `/addon/{id}/`, works on tablets, supports PWA "Add to Home Screen"
 3. **Runner** — Headless standalone mode for Raspberry Pi, publishes data to MQTT for remote operation
+
+> This describes the **sensor/connector archetype** (`SensorAddon`/`AddonBase`:
+> hackrf, meshtastic, isaac_sim). The ten `communications` addons are a
+> **different archetype** — bare `*Plugin` classes loaded by the
+> `CommsDispatcher` (not the AddonLoader) to relay notifications outward. See
+> [COMMS-BRIDGES.md](COMMS-BRIDGES.md).
 
 ## Dependencies
 
@@ -97,7 +104,7 @@ Addons depend on:
 - Cyberpunk aesthetic: cyan #00f0ff, magenta #ff2a6d, green #05ffa1, yellow #fcee0a
 - Background: #0a0a0f, surfaces #0e0e14/#12121a
 - Type hints on all public Python functions
-- Functional addons must have tests — hackrf (314 tests) and meshtastic (522 tests) are covered; comms stubs have none
+- Functional addons must have tests — hackrf (333 tests) and meshtastic (524 tests) are covered; comms stubs have none (including `webhooks`, whose real send path is untested)
 
 ## Testing
 
