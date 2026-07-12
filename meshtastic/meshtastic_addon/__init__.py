@@ -49,6 +49,7 @@ class MeshtasticAddon(SensorAddon):
         self.message_bridge: MessageBridge | None = None
         self._poll_task = None
         self._stats_task = None
+        self._connect_task = None  # background startup auto-connect (non-blocking)
 
     def _get_primary_connection(self) -> ConnectionManager | None:
         """Return the first connected ConnectionManager, or the first one registered."""
@@ -268,39 +269,23 @@ class MeshtasticAddon(SensorAddon):
             log.warning(f"Meshtastic data store init failed (non-fatal): {e}")
             self.data_store = None
 
-        # Auto-connect all detected radios
-        for device_id, conn in self._connections.items():
-            if conn.is_connected:
-                log.info(f"Device {device_id} already connected, skipping auto-connect")
-                self.registry.set_state(device_id, DeviceState.CONNECTED)
-                continue
-            dev = self.registry.get_device(device_id)
-            port = dev.metadata.get("port", "") if dev else ""
-            if port:
-                try:
-                    self.registry.set_state(device_id, DeviceState.CONNECTING)
-                    await conn.connect_serial(port, timeout=60, noNodes=True)
-                    if conn.is_connected:
-                        self.registry.set_state(device_id, DeviceState.CONNECTED)
-                        self.registry.touch(device_id)
-                        log.info(f"Connected to {device_id} on {port}")
-                    else:
-                        self.registry.set_state(device_id, DeviceState.ERROR, error="connect failed")
-                except Exception as e:
-                    log.warning(f"Auto-connect failed for {device_id}: {e}")
-                    self.registry.set_state(device_id, DeviceState.ERROR, error=str(e))
-            else:
-                # No port — try auto_connect (TCP/BLE/MQTT from env vars)
-                try:
-                    await conn.auto_connect()
-                    if conn.is_connected:
-                        self.registry.set_state(device_id, DeviceState.CONNECTED)
-                        self.registry.touch(device_id)
-                except Exception as e:
-                    log.warning(f"Auto-connect failed for {device_id}: {e}")
-
-        # Update primary connection alias after auto-connect
-        self.connection = self._get_primary_connection()
+        # Auto-connect all detected radios IN THE BACKGROUND.  A serial
+        # device that is present but never completes its Meshtastic config
+        # exchange (e.g. a phone/other CDC-ACM board enumerating as
+        # /dev/ttyACM0) would otherwise make register() — and therefore the
+        # whole lifespan startup and the server bind — block for the full
+        # connect timeout (~60s x attempts).  connect_serial already runs the
+        # blocking SerialInterface constructor on a daemon thread bridged to a
+        # future (addons fcb88ee); scheduling the whole connect loop as a
+        # background task moves the *await* off the boot path too, so the
+        # server binds immediately and the mesh connects (or fails + retries
+        # via the poll loop) without ever freezing startup.  The connection
+        # objects already exist, so state persistence / the message bridge /
+        # the poll loop below all wire up against them right now; the live
+        # interface simply attaches a moment later.
+        import asyncio
+        self._connect_task = asyncio.create_task(self._auto_connect_all())
+        self._background_tasks.append(self._connect_task)
 
         # Persist state for hot-reload via context or app.state
         state_dict = {
@@ -320,8 +305,10 @@ class MeshtasticAddon(SensorAddon):
             app.state.meshtastic_node_managers = self._node_managers
             app.state.meshtastic_registry = self.registry
 
-        # Register message bridge callbacks after connection attempt
-        self.message_bridge.register_callbacks()
+        # NOTE: message bridge receive callbacks are registered by
+        # _auto_connect_all() once an interface actually exists — they
+        # early-return without one, so registering here (before the
+        # background connect) would be a no-op.
 
         # Wire up MQTT bridge for remote Meshtastic radios (only if MQTT supports subscribe)
         self._mqtt_remote_bridge = None
@@ -346,7 +333,80 @@ class MeshtasticAddon(SensorAddon):
         self._stats_task = asyncio.create_task(self._stats_loop())
         self._background_tasks.append(self._stats_task)
 
+    async def _auto_connect_all(self):
+        """Connect every detected radio — OFF the lifespan startup path.
+
+        Scheduled as a background task by register() so a serial device that
+        is present but never completes its config exchange cannot block the
+        server bind.  Mirrors the old inline loop exactly (registry state
+        transitions, primary-alias refresh) and, once an interface exists,
+        registers the message bridge's receive callbacks.  Any failure is
+        non-fatal — the 10s poll loop keeps retrying disconnected ports.
+        """
+        import asyncio
+        import logging
+        log = logging.getLogger("meshtastic")
+        try:
+            for device_id, conn in list(self._connections.items()):
+                if conn.is_connected:
+                    log.info(f"Device {device_id} already connected, skipping auto-connect")
+                    self.registry.set_state(device_id, DeviceState.CONNECTED)
+                    continue
+                dev = self.registry.get_device(device_id)
+                port = dev.metadata.get("port", "") if dev else ""
+                if port:
+                    try:
+                        self.registry.set_state(device_id, DeviceState.CONNECTING)
+                        await conn.connect_serial(port, timeout=60, noNodes=True)
+                        if conn.is_connected:
+                            self.registry.set_state(device_id, DeviceState.CONNECTED)
+                            self.registry.touch(device_id)
+                            log.info(f"Connected to {device_id} on {port}")
+                        else:
+                            self.registry.set_state(device_id, DeviceState.ERROR, error="connect failed")
+                    except Exception as e:
+                        log.warning(f"Auto-connect failed for {device_id}: {e}")
+                        self.registry.set_state(device_id, DeviceState.ERROR, error=str(e))
+                else:
+                    # No port — try auto_connect (TCP/BLE/MQTT from env vars)
+                    try:
+                        await conn.auto_connect()
+                        if conn.is_connected:
+                            self.registry.set_state(device_id, DeviceState.CONNECTED)
+                            self.registry.touch(device_id)
+                    except Exception as e:
+                        log.warning(f"Auto-connect failed for {device_id}: {e}")
+
+            # Refresh primary connection alias, then register the message
+            # bridge's receive callbacks now that an interface may exist.
+            self.connection = self._get_primary_connection()
+            if self.message_bridge is not None:
+                self.message_bridge.connection = self.connection
+                self.message_bridge.register_callbacks()
+        except asyncio.CancelledError:
+            # Shutdown raced startup — let cancellation propagate so the task
+            # ends promptly.  Any late-arriving serial interface is closed by
+            # the daemon connect thread (see connection.connect_serial).
+            raise
+        except Exception as e:
+            log.warning(f"Background auto-connect error (non-fatal): {e}")
+
     async def unregister(self, app=None, *, context=None):
+        # Stop the background startup auto-connect before tearing radios down,
+        # so an in-flight connect cannot race the disconnect loop below.  The
+        # daemon connect thread itself is unjoinable but self-closes a late
+        # interface; cancelling the awaiting task is enough for a clean exit.
+        import asyncio
+        if self._connect_task is not None:
+            self._connect_task.cancel()
+            try:
+                await self._connect_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+            self._connect_task = None
+
         # Stop MQTT remote bridge
         if self._mqtt_remote_bridge:
             self._mqtt_remote_bridge.stop()
