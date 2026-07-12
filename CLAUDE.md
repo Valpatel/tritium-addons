@@ -1,5 +1,7 @@
 # Tritium Addons — Plugin Ecosystem
 
+> **Submodule of [Valpatel/tritium](https://github.com/Valpatel/tritium).** Cross-repo commit/push order, gitlink safety, the pre-push privacy gate, and merge hazards are in [`AGENTS.md`](AGENTS.md) (+ the parent's). Read it before any multi-repo work.
+
 > **North Star:** *Build a fun simulator for the purpose of testing and validating the software stack that drives independent machines.*
 
 Every addon is dual-use: it lights up real-world capability (a sensor, a comms channel, a data feed) AND becomes a playable element in the simulator (a layer, a panel, a mission trigger, a narrated event). If a new addon doesn't have both surfaces, it's incomplete.
