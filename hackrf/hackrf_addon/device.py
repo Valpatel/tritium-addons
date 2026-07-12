@@ -90,10 +90,18 @@ async def detect_all_hackrfs() -> list[dict]:
 
 
 class HackRFDevice:
-    """Interface to a HackRF One device via command-line tools.
+    """Control-plane interface to a HackRF One via command-line tools.
 
-    All operations use subprocess calls to hackrf_* binaries.
-    No Python bindings required.
+    Handles detection, firmware/CPLD flashing, clock (CLKIN/CLKOUT) config,
+    Opera Cake antenna switching, bias-tee, and diagnostics. All operations use
+    subprocess calls to ``hackrf_*`` binaries — no Python bindings required.
+
+    ``detect()`` returns a rich ``dict`` (consumed as a dict across the addon),
+    which is why this class intentionally does **not** inherit the data-plane
+    ``tritium_lib.sdr.SDRDevice`` ABC. For an ABC-conformant HackRF backend
+    (``detect() -> SDRInfo``, ``sweep() -> SweepResult``, ``tune`` / ``stop`` /
+    ``read_iq`` over ``hackrf_sweep`` / ``hackrf_transfer``) use
+    :class:`hackrf_addon.sdr_device.HackRFSDRDevice`, which composes this class.
     """
 
     def __init__(self):
