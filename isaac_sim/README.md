@@ -39,10 +39,13 @@ isaac_sim/
       usd_scene_builder.py           # Scene3D JSON -> USD stage (per-kind materials)
       render_city.py                 # headless render of a USD twin -> PNG
       camera_server.py               # Isaac camera as an MJPEG IP camera
+      isaac_camera_bridge.py         # robot onboard camera -> camera_feeds MQTT (JPEG + optional detections)
       isaac_quadruped_server.py      # robot-dog physics body behind the TCP seam
   examples/                          # run recipes
       README.md                      # scene/camera recipes
       robot_bridge.md                # robot-dog brain/body run recipe + protocol
+      go2_newton_stand.usd           # Newton-physics Go2 stand scene (loads under physics)
+      spot_policy_walk.py            # PhysX velocity-command RL walk runner (SIL twist seam)
       smoke_boot.py                  # first-run Isaac launch validator (60 steps)
       smoke_detect.py                # no-GPU camera->detector->track proof
   tests/                             # no-GPU gates (validate / OBJ / import guards)

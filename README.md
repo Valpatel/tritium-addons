@@ -31,7 +31,7 @@ flowchart LR
 |-------|--------|----------|-------------|
 | [hackrf/](hackrf/) | **Functional** | HackRF One | Spectrum analysis, FM radio, ADS-B aircraft, TPMS vehicles, ISM bands |
 | [meshtastic/](meshtastic/) | **Functional** | Any Meshtastic radio | LoRa mesh — GPS tracking, messaging, device config |
-| [isaac_sim/](isaac_sim/) | **Connector** (in-progress) | RTX GPU render host | NVIDIA Isaac Sim digital twins — Scene3D→USD, MJPEG cameras, robot-body TCP seam (see [DEVELOPER-GUIDE.md §10](DEVELOPER-GUIDE.md)) |
+| [isaac_sim/](isaac_sim/) | **Connector** (SIL, live) | RTX GPU render host | NVIDIA Isaac Sim digital twins — Scene3D→USD, MJPEG cameras, onboard-camera→`camera_feeds` bridge, robot-body TCP seam. Live: a Newton-physics stand scene (`go2_newton_stand.usd`) + a PhysX velocity-command walk (`spot_policy_walk.py`) (see [DEVELOPER-GUIDE.md](DEVELOPER-GUIDE.md)) |
 | [webhooks/](webhooks/) | **Functional (when configured)** | — | Real `httpx` POST of notifications to any URL. Inert until `WEBHOOKS_URL`+`WEBHOOKS_ENABLED` set |
 | [discord/](discord/) | Stub (loaded) | — | Discord bot bridge |
 | [telegram/](telegram/) | Stub (loaded) | — | Telegram bot bridge |
