@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import threading
 from pathlib import Path
 from typing import Any, Optional
 
@@ -105,6 +106,12 @@ class ConnectionManager:
         self.transport_type: str = "none"  # serial, tcp, ble, mqtt
         self.port: str = ""
         self.device_info: dict = {}
+        # Re-entry guard: only one connect attempt per manager at a time.
+        # The startup auto-connect task and the 10s poll-loop reconnect can
+        # both target the same serial port; a second _drain_serial /
+        # SerialInterface open on a port already being opened corrupts the
+        # config exchange (and can reset the ESP32 via DTR/RTS).
+        self._connecting: bool = False
 
     @property
     def is_connected(self):
@@ -228,78 +235,139 @@ class ConnectionManager:
             self.is_connected = True
             return
 
-        for attempt in range(1 + retries):
-            try:
-                import meshtastic.serial_interface
-                log.info(
-                    f"Connecting to Meshtastic on {port} "
-                    f"(attempt {attempt + 1}, timeout {timeout}s, "
-                    f"noNodes={noNodes})..."
-                )
-
-                # Disconnect any existing interface first
-                self._close_interface()
-
-                # Drain stale serial data to prevent protocol confusion
-                # (critical after rapid connect/disconnect cycles)
-                self._drain_serial(port)
-
-                loop = asyncio.get_event_loop()
-
-                # The SerialInterface ``timeout`` kwarg maps to
-                # ``connectTimeout`` — the time to open the serial port
-                # and get a basic response.  It does NOT control
-                # ``_waitConnected`` (config exchange).  We set a
-                # generous connect timeout and let asyncio.wait_for
-                # enforce the outer wall-clock deadline.
-                connect_timeout = min(int(timeout), 30)
-
-                def _connect():
-                    return meshtastic.serial_interface.SerialInterface(
-                        port,
-                        debugOut=None,
-                        noProto=False,
-                        noNodes=noNodes,
-                        timeout=connect_timeout,
+        # A connect is already running on this manager — the in-flight
+        # attempt owns the port; do not open it a second time.
+        if self._connecting:
+            log.debug(
+                f"connect_serial({port}) skipped — connect already in progress"
+            )
+            return
+        self._connecting = True
+        try:
+            for attempt in range(1 + retries):
+                try:
+                    import meshtastic.serial_interface
+                    log.info(
+                        f"Connecting to Meshtastic on {port} "
+                        f"(attempt {attempt + 1}, timeout {timeout}s, "
+                        f"noNodes={noNodes})..."
                     )
 
-                self.interface = await asyncio.wait_for(
-                    loop.run_in_executor(None, _connect),
-                    timeout=timeout,
-                )
-                self.is_connected = True
-                self.transport_type = "serial"
-                self.port = port
-                try:
-                    self._read_device_info()
-                except Exception as info_err:
-                    log.warning(f"Device info read failed (connection still OK): {info_err}")
-                log.info(f"Connected to {self.device_info.get('long_name', port)} via serial, is_connected={self.is_connected}")
-                if self.event_bus:
-                    self.event_bus.publish("meshtastic:connected", {
-                        "transport": "serial", "port": port, "device": self.device_info,
-                    })
-                log.info(f"connect_serial returning, is_connected={self.is_connected}")
-                return  # success
-            except asyncio.TimeoutError:
-                log.warning(f"Serial connection to {port} timed out after {timeout}s (attempt {attempt + 1})")
-                self._close_interface()
-                self.is_connected = False
-            except ImportError as ie:
-                log.error(f"meshtastic import failed: {ie}")
-                self.is_connected = False
-                return  # no point retrying
-            except Exception as e:
-                log.warning(f"Serial connection failed on {port}: {type(e).__name__}: {e} (attempt {attempt + 1})")
-                import traceback
-                log.debug(traceback.format_exc())
-                self._close_interface()
-                self.is_connected = False
+                    # Disconnect any existing interface first
+                    self._close_interface()
 
-            # Retry delay (only if we have retries left)
-            if attempt < retries:
-                log.info("Retrying serial connection in 2s...")
-                await asyncio.sleep(2)
+                    # Drain stale serial data to prevent protocol confusion
+                    # (critical after rapid connect/disconnect cycles)
+                    self._drain_serial(port)
+
+                    loop = asyncio.get_event_loop()
+
+                    # The SerialInterface ``timeout`` kwarg maps to
+                    # ``connectTimeout`` — the time to open the serial port
+                    # and get a basic response.  It does NOT control
+                    # ``_waitConnected`` (config exchange).  We set a
+                    # generous connect timeout and let asyncio.wait_for
+                    # enforce the outer wall-clock deadline.
+                    connect_timeout = min(int(timeout), 30)
+
+                    def _connect():
+                        return meshtastic.serial_interface.SerialInterface(
+                            port,
+                            debugOut=None,
+                            noProto=False,
+                            noNodes=noNodes,
+                            timeout=connect_timeout,
+                        )
+
+                    # Run the blocking connect on a DEDICATED DAEMON thread,
+                    # not loop.run_in_executor(None, ...).  asyncio.wait_for
+                    # cancels the await but cannot interrupt the blocked
+                    # thread; a default-executor thread then gets JOINED by
+                    # loop.shutdown_default_executor() at loop close, which
+                    # froze app/TestClient shutdown for the full meshtastic
+                    # _waitConnected timeout (observed: 4 x 120s teardown
+                    # hangs in the amy test tier, 2026-07-10).  A daemon
+                    # thread bridged to a future keeps the timeout semantics
+                    # without ever blocking shutdown; a late success after
+                    # we gave up is closed, not leaked.
+                    connect_fut: asyncio.Future = loop.create_future()
+
+                    def _connect_worker():
+                        try:
+                            iface = _connect()
+                        except BaseException as exc:  # bridge ALL failures
+                            def _fail(e=exc):
+                                if not connect_fut.done():
+                                    connect_fut.set_exception(e)
+                            try:
+                                loop.call_soon_threadsafe(_fail)
+                            except RuntimeError:
+                                pass  # loop already closed
+                            return
+
+                        def _deliver():
+                            if not connect_fut.done():
+                                connect_fut.set_result(iface)
+                            else:
+                                # We timed out and moved on — close the
+                                # late-arriving interface instead of leaking
+                                # its reader threads.
+                                try:
+                                    iface.close()
+                                except Exception:
+                                    pass
+                        try:
+                            loop.call_soon_threadsafe(_deliver)
+                        except RuntimeError:
+                            try:
+                                iface.close()
+                            except Exception:
+                                pass
+
+                    threading.Thread(
+                        target=_connect_worker,
+                        name="meshtastic-serial-connect",
+                        daemon=True,
+                    ).start()
+
+                    self.interface = await asyncio.wait_for(
+                        connect_fut, timeout=timeout,
+                    )
+                    self.is_connected = True
+                    self.transport_type = "serial"
+                    self.port = port
+                    try:
+                        self._read_device_info()
+                    except Exception as info_err:
+                        log.warning(f"Device info read failed (connection still OK): {info_err}")
+                    log.info(f"Connected to {self.device_info.get('long_name', port)} via serial, is_connected={self.is_connected}")
+                    if self.event_bus:
+                        self.event_bus.publish("meshtastic:connected", {
+                            "transport": "serial", "port": port, "device": self.device_info,
+                        })
+                    log.info(f"connect_serial returning, is_connected={self.is_connected}")
+                    return  # success
+                except asyncio.TimeoutError:
+                    log.warning(f"Serial connection to {port} timed out after {timeout}s (attempt {attempt + 1})")
+                    self._close_interface()
+                    self.is_connected = False
+                except ImportError as ie:
+                    log.error(f"meshtastic import failed: {ie}")
+                    self.is_connected = False
+                    return  # no point retrying
+                except Exception as e:
+                    log.warning(f"Serial connection failed on {port}: {type(e).__name__}: {e} (attempt {attempt + 1})")
+                    import traceback
+                    log.debug(traceback.format_exc())
+                    self._close_interface()
+                    self.is_connected = False
+
+                # Retry delay (only if we have retries left)
+                if attempt < retries:
+                    log.info("Retrying serial connection in 2s...")
+                    await asyncio.sleep(2)
+        finally:
+            self._connecting = False
 
     async def connect_tcp(self, host: str, port: int = 4403, timeout: float = DEFAULT_TCP_TIMEOUT):
         """Connect via WiFi/TCP."""

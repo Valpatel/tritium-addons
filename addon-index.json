@@ -1,0 +1,180 @@
+{
+  "schema": "tritium-addon-index/v1",
+  "updated": "2026-07-11",
+  "description": "Static catalog of known Tritium addons across public and private repos. Intended to advertise a verified-addon list and gray out addons whose source repo is not installed (Blender-style) — but NOT yet wired: no code currently reads this file. The live Addon Manager lists only installed addons via /api/addons/* (AddonLoader filesystem discovery). Extensible: add a repo entry to list third-party addon sources.",
+  "repos": [
+    {
+      "id": "tritium-addons",
+      "visibility": "public",
+      "license": "AGPL-3.0",
+      "owner": "Valpatel Software LLC",
+      "url": "https://github.com/Valpatel/tritium-addons",
+      "verified": true
+    },
+    {
+      "id": "tritium-addon-priv",
+      "visibility": "private",
+      "license": "Proprietary",
+      "owner": "Valpatel Software LLC",
+      "url": "git@github.com:Valpatel/tritium-addon-priv.git",
+      "verified": true,
+      "note": "Closed-source advanced addons. Individual addons may be promoted to a public AGPL repo at Valpatel's discretion."
+    }
+  ],
+  "addons": [
+    {
+      "id": "nav-pro",
+      "name": "Navigation Pro",
+      "repo": "tritium-addon-priv",
+      "license": "Proprietary",
+      "owner": "Valpatel Software LLC",
+      "status": "functional",
+      "category": "simulation",
+      "verified": true,
+      "description": "Flow-field crowd navigation \u2014 one field routes hundreds of agents around buildings at O(1) each, with corner-cut prevention. Premium layer over the core's per-agent grid A*."
+    },
+    {
+      "id": "hackrf",
+      "name": "HackRF One SDR",
+      "repo": "tritium-addons",
+      "license": "AGPL-3.0",
+      "owner": "Valpatel Software LLC",
+      "status": "functional",
+      "category": "radio",
+      "verified": true,
+      "description": "Software Defined Radio \u2014 spectrum analysis, FM radio, ADS-B aircraft, TPMS vehicles, ISM bands."
+    },
+    {
+      "id": "meshtastic",
+      "name": "Meshtastic LoRa",
+      "repo": "tritium-addons",
+      "license": "AGPL-3.0",
+      "owner": "Valpatel Software LLC",
+      "status": "functional",
+      "category": "mesh",
+      "verified": true,
+      "description": "LoRa mesh radio \u2014 GPS tracking, messaging, device config."
+    },
+    {
+      "id": "discord",
+      "name": "Discord Bridge",
+      "repo": "tritium-addons",
+      "license": "AGPL-3.0",
+      "owner": "Valpatel Software LLC",
+      "status": "stub",
+      "category": "comms",
+      "verified": true,
+      "description": "Discord bot bridge (scaffolding only)."
+    },
+    {
+      "id": "telegram",
+      "name": "Telegram Bridge",
+      "repo": "tritium-addons",
+      "license": "AGPL-3.0",
+      "owner": "Valpatel Software LLC",
+      "status": "stub",
+      "category": "comms",
+      "verified": true,
+      "description": "Telegram bot bridge (scaffolding only)."
+    },
+    {
+      "id": "irc",
+      "name": "IRC Bridge",
+      "repo": "tritium-addons",
+      "license": "AGPL-3.0",
+      "owner": "Valpatel Software LLC",
+      "status": "stub",
+      "category": "comms",
+      "verified": true,
+      "description": "IRC bridge (scaffolding only)."
+    },
+    {
+      "id": "matrix",
+      "name": "Matrix Bridge",
+      "repo": "tritium-addons",
+      "license": "AGPL-3.0",
+      "owner": "Valpatel Software LLC",
+      "status": "stub",
+      "category": "comms",
+      "verified": true,
+      "description": "Matrix chat bridge (scaffolding only)."
+    },
+    {
+      "id": "signal_bridge",
+      "name": "Signal Bridge",
+      "repo": "tritium-addons",
+      "license": "AGPL-3.0",
+      "owner": "Valpatel Software LLC",
+      "status": "stub",
+      "category": "comms",
+      "verified": true,
+      "description": "Signal messenger bridge (scaffolding only)."
+    },
+    {
+      "id": "slack",
+      "name": "Slack Bridge",
+      "repo": "tritium-addons",
+      "license": "AGPL-3.0",
+      "owner": "Valpatel Software LLC",
+      "status": "stub",
+      "category": "comms",
+      "verified": true,
+      "description": "Slack integration (scaffolding only)."
+    },
+    {
+      "id": "email_bridge",
+      "name": "Email Bridge",
+      "repo": "tritium-addons",
+      "license": "AGPL-3.0",
+      "owner": "Valpatel Software LLC",
+      "status": "stub",
+      "category": "comms",
+      "verified": true,
+      "description": "Email notifications (scaffolding only)."
+    },
+    {
+      "id": "sms_gateway",
+      "name": "SMS Gateway",
+      "repo": "tritium-addons",
+      "license": "AGPL-3.0",
+      "owner": "Valpatel Software LLC",
+      "status": "stub",
+      "category": "comms",
+      "verified": true,
+      "description": "SMS gateway bridge (scaffolding only)."
+    },
+    {
+      "id": "satellite",
+      "name": "Satellite Link",
+      "repo": "tritium-addons",
+      "license": "AGPL-3.0",
+      "owner": "Valpatel Software LLC",
+      "status": "stub",
+      "category": "comms",
+      "verified": true,
+      "description": "Satellite uplink (scaffolding only)."
+    },
+    {
+      "id": "webhooks",
+      "name": "Webhooks",
+      "repo": "tritium-addons",
+      "license": "AGPL-3.0",
+      "owner": "Valpatel Software LLC",
+      "status": "functional",
+      "category": "comms",
+      "verified": true,
+      "description": "Generic webhook relay — POSTs Tritium notifications (above a severity threshold) as JSON to any URL via the comms dispatcher. The one comms addon with a real send path (httpx); inert until WEBHOOKS_URL + WEBHOOKS_ENABLED are set."
+    },
+    {
+      "id": "isaac-sim",
+      "name": "NVIDIA Isaac Sim Connector",
+      "repo": "tritium-addons",
+      "license": "AGPL-3.0",
+      "owner": "Valpatel Software LLC",
+      "status": "in-progress",
+      "category": "simulation",
+      "verified": true,
+      "description": "Connect Tritium to NVIDIA Isaac Sim \u2014 render real map areas as 3D digital twins, drive simulated cameras and robot bodies over the LAN. Optional heavy-GPU integration; the core runs without it."
+    }
+  ]
+}

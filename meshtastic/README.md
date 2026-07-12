@@ -27,7 +27,7 @@ graph LR
 ### `meshtastic_addon/` — Python Backend
 | File | Description |
 |------|-------------|
-| `__init__.py` | `MeshtasticAddon(SensorAddon)` — plugin entry point, multi-radio support, auto-connect |
+| `__init__.py` | `MeshtasticAddon(SensorAddon)` — plugin entry point, multi-radio support, **non-blocking** background auto-connect |
 | `connection.py` | Serial/TCP/BLE/MQTT connection manager with auto-detect, retries, DTR drain |
 | `node_manager.py` | Converts mesh nodes to Tritium targets, BFS hop estimation, position anchors |
 | `device_manager.py` | Device configuration (LoRa params, channels, user), firmware management |
@@ -46,7 +46,7 @@ graph LR
 | `frontend/mesh-nodes.js` | Node table with sorting, filtering, GPS/battery/SNR columns |
 | `frontend/mesh-config.js` | Device configuration form (LoRa region, modem preset, tx power) |
 | `frontend/mesh-messages.js` | Chat interface for mesh text messaging |
-| `tests/` | 522 pytest tests across 9 test files |
+| `tests/` | 524 pytest tests across 10 test files (incl. `test_nonblocking_startup.py`) |
 | `tritium_addon.toml` | Addon manifest (VID:PIDs for ESP32/SiLabs/CH340, router prefix `/api/addons/meshtastic`) |
 | `docs/MESHTASTIC-API-NOTES.md` | Hard-won notes on meshtastic Python library behavior |
 
@@ -54,7 +54,7 @@ graph LR
 
 ```bash
 pip install meshtastic                        # Install dependency
-python3 -m pytest meshtastic/tests/ -v        # Run 522 tests
+python3 -m pytest meshtastic/tests/ -v        # Run 524 tests
 meshtastic --info                             # Verify hardware
 cd tritium-sc && ./start.sh                   # Panel in WINDOWS > RADIO menu
 # Or connect manually:

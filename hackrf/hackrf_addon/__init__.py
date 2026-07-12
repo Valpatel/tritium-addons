@@ -16,6 +16,7 @@ except ImportError:
 
 from .data_store import HackRFDataStore
 from .device import HackRFDevice, detect_all_hackrfs
+from .sdr_device import HackRFSDRDevice
 from .spectrum import SpectrumAnalyzer
 from .receiver import FMReceiver
 from .signal_db import SignalDatabase

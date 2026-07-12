@@ -31,20 +31,60 @@ flowchart LR
 |-------|--------|----------|-------------|
 | [hackrf/](hackrf/) | **Functional** | HackRF One | Spectrum analysis, FM radio, ADS-B aircraft, TPMS vehicles, ISM bands |
 | [meshtastic/](meshtastic/) | **Functional** | Any Meshtastic radio | LoRa mesh — GPS tracking, messaging, device config |
-| discord/ | Stub | — | Discord bot (scaffolding only) |
-| telegram/ | Stub | — | Telegram bot (scaffolding only) |
-| irc/ | Stub | — | IRC bridge (scaffolding only) |
-| matrix/ | Stub | — | Matrix chat (scaffolding only) |
-| signal_bridge/ | Stub | — | Signal messenger (scaffolding only; dir renamed — `signal/` shadowed the Python stdlib `signal` module) |
-| slack/ | Stub | — | Slack integration (scaffolding only) |
-| email_bridge/ | Stub | — | Email notifications (scaffolding only; dir renamed — `email/` shadowed the Python stdlib `email` package) |
-| sms_gateway/ | Stub | — | SMS gateway (scaffolding only) |
-| satellite/ | Stub | — | Satellite tracking (scaffolding only) |
-| webhooks/ | Stub | — | Generic webhooks (scaffolding only) |
+| [isaac_sim/](isaac_sim/) | **Connector** (in-progress) | RTX GPU render host | NVIDIA Isaac Sim digital twins — Scene3D→USD, MJPEG cameras, robot-body TCP seam (see [DEVELOPER-GUIDE.md §10](DEVELOPER-GUIDE.md)) |
+| [webhooks/](webhooks/) | **Functional (when configured)** | — | Real `httpx` POST of notifications to any URL. Inert until `WEBHOOKS_URL`+`WEBHOOKS_ENABLED` set |
+| [discord/](discord/) | Stub (loaded) | — | Discord bot bridge |
+| [telegram/](telegram/) | Stub (loaded) | — | Telegram bot bridge |
+| [irc/](irc/) | Stub (loaded) | — | IRC bridge |
+| [matrix/](matrix/) | Stub (loaded) | — | Matrix chat bridge |
+| [slack/](slack/) | Stub (loaded) | — | Slack integration |
+| [sms_gateway/](sms_gateway/) | Stub (loaded) | — | SMS gateway (Twilio / GSM modem) |
+| [satellite/](satellite/) | Stub (loaded) | — | Satellite uplink (Iridium / Starlink / Inmarsat) |
+| [signal_bridge/](signal_bridge/) | Stub (**not loaded**) | — | Signal via signal-cli; orphaned — dispatcher looks for dir `signal` (renamed to avoid shadowing stdlib `signal`) |
+| [email_bridge/](email_bridge/) | Stub (**not loaded**) | — | SMTP relay; orphaned — dispatcher looks for dir `email` (renamed to avoid shadowing stdlib `email`) |
 
 > Previously listed `wifi_csi/` as an empty placeholder; deleted in W203 because it was a lying manifest. See `tritium-sc/docs/technical-brief-ruview-csi-analysis.md` for the planned RuView-based implementation.
 
-The stubs share the same pattern: a plugin class that logs "started (stub)" and a `send_message()` that returns `True` without connecting to anything. They exist as scaffolding for future implementation.
+The ten `communications` addons are a **second addon archetype** — bare
+`*Plugin` classes (not `SensorAddon`) loaded by a `CommsDispatcher` to relay
+Tritium notifications *out* to a channel. Nine are pure stubs (`send_message()`
+logs "Would send" and returns `True`); **`webhooks` is the exception** with a
+real send path. Two (`signal_bridge`, `email_bridge`) don't even load today, and
+all ten `routes.py` routers are unmounted. The full mechanism, the honest
+per-addon status, and the drifts are documented in
+**[COMMS-BRIDGES.md](COMMS-BRIDGES.md)**.
+
+## Verified addon index (public + private catalog)
+
+[`addon-index.json`](addon-index.json) is a static catalog of **all known
+addons across repos** — public ones here, plus advanced/premium ones in
+private repos (e.g. `tritium-addon-priv`). Each entry carries `name`,
+short `description`, `license`, `owner`, source `repo`, `status`, and a
+`verified` flag.
+
+> **Honest status:** nothing in the codebase reads `addon-index.json` today
+> (verified by grep across the tree). The live Addon Manager panel
+> (`addons-manager.js`) lists only *installed* addons by discovering their
+> manifests via `/api/addons/` and `/api/addons/manifests` (filesystem
+> discovery through the `AddonLoader`). Wiring this cross-repo catalog into
+> that UI — so it can advertise-and-gray-out addons from repos that aren't
+> installed (Blender-style) — is future work, not a live feature.
+
+| Addon | Repo | License | Owner | Status |
+|-------|------|---------|-------|--------|
+| nav-pro | tritium-addon-priv (private) | Proprietary | Valpatel Software LLC | functional |
+| hackrf | tritium-addons | AGPL-3.0 | Valpatel Software LLC | functional |
+| meshtastic | tritium-addons | AGPL-3.0 | Valpatel Software LLC | functional |
+| isaac-sim | tritium-addons | AGPL-3.0 | Valpatel Software LLC | in-progress |
+| webhooks | tritium-addons | AGPL-3.0 | Valpatel Software LLC | functional (when configured) |
+| (9 comms stubs) | tritium-addons | AGPL-3.0 | Valpatel Software LLC | stub |
+
+The index is **extensible**: add a `repos[]` entry to advertise a
+third-party addon source, then list its addons. A private addon may be
+**promoted to public** by moving its directory into this repo, switching
+its manifest `license` to `AGPL-3.0`, and updating its index entry's
+`repo`/`license` — the addon code already targets only the open SDK, so
+no code change is needed.
 
 ## Quick start
 
@@ -61,6 +101,11 @@ python3 -m pytest meshtastic/tests/ -v
 
 ## Creating a new addon
 
+**Follow the [Addon Developer Guide](DEVELOPER-GUIDE.md)** — the
+canonical, code-grounded walkthrough (manifest, entry-point class, the
+loader lifecycle, getting targets on the map, headless runner mode,
+publishing). The layout it expects:
+
 ```
 my-addon/
 ├── my_addon/
@@ -75,7 +120,9 @@ my-addon/
 └── tritium_addon.toml        # Manifest (metadata, routes, capabilities)
 ```
 
-The addon SDK lives in `tritium-lib` (`tritium_lib.sdk`). See [CLAUDE.md](CLAUDE.md) for the full manifest format and conventions.
+The addon SDK lives in `tritium-lib` (`tritium_lib.sdk`). Full walkthrough: [DEVELOPER-GUIDE.md](DEVELOPER-GUIDE.md). Manifest quick-reference and repo conventions: [CLAUDE.md](CLAUDE.md).
+
+Building an **outbound comms bridge** (relay notifications to Discord/Slack/email/…) instead of a sensor? That's a separate, lighter archetype — see **[COMMS-BRIDGES.md](COMMS-BRIDGES.md)**.
 
 ## How it grows
 

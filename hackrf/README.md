@@ -30,7 +30,8 @@ graph LR
 | File | Description |
 |------|-------------|
 | `__init__.py` | `HackRFAddon(SensorAddon)` — plugin entry point, multi-device support, background poll loop |
-| `device.py` | Device detection via `hackrf_info`, firmware flashing, clock/antenna/bias-tee control |
+| `device.py` | **Control plane.** Device detection via `hackrf_info`, firmware flashing, clock/antenna/bias-tee control. `detect()` returns a rich `dict` the addon consumes directly |
+| `sdr_device.py` | **Data plane.** `HackRFSDRDevice(SDRDevice)` — the real-hardware adapter for the `tritium_lib.sdr.SDRDevice` ABC (`detect→SDRInfo`, `sweep→SweepResult`, `tune`/`stop`/`read_iq`). Composes a `HackRFDevice` for identity; drives `hackrf_sweep`/`hackrf_transfer`. Previously only `SimulatedSDR` satisfied the ABC — now one real backend does too |
 | `spectrum.py` | Spectrum analyzer wrapping `hackrf_sweep` subprocess, CSV parser |
 | `receiver.py` | IQ capture via `hackrf_transfer` with configurable gain and sample rate |
 | `fm_player.py` | Real-time FM demodulation (LPF, discriminator, de-emphasis) with WAV streaming |
@@ -48,11 +49,28 @@ graph LR
 | `decoders/ism_monitor.py` | ISM band monitor (315, 433, 868, 915 MHz) with device fingerprinting |
 | `decoders/rtl433_wrapper.py` | Wraps `rtl_433` subprocess for 200+ device protocol decoding |
 
+### Two device abstractions — control plane vs data plane
+
+The addon deliberately keeps **two** views of the radio rather than forcing one
+class to serve both:
+
+- **`HackRFDevice` (control plane)** owns identity, firmware flashing, clock
+  (CLKIN/CLKOUT), Opera Cake antenna switching, bias-tee, and diagnostics. Its
+  `detect()` returns a rich **dict** that the addon, router, and health check
+  read directly. This is the plane the whole feature set is built on.
+- **`HackRFSDRDevice` (data plane)** is a thin adapter that implements the
+  generic `tritium_lib.sdr.SDRDevice` ABC (`detect→SDRInfo`, `sweep→SweepResult`,
+  `tune`/`stop`/`read_iq`) against the real `hackrf_*` CLI tools, composing a
+  `HackRFDevice` for identity. It exists so lib-side SDR consumers that program
+  to the ABC (previously served only by `SimulatedSDR`) get a real hardware
+  backend. Forcing the ABC onto `HackRFDevice` would have broken every dict
+  consumer or lied about return types — so the two planes stay separate.
+
 ### Other Files
 | File | Description |
 |------|-------------|
 | `frontend/hackrf.js` | 7-tab panel: Radio, Spectrum, Signals, Devices, Aircraft, Config, Firmware |
-| `tests/` | 314 pytest tests across 11 test files |
+| `tests/` | 333 pytest tests across 13 test files (incl. `test_sdr_device.py` for the ABC adapter) |
 | `tritium_addon.toml` | Addon manifest (USB VID:PID `1d50:6089`, router prefix `/api/addons/hackrf`) |
 | `setup.sh` | Installs hackrf tools, rtl_433, numpy/scipy, udev rules |
 
@@ -60,7 +78,7 @@ graph LR
 
 ```bash
 ./setup.sh                                    # Install dependencies
-python3 -m pytest hackrf/tests/ -v            # Run 314 tests
+python3 -m pytest hackrf/tests/ -v            # Run 333 tests
 hackrf_info                                   # Verify hardware
 hackrf_sweep -f 88:108 -w 500000 -1           # Quick FM band sweep
 cd tritium-sc && ./start.sh                   # Panel in WINDOWS > RADIO menu
