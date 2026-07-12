@@ -1,0 +1,14 @@
+{
+  "name": "tritium-mermaid-github-check",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Pinned mermaid + jsdom so scripts/mermaid_github_check.mjs validates mermaid blocks against the SAME mermaid core GitHub renders with. mermaid is pinned EXACT (not ^) on purpose: the whole point is version fidelity to GitHub, so an unattended minor bump must NOT change what the gate accepts. Bump 'mermaid' here only when GitHub bumps (verify GitHub's live version with the ```mermaid\\ninfo``` diagram — see the .mjs header).",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "mermaid": "11.15.0",
+    "jsdom": "29.1.1"
+  }
+}
