@@ -1,7 +1,7 @@
 {
   "schema": "tritium-addon-index/v1",
   "updated": "2026-07-11",
-  "description": "Catalog of known Tritium addons across public and private repos. The Command Center reads this to present a verified-addon list; addons whose source repo is not installed are shown grayed-out (Blender-style). Extensible: add a repo entry to list third-party addon sources.",
+  "description": "Static catalog of known Tritium addons across public and private repos. Intended to advertise a verified-addon list and gray out addons whose source repo is not installed (Blender-style) — but NOT yet wired: no code currently reads this file. The live Addon Manager lists only installed addons via /api/addons/* (AddonLoader filesystem discovery). Extensible: add a repo entry to list third-party addon sources.",
   "repos": [
     {
       "id": "tritium-addons",
@@ -160,10 +160,10 @@
       "repo": "tritium-addons",
       "license": "AGPL-3.0",
       "owner": "Valpatel Software LLC",
-      "status": "stub",
+      "status": "functional",
       "category": "comms",
       "verified": true,
-      "description": "Generic webhook notifications (scaffolding only)."
+      "description": "Generic webhook relay — POSTs Tritium notifications (above a severity threshold) as JSON to any URL via the comms dispatcher. The one comms addon with a real send path (httpx); inert until WEBHOOKS_URL + WEBHOOKS_ENABLED are set."
     },
     {
       "id": "isaac-sim",

@@ -527,10 +527,12 @@ the Command Center.
 
 Every known addon — public here and private elsewhere — is listed in
 [`addon-index.json`](addon-index.json) (schema
-`tritium-addon-index/v1`). The Command Center reads it to show a
-searchable list and **grays out** addons whose source repo is not
-installed (Blender-style), so operators can see what exists and where to
-get it without the code being present. To publish:
+`tritium-addon-index/v1`). This is a **static catalog spec**: nothing in
+the codebase reads it yet. The live Addon Manager panel lists only
+*installed* addons via `/api/addons/*` (AddonLoader filesystem discovery).
+Wiring the catalog into that UI — to advertise-and-gray-out addons from
+repos that aren't installed (Blender-style) — is future work. To add an
+entry:
 
 1. Add your addon under `addons[]` with `id`, `name`, `repo`,
    `license`, `owner`, `status`, `category`, `verified`, `description`.
