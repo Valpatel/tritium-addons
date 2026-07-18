@@ -47,6 +47,10 @@ ARTICULATION_PATH = f"{ROBOT_PATH}/base"
 GROUND_PATH = "/World/GroundSlab"
 GROUND_SIZE_M = 50.0
 GROUND_THICKNESS_M = 1.0
+# Where the Isaac process should find tritium-lib.  The driver runs inside the
+# kit's own interpreter, which has its own site-packages and no knowledge of
+# this checkout, so the path is injected rather than assumed importable.
+LIB_SRC = "/home/scubasonar/Code/tritium/tritium-lib/src"
 
 
 # --------------------------------------------------------------------------
@@ -302,7 +306,77 @@ def tile(vec):
 # STOPPED (see SCENE_CODE), which the solver picks up on play.  Only the
 # per-step position targets go through the tensor API.
 
-state = {"trace": [], "steps": 0, "t0": None, "err": None}
+# ---- closed-loop attitude feedback -------------------------------------
+# The controller itself is NOT reimplemented here.  It is
+# tritium_lib.control.AttitudeStabilizer, the same object the headless unit
+# tests drive -- which is the whole point of the lib/addon split: the code
+# that keeps a simulated Go2 upright is the code that would keep a real one
+# upright, and it is tested without a GPU in the room.
+import sys as _sys
+if __LIB_SRC__ not in _sys.path:
+    _sys.path.insert(0, __LIB_SRC__)
+from tritium_lib.control import AttitudeStabilizer, LegPlacement
+
+# Go2 foot placements in the body frame (REP-103: +X forward, +Y left).
+# Hip x-offset is the real URDF value; y is the FOOT's lateral stance, which
+# is wider than the hip joint because the legs splay outward.
+GO2_LEGS = (
+    LegPlacement("FL", x=0.1881, y=0.1300),
+    LegPlacement("FR", x=0.1881, y=-0.1300),
+    LegPlacement("RL", x=-0.1881, y=0.1300),
+    LegPlacement("RR", x=-0.1881, y=-0.1300),
+)
+GO2_THIGH_LEN = 0.213  # metres; Go2 thigh and calf links are the same length
+GO2_CALF_LEN = 0.213
+MAX_TRIM_RAD = 0.30    # per-joint clamp, so one bad pose read cannot fling a leg
+
+stab = AttitudeStabilizer(kp=__KP__, kd=__KD__)
+
+# Resolve each leg's thigh/calf DOF index once.  A leg whose joints are not
+# both present is dropped rather than guessed at.
+leg_dof = {}
+for _leg in GO2_LEGS:
+    try:
+        leg_dof[_leg.name] = (joint_names.index(_leg.name + "_thigh"),
+                              joint_names.index(_leg.name + "_calf"))
+    except ValueError:
+        pass
+
+
+def _apply_trim(targets, offsets):
+    # Map a desired vertical foot movement to thigh/calf angles through the
+    # leg's linearised vertical Jacobian, evaluated at the CURRENTLY commanded
+    # pose rather than a fixed stand pose -- the gait sweeps the legs through a
+    # wide arc, and a Jacobian frozen at stand would be badly wrong mid-stride.
+    #
+    # For a 2-link planar leg the downward reach is
+    #     depth = L1*cos(q1) + L2*cos(q1 + q2)
+    # so the row Jacobian is d(depth)/d(q1, q2).  Distributing the correction
+    # by least-norm (J^T * dz / (J . J)) splits it across both joints in the
+    # smallest total joint movement, instead of asking one joint to do all of
+    # it and hitting its limit.
+    for name, (i_th, i_ca) in leg_dof.items():
+        dz = offsets.get(name, 0.0)
+        if dz == 0.0:
+            continue
+        q1 = float(targets[i_th])
+        q2 = float(targets[i_ca])
+        j1 = -GO2_THIGH_LEN * math.sin(q1) - GO2_CALF_LEN * math.sin(q1 + q2)
+        j2 = -GO2_CALF_LEN * math.sin(q1 + q2)
+        denom = j1 * j1 + j2 * j2
+        if denom < 1e-6:
+            # Singular: the leg is straight, so no small joint change moves the
+            # foot vertically.  Skipping is correct -- the pseudo-inverse would
+            # divide by ~0 and command an enormous trim.
+            continue
+        scale = dz / denom
+        targets[i_th] += max(-MAX_TRIM_RAD, min(MAX_TRIM_RAD, j1 * scale))
+        targets[i_ca] += max(-MAX_TRIM_RAD, min(MAX_TRIM_RAD, j2 * scale))
+    return targets
+
+
+state = {"trace": [], "steps": 0, "t0": None, "err": None,
+         "t_prev": None, "stabilized": 0, "max_cmd_seen": 0.0}
 
 def _to_numpy(t):
     # Newton getters hand back torch tensors on cuda:0, and np.array() on one
@@ -331,10 +405,36 @@ def _on_step(dt):
         elapsed = t - state["t0"]
         if elapsed > DURATION:
             return
-        view.set_dof_position_targets(tile(_sample_targets(elapsed)), idx)
+
+        targets = _sample_targets(elapsed).copy()
+
+        # The root transform is read EVERY step when stabilising, not on the
+        # SAMPLE_EVERY cadence -- feedback at the trace's logging rate would be
+        # a control loop running an order of magnitude slower than the
+        # disturbance it is meant to reject.
+        root = None
+        if __STABILIZE__:
+            root = _to_numpy(view.get_root_transforms())
+            t_prev = state["t_prev"]
+            step_dt = (elapsed - t_prev) if t_prev is not None else 0.0
+            if step_dt > 0.0:
+                # Isaac's root transform is position + an XYZW quaternion;
+                # tritium_lib speaks WXYZ, so this reorder is load-bearing.
+                qx, qy, qz, qw = (float(v) for v in root[0][3:7])
+                corr = stab.update((qw, qx, qy, qz), step_dt)
+                targets = _apply_trim(
+                    targets, corr.leg_height_offsets(GO2_LEGS))
+                state["stabilized"] += 1
+                state["max_cmd_seen"] = max(
+                    state["max_cmd_seen"],
+                    abs(corr.roll_cmd), abs(corr.pitch_cmd))
+            state["t_prev"] = elapsed
+
+        view.set_dof_position_targets(tile(targets), idx)
         state["steps"] += 1
         if state["steps"] % SAMPLE_EVERY == 0:
-            root = _to_numpy(view.get_root_transforms())
+            if root is None:
+                root = _to_numpy(view.get_root_transforms())
             state["trace"].append([round(float(elapsed), 3)]
                                   + [round(float(v), 4) for v in root[0][:7]])
     except Exception as exc:  # keep a solver exception from killing the app
@@ -358,12 +458,17 @@ import builtins
 builtins._tritium_gait = {"state": state, "handle": handle, "view": view,
                           "joint_names": joint_names}
 result = {"joint_names": joint_names, "count": int(count),
-          "dof": int(len(joint_names))}
+          "dof": int(len(joint_names)), "stabilize": bool(__STABILIZE__),
+          "legs_wired": sorted(leg_dof)}
 """
 
 
 def build_driver_code(gait: dict, duration: float, stiffness: float,
-                      damping: float, sample_every: int) -> str:
+                      damping: float, sample_every: int,
+                      stabilize: bool = True, kp: float = None,
+                      kd: float = None, lib_src: str = LIB_SRC) -> str:
+    from tritium_lib.control.attitude_stabilizer import DEFAULT_KD, DEFAULT_KP
+
     code = DRIVER_CODE
     code = code.replace("GAIT_JSON", repr(json.dumps(gait)))
     code = code.replace("ARTICULATION_PATH", ARTICULATION_PATH)
@@ -371,6 +476,10 @@ def build_driver_code(gait: dict, duration: float, stiffness: float,
     code = code.replace("DAMPING", repr(damping))
     code = code.replace("DURATION", repr(duration))
     code = code.replace("SAMPLE_EVERY", str(sample_every))
+    code = code.replace("__STABILIZE__", repr(bool(stabilize)))
+    code = code.replace("__LIB_SRC__", repr(lib_src))
+    code = code.replace("__KP__", repr(float(DEFAULT_KP if kp is None else kp)))
+    code = code.replace("__KD__", repr(float(DEFAULT_KD if kd is None else kd)))
     # IsaacEvents moved around between releases; resolve it remotely.
     code = code.replace(
         "CALLBACK_EVENT",
@@ -496,9 +605,21 @@ def main() -> int:
     ap.add_argument("--damping", type=float, default=4.0)
     ap.add_argument("--sample-every", type=int, default=10,
                     help="record a pose sample every N physics steps")
-    ap.add_argument("--capture", help="write a viewport PNG here when done")
+    ap.add_argument("--capture", help="write a mid-window viewport PNG here")
     ap.add_argument("--keep-running", action="store_true",
                     help="leave the step callback installed after scoring")
+    ap.add_argument("--trials", type=int, default=1, metavar="N",
+                    help="run N trials per arm and report the rate. A gait is "
+                         "a distribution, not a run: this lane has quoted 67%% "
+                         "and 29%% for the same gait file off single handfuls "
+                         "of trials, which is why one run proves nothing.")
+    ap.add_argument("--stabilize", choices=("on", "off", "both"), default="on",
+                    help="closed-loop attitude feedback: on, off (open-loop "
+                         "control), or both arms A/B in one session")
+    ap.add_argument("--kp", type=float, default=None,
+                    help="attitude proportional gain (default: tritium-lib's)")
+    ap.add_argument("--kd", type=float, default=None,
+                    help="attitude derivative gain (default: tritium-lib's)")
     args = ap.parse_args()
 
     if args.emit_gait:
@@ -521,48 +642,130 @@ def main() -> int:
     br = Bridge(args.host, args.port)
     print(f"[gait] bridge {args.host}:{args.port} -> {br.sim_state().get('result', {}).get('state')}")
 
-    # Build the scene stopped, then play so physics initializes with the
-    # robot present.
+    # Which arms to run.  Running the open-loop control in the SAME session,
+    # against the same kit and the same slab, is what makes the closed-loop
+    # number mean anything -- the two recorded rates for this gait (67% then
+    # 29%) came from different sessions and cannot be compared to each other.
+    arms = []
+    if args.stabilize in ("on", "both"):
+        arms.append(True)
+    if args.stabilize in ("off", "both"):
+        arms.append(False)
+
+    results: dict[bool, list[dict]] = {}
+    for stabilize in arms:
+        label = "closed-loop" if stabilize else "open-loop (control)"
+        runs = []
+        for trial in range(1, args.trials + 1):
+            capture = None
+            if args.capture and trial == 1:
+                suffix = "closed" if stabilize else "open"
+                capture = args.capture.replace(".png", f"-{suffix}.png")
+            score = run_trial(br, gait, args, stabilize, capture)
+            runs.append(score)
+            print(f"[gait] {label} trial {trial}/{args.trials}: "
+                  f"{score.get('verdict')} "
+                  f"dist={score.get('displacement_m')} "
+                  f"max_tilt={score.get('max_tilt_deg')}")
+        results[stabilize] = runs
+
+    print("\n" + "=" * 62)
+    print("HONEST GAIT RATE — every trial counted, none discarded")
+    print("=" * 62)
+    summary = {}
+    for stabilize, runs in results.items():
+        label = "closed_loop" if stabilize else "open_loop_control"
+        walked = sum(1 for r in runs if r.get("verdict") == "WALKED")
+        upright = sum(1 for r in runs if not r.get("tumbled"))
+        tilts = [r["max_tilt_deg"] for r in runs if r.get("max_tilt_deg") is not None]
+        dists = [r["displacement_m"] for r in runs if r.get("displacement_m") is not None]
+        summary[label] = {
+            "trials": len(runs),
+            "walked": walked,
+            "walked_rate": round(walked / len(runs), 3) if runs else None,
+            "upright": upright,
+            "upright_rate": round(upright / len(runs), 3) if runs else None,
+            "median_max_tilt_deg": round(sorted(tilts)[len(tilts) // 2], 2) if tilts else None,
+            "worst_max_tilt_deg": round(max(tilts), 2) if tilts else None,
+            "median_displacement_m": round(sorted(dists)[len(dists) // 2], 3) if dists else None,
+            "verdicts": [r.get("verdict") for r in runs],
+        }
+        print(f"{label:20s} walked {walked}/{len(runs)}  upright {upright}/{len(runs)}  "
+              f"median_tilt={summary[label]['median_max_tilt_deg']}deg")
+    print(json.dumps(summary, indent=1))
+
+    if len(results) == 2:
+        c = summary["closed_loop"]["upright_rate"]
+        o = summary["open_loop_control"]["upright_rate"]
+        print(f"\n[gait] upright rate: closed-loop {c} vs open-loop control {o}")
+        if args.trials < 10:
+            print(f"[gait] NOTE: {args.trials} trials per arm is too few to call "
+                  "a difference significant; this is a direction, not a rate.")
+
+    # With --trials the exit code reflects the ARM, not one lucky run: a single
+    # WALKED out of ten is not a working gait, and an exit code that says so
+    # is the whole reason this flag exists.
+    primary = results.get(True, results.get(False, []))
+    if not primary:
+        return 1
+    walked = sum(1 for r in primary if r.get("verdict") == "WALKED")
+    return 0 if walked * 2 > len(primary) else 1
+
+
+def run_trial(br: "Bridge", gait: dict, args, stabilize: bool,
+              capture: str | None = None) -> dict:
+    """One scored run from a freshly rebuilt scene.
+
+    The scene is torn down and rebuilt per trial rather than reusing the
+    stage.  A Go2 left holding its last joint targets topples within seconds,
+    so a second trial starting from wherever the first one ended would be
+    scoring the recovery of a fallen robot, not the gait.
+    """
     br.sim_control("stop")
     time.sleep(1.0)
-    print(f"[gait] scene: {_ok('scene', br.execute(build_scene_code(args.stiffness, args.damping)))}")
+    _ok("scene", br.execute(build_scene_code(args.stiffness, args.damping)))
     br.sim_control("play")
     time.sleep(2.0)
 
     info = _ok("driver", br.execute(build_driver_code(
-        gait, args.seconds, args.stiffness, args.damping, args.sample_every)))
-    print(f"[gait] driving {info['dof']} DOF: {info['joint_names']}")
+        gait, args.seconds, args.stiffness, args.damping, args.sample_every,
+        stabilize=stabilize, kp=args.kp, kd=args.kd)))
+    if stabilize and len(info.get("legs_wired", [])) != 4:
+        # Silently trimming two legs would look like a weak controller rather
+        # than a wiring bug, so it is fatal instead.
+        raise RuntimeError(
+            f"attitude trim wired to {info.get('legs_wired')} — expected all 4 "
+            f"legs; solver DOF names are {info.get('joint_names')}")
 
-    time.sleep(args.seconds + 2.0)
+    # Capture from the MIDDLE of the scored window.  An end-of-run frame is
+    # evidence about a moment nobody measured: the driver stops commanding at
+    # DURATION and the robot topples immediately after.
+    mid_deadline = time.time() + args.seconds * 0.5
+    if capture:
+        br.camera_look_at(ROBOT_PATH, distance=3.0)
+    time.sleep(max(0.0, mid_deadline - time.time()))
+    mid_shot = br.capture() if capture else None
+    time.sleep(max(0.0, args.seconds * 0.5 + 2.0))
 
     collected = _ok("collect", br.execute(COLLECT_CODE))
     if collected.get("err"):
         print(f"[gait] callback error: {collected['err']}", file=sys.stderr)
-    if not args.keep_running:
-        _ok("cleanup", br.execute(CLEANUP_CODE))
+    _ok("cleanup", br.execute(CLEANUP_CODE))
 
     score = score_trace(collected.get("trace", []))
     score["physics_steps"] = collected.get("steps")
-    print(json.dumps(score, indent=1))
+    score["stabilized_steps"] = collected.get("stabilized")
+    score["max_cmd_rad"] = collected.get("max_cmd_seen")
+    score["stabilize"] = stabilize
 
-    if args.capture:
-        br.camera_look_at(ROBOT_PATH, distance=3.0)
-        time.sleep(0.5)
-        shot = br.capture()
-        data = shot.get("result", {})
+    if capture and mid_shot:
+        data = mid_shot.get("result", {})
         b64 = data.get("image_base64") or data.get("image") or data.get("data")
         if b64:
-            with open(args.capture, "wb") as fh:
+            with open(capture, "wb") as fh:
                 fh.write(base64.b64decode(b64))
-            print(f"[gait] wrote {args.capture}")
-        else:
-            print(f"[gait] no image in capture response: {list(data)[:8]}",
-                  file=sys.stderr)
-
-    # "WALKED" is the only passing verdict: TUMBLED must exit nonzero even
-    # though it covers ground, or a CI gate happily green-lights a robot that
-    # travels on its back.
-    return 0 if score.get("verdict") == "WALKED" else 1
+            print(f"[gait] wrote {capture} (mid-window)")
+    return score
 
 
 if __name__ == "__main__":
