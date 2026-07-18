@@ -617,6 +617,18 @@ if _ROUTE:
         _YAW_LOOP = YawRateLoop(
             kp=float(_ROUTE["yaw_kp"]), ki=float(_ROUTE["yaw_ki"]),
             max_output_rps=float(_ROUTE["yaw_max"]))
+    # Imported unconditionally for the same reason yaw_rate_from_headings is:
+    # the trace records the filtered rate in BOTH arms so the two are
+    # comparable, and a name bound only under a flag is a NameError at call
+    # time that compile() cannot see.
+    from tritium_lib.control import StrideFilter
+    _YAW_FILT = None
+    if _ROUTE.get("yaw_filter"):
+        # stride_hz here is the SCALED value the gait is actually running at
+        # (0.52 Hz at a 0.3 m/s cruise, not the 2.6 Hz table entry) -- the
+        # null must land on the emitted frequency, not the nominal one.
+        _YAW_FILT = StrideFilter.from_stride_hz(stride_hz)
+
     state["yaw_prev"] = None
     state["yaw_t_prev"] = None
 
@@ -703,17 +715,36 @@ def _on_step(dt):
             # transform, never from the command -- a loop closed on its own
             # output is not a loop.
             _yaw_dt = 0.0
-            _yaw_meas = 0.0
+            _yaw_raw = 0.0
             if state["yaw_prev"] is not None:
                 _yaw_dt = elapsed - state["yaw_t_prev"]
-                _yaw_meas = yaw_rate_from_headings(
+                _yaw_raw = yaw_rate_from_headings(
                     state["yaw_prev"], _hdg, _yaw_dt)
             state["yaw_prev"] = _hdg
             state["yaw_t_prev"] = elapsed
 
+            # Null the gait out of the measurement.  _yaw_raw is the body's
+            # turn PLUS its own stride rock, and the rock is the larger of the
+            # two; a boxcar over one stride period zeroes the rock and its
+            # harmonics exactly, leaving the net turn.  Filtered in both arms
+            # so the trace's two columns mean the same thing in each.
+            _yaw_meas = _yaw_raw
+            _yaw_ready = True
+            if _YAW_FILT is not None:
+                _yaw_meas = _YAW_FILT.update(elapsed, _yaw_raw)
+                # Until a full window has passed the average is over a partial
+                # window, which does NOT null the gait -- feeding it to the
+                # integrator would inject exactly the stride-synchronous error
+                # the filter exists to remove.  Hold the loop off instead.
+                _yaw_ready = _YAW_FILT.ready
+
+            # The twist actually handed to the mixer, whatever path produced
+            # it -- this is what the trace must compare the measurement to.
+            _bias_twist = None
             if _fs.arrived:
                 if state["arrived_at"] is None:
                     state["arrived_at"] = round(float(elapsed), 3)
+                _bias_twist = TwistCommand.stop()
                 _bias = _STOP_BIAS
                 if _YAW_LOOP is not None:
                     # Standing still with a charged integrator would spin the
@@ -722,10 +753,11 @@ def _on_step(dt):
             else:
                 _twist = _fs.twist
                 _yaw_cmd = _twist.angular_rps
-                if _YAW_LOOP is not None:
+                if _YAW_LOOP is not None and _yaw_ready:
                     _corr = _YAW_LOOP.update(_yaw_cmd, _yaw_meas, _yaw_dt)
                     _twist = TwistCommand(linear_mps=_twist.linear_mps,
                                           angular_rps=_corr.compensated_rps)
+                _bias_twist = _twist
                 _bias = differential_stride(
                     _twist, track_width_m=float(_ROUTE["track"]),
                     nominal_mps=float(_ROUTE["nominal"]))
@@ -734,19 +766,28 @@ def _on_step(dt):
                 # from the ground-truth pose trace against the route, never
                 # from these numbers -- a controller grading its own tracking
                 # error is marking its own homework.
+                # Column 3 is the command the body was ACTUALLY GIVEN, i.e.
+                # post-compensation.  It used to be _fs.twist.angular_rps --
+                # the follower's raw pre-loop demand -- so whenever the rate
+                # loop was on, the plant-gain ratio was computed against a
+                # command that never reached the mixer.  That is what made
+                # tick 18's "12% steering authority" and its -0.186 sign
+                # uninterpretable.  Both the raw and the filtered measurement
+                # are recorded so the gait's contribution stays visible
+                # instead of being quietly averaged away.
+                _cmd_given = (_bias_twist.angular_rps
+                              if _bias_twist is not None else 0.0)
                 state["follow"].append(
                     [round(float(elapsed), 3),
                      round(float(_fs.cross_track_m), 4),
                      round(float(_fs.distance_to_goal_m), 4),
-                     round(float(_fs.twist.angular_rps), 4),
+                     round(float(_cmd_given), 4),
                      int(_fs.target_index),
-                     # What the body actually turned at, and what the rate
-                     # loop asked for as a result.  The ratio between the
-                     # first and the fourth column IS the plant gain this
-                     # whole loop exists to cancel.
                      round(float(_yaw_meas), 4),
                      round(float(_bias.left_scale), 4),
-                     round(float(_bias.right_scale), 4)])
+                     round(float(_bias.right_scale), 4),
+                     round(float(_yaw_raw), 4),
+                     round(float(_fs.twist.angular_rps), 4)])
 
         # Steering is applied BEFORE the attitude trim, so the stabiliser's
         # vertical corrections ride on top of the steered stride rather than
@@ -1052,6 +1093,13 @@ def route_spec(args, waypoints) -> dict | None:
         "yaw_kp": float(args.yaw_kp),
         "yaw_ki": float(args.yaw_ki),
         "yaw_max": float(args.yaw_max),
+        # Boxcar the measured yaw rate over one stride period before any loop
+        # sees it.  The window is derived from the gait's OWN stride_hz rather
+        # than passed in, because the null has to sit on the frequency this
+        # body actually emits -- a hardcoded window notches whatever the last
+        # tuning session happened to walk at.  The measurement is filtered in
+        # BOTH arms when this is on; only the closed-loop arm acts on it.
+        "yaw_filter": bool(args.yaw_filter),
         # The scorer stands off by the BODY RADIUS, not by the planner's
         # clearance.  These are two different quantities and conflating them
         # breaks the referee in both directions:
@@ -1209,6 +1257,11 @@ def main() -> int:
                     help="write the per-step follower trace for offline "
                          "diagnosis (commanded vs MEASURED yaw rate). Never "
                          "an input to any verdict")
+    ap.add_argument("--yaw-filter", action="store_true",
+                    help="boxcar the MEASURED yaw rate over one stride period "
+                         "(tritium_lib.control.StrideFilter) before the loop "
+                         "sees it, nulling the gait's own left-right rock. "
+                         "Costs half a stride period of group delay")
     ap.add_argument("--closed-loop-yaw", action="store_true",
                     help="close an inner PI loop on MEASURED yaw rate "
                          "(tritium_lib.control.YawRateLoop). Off by default "

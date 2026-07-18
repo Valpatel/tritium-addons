@@ -75,6 +75,7 @@ class _Args:
     # Default OFF: the open-loop arm must stay the default path so the A/B
     # keeps a control.
     closed_loop_yaw = False
+    yaw_filter = False
     yaw_kp = 1.0
     yaw_ki = 6.0
     yaw_max = 4.0
@@ -618,8 +619,12 @@ def test_yaw_rate_helper_is_imported_even_when_the_loop_is_off():
             if isinstance(inner, ast.ImportFrom):
                 guarded.extend(a.name for a in inner.names)
 
-    assert "yaw_rate_from_headings" not in guarded, (
-        "yaw_rate_from_headings is imported under the yaw_closed_loop guard, "
-        "but the step callback uses it in both arms"
-    )
-    assert "yaw_rate_from_headings" in code
+    # StrideFilter has the identical exposure: the trace records the filtered
+    # rate in both arms so the columns are comparable, so binding it under the
+    # closed-loop guard would reproduce the same call-time NameError.
+    for name in ("yaw_rate_from_headings", "StrideFilter"):
+        assert name not in guarded, (
+            f"{name} is imported under the yaw_closed_loop guard, "
+            "but the step callback uses it in both arms"
+        )
+        assert name in code
