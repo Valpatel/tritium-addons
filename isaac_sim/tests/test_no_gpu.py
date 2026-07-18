@@ -313,6 +313,50 @@ def test_lidar_synthetic_sees_the_room_and_obstacles():
     assert scan[pb] < 2.8, "pillar should shadow its bearing"
 
 
+def test_lidar_main_thread_source_refuses_background_scanning():
+    """A Kit-backed source must never be started in a worker thread.
+
+    Regression for a live failure: ``IsaacScanSource`` did not declare
+    ``requires_main_thread``, so ``LidarState.start()`` handed it to a worker
+    and ``world.step()`` parked there forever -- no exception, no error count,
+    /status answering ``scans: 0, errors: 0`` indefinitely.  A silent hang is
+    the worst failure mode available, so the contract is now enforced loudly."""
+    mod = _load("lidar_server")
+    assert mod.IsaacScanSource.requires_main_thread is True
+    assert mod.ScanSource.requires_main_thread is False
+
+    class _KitLike(mod.SyntheticScanSource):
+        name = "kit-like"
+        requires_main_thread = True
+
+    state = mod.LidarState(_KitLike(num_beams=36), "t", 10)
+    with pytest.raises(RuntimeError, match="main thread"):
+        state.start()
+
+    # ...and the ordinary background path still works for non-Kit sources.
+    ok = mod.LidarState(mod.SyntheticScanSource(num_beams=36), "t", 10)
+    assert ok.tick_once() and ok.scans == 1
+
+
+def test_lidar_ground_is_a_slab_not_a_zero_thickness_quad():
+    """The Newton blocker must not be re-authored into this scene.
+
+    ``add_default_ground_plane()`` writes a flat quad; qhull cannot hull a
+    rank-2 point set, and the resulting exception latches Newton's
+    ``_initializing`` flag so physics silently stops integrating process-wide
+    while the clock keeps advancing (see examples/newton_ground_fix_proof.py)."""
+    # Match the CALL, not the name: the fix's own comment explains what
+    # add_default_ground_plane does, so a bare substring search self-trips.
+    src = (_CONN / "lidar_server.py").read_text()
+    calls = [ln for ln in src.splitlines()
+             if "add_default_ground_plane(" in ln and not ln.lstrip().startswith("#")]
+    assert not calls, (
+        f"ground must be a box slab -- a zero-thickness quad kills Newton "
+        f"silently; found call(s): {calls}"
+    )
+    assert "GroundSlab" in src
+
+
 def test_lidar_payload_matches_edge_scan_contract():
     """/scan JSON carries ranges + the geometry keys tritium-edge's
     parse_scan_json consumes, JSON-serializable, no NaN."""

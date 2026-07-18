@@ -141,6 +141,14 @@ class ScanSource:
 
     name = "abstract"
 
+    #: True when the source may ONLY be stepped from the process's main thread.
+    #: Omniverse Kit is such a source: ``world.step()`` never returns when it is
+    #: called from a worker, and it does so SILENTLY — no exception, no error
+    #: count, just a scan loop parked forever while /status keeps answering
+    #: ``scans: 0, errors: 0``.  Same contract as ``camera_server``'s
+    #: ``FrameSource.requires_main_thread``.
+    requires_main_thread = False
+
     def __init__(self, num_beams: int = 360, range_min: float = 0.1,
                  range_max: float = 30.0, angle_min: float = -math.pi):
         self.num_beams = int(num_beams)
@@ -248,6 +256,8 @@ class IsaacScanSource(ScanSource):
     the RTX sensor annotator; nothing here assumes a PhysX backend."""
 
     name = "isaac"
+    # Kit's update loop is main-thread-only — see ScanSource.requires_main_thread.
+    requires_main_thread = True
 
     def __init__(self, num_beams: int = 360, range_min: float = 0.1,
                  range_max: float = 30.0, angle_min: float = -math.pi,
@@ -279,7 +289,24 @@ class IsaacScanSource(ScanSource):
         stage = stage_utils.get_current_stage()
         UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
         self._world = World(stage_units_in_meters=1.0)
-        self._world.scene.add_default_ground_plane()
+        # GROUND: a box slab, never a flat quad.  `add_default_ground_plane()`
+        # authors a zero-thickness quad, which qhull cannot hull; under Newton
+        # the resulting exception latches the physics extension's
+        # `_initializing` flag and silently disables integration for the whole
+        # process while the clock keeps advancing (the four-tick blocker fixed
+        # in `examples/newton_ground_fix_proof.py`).  The lidar only needs
+        # geometry to ray-trace, but the scene must stay Newton-safe for the
+        # moment a body is dropped into it — and a slab also gives the sweep an
+        # honest floor return instead of an infinitely thin one.
+        # Mirrors the lib's `geo.collider_shape.ground_slab`, authored inline
+        # because connectors stay dependency-clean (isaacsim + numpy only).
+        from pxr import UsdPhysics  # type: ignore
+        slab = UsdGeom.Cube.Define(stage, "/World/GroundSlab")
+        slab.CreateSizeAttr(2.0)  # unit cube; the scale op below sets extents
+        slab_xf = UsdGeom.Xformable(slab.GetPrim())
+        slab_xf.AddTranslateOp().Set((0.0, 0.0, -0.5))  # top face at z = 0
+        slab_xf.AddScaleOp().Set((25.0, 25.0, 0.5))     # 50 x 50 x 1 m
+        UsdPhysics.CollisionAPI.Apply(slab.GetPrim())
         if not scene_usd:
             # Minimal scene: a few obstacle boxes ringing the sensor so the
             # sweep has structure (the synthetic room's Isaac counterpart).
@@ -366,7 +393,21 @@ class LidarState:
         self._stop = threading.Event()
 
     def start(self):
+        # Refuse rather than deadlock: a Kit-backed source stepped off the main
+        # thread hangs silently forever, which is indistinguishable from "slow"
+        # at the /status route.  Fail loudly and name the fix.
+        if getattr(self.source, "requires_main_thread", False):
+            raise RuntimeError(
+                f"source {self.source.name!r} must be scanned on the main thread "
+                "(Omniverse Kit deadlocks in a worker); use run_main_thread() and "
+                "serve HTTP from a background thread instead"
+            )
         threading.Thread(target=self._loop, daemon=True, name="isaac-lidar-scan").start()
+
+    def run_main_thread(self):
+        """Drive scanning on the CALLING (main) thread until stopped. Blocks —
+        the HTTP server runs in a background thread under this arrangement."""
+        self._loop()
 
     def tick_once(self) -> bool:
         """Poll the source once; cache the payload.  Returns success.  A raising
@@ -520,9 +561,18 @@ def main(argv=None) -> int:
 
     source = _build_source(args)
     state = LidarState(source, args.lidar_id, args.hz)
-    state.start()
 
     httpd = ThreadingHTTPServer((args.host, args.port), _make_handler(state))
+
+    # Kit-backed sources must scan on the main thread, so the two roles swap:
+    # HTTP goes to the background and the scan loop keeps main.  Non-Kit sources
+    # keep the ordinary arrangement (scan in a worker, HTTP blocking on main).
+    main_thread_scan = getattr(source, "requires_main_thread", False)
+    if main_thread_scan:
+        threading.Thread(target=httpd.serve_forever, daemon=True,
+                         name="isaac-lidar-http").start()
+    else:
+        state.start()
 
     def _shutdown(*_a):
         log.info("shutting down")
@@ -540,7 +590,10 @@ def main(argv=None) -> int:
         args.hz,
     )
     try:
-        httpd.serve_forever()
+        if main_thread_scan:
+            state.run_main_thread()   # blocks; HTTP is already serving
+        else:
+            httpd.serve_forever()
     finally:
         state.stop()
     return 0
