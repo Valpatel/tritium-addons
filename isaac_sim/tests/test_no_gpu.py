@@ -561,3 +561,132 @@ def _decode_png16_bytes(blob: bytes):
         from PIL import Image
 
         return np.array(Image.open(io.BytesIO(blob)))
+
+
+# -- capability 8b: a camera MOUNTED on a body ------------------------------
+#
+# Until now every camera_server render came from a wall: rep.create.camera at a
+# fixed world pose.  A camera bolted to a robot is a different object — its lens
+# pose is a FUNCTION of body pose, so the prim must be parented under the body
+# and carry a body-frame offset plus a boresight orientation.  These gates pin
+# the orientation math, which is the part that is easy to get wrong and
+# impossible to eyeball from a single north-facing frame.
+
+def _mount_axes(mod, **kw):
+    """Boresight and up vector implied by the connector's mount orientation."""
+    import numpy as np
+    q = mod.mount_camera_quat(**kw)          # (w, x, y, z)
+    w, x, y, z = q
+    # Quaternion -> rotation matrix (columns are the rotated basis vectors).
+    R = np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ])
+    # USD cameras look down -Z_cam with +Y_cam up.
+    return R @ np.array([0.0, 0.0, -1.0]), R @ np.array([0.0, 1.0, 0.0])
+
+
+def test_mounted_camera_looks_out_the_nose_of_the_body():
+    """Zero tilt: boresight is body +X (forward), up is body +Z. On a Z-up
+    stage that is the whole point of a nose camera."""
+    import numpy as np
+    mod = _load("camera_server")
+    fwd, up = _mount_axes(mod, tilt_deg=0.0)
+    assert np.allclose(fwd, [1.0, 0.0, 0.0], atol=1e-9)
+    assert np.allclose(up, [0.0, 0.0, 1.0], atol=1e-9)
+
+
+def test_mounted_camera_tilt_is_positive_up():
+    """A +30 deg tilt raises the boresight; -30 lowers it. Sign errors here
+    point a ground robot's camera at the sky, which still renders and so
+    survives every check except this one."""
+    import math
+
+    import numpy as np
+    mod = _load("camera_server")
+    up30, _ = _mount_axes(mod, tilt_deg=30.0)
+    down30, _ = _mount_axes(mod, tilt_deg=-30.0)
+    assert np.allclose(up30, [math.cos(math.radians(30)), 0.0, math.sin(math.radians(30))], atol=1e-9)
+    assert down30[2] == pytest.approx(-math.sin(math.radians(30)), abs=1e-9)
+    # Tilt is a rotation, not a translation — the boresight stays a unit vector.
+    assert np.linalg.norm(up30) == pytest.approx(1.0)
+
+
+def test_mounted_camera_never_rolls():
+    """The horizon must stay level at every tilt: the camera's up vector keeps
+    zero component along the body's left axis (+Y on a Z-up stage)."""
+    import numpy as np
+    mod = _load("camera_server")
+    for tilt in (-89.0, -45.0, 0.0, 15.0, 89.0):
+        _, up = _mount_axes(mod, tilt_deg=tilt)
+        assert abs(float(up[1])) < 1e-9, f"camera rolled at tilt {tilt}"
+        assert float(up[2]) > 0.0, f"camera upside down at tilt {tilt}"
+
+
+def test_mount_offset_contract_matches_the_lib_camera_mount():
+    """CONTRACT: the offset the connector hands USD and the offset
+    tritium_lib's CameraMount uses to project the FOV cone must be the SAME
+    numbers, or the rendered image and the drawn cone silently disagree.
+
+    Duplicated for the same reason as the depth codec: connectors run in
+    Isaac's python and must stay tritium-free."""
+    mount = pytest.importorskip("tritium_lib.geo.camera_mount")
+    mod = _load("camera_server")
+    kw = dict(forward_m=0.30, left_m=-0.05, up_m=0.12)
+    lib_xyz = mount.CameraMount(tilt_deg=-10.0, **kw).stage_offset(up_axis="Z")
+    assert mod.mount_stage_offset(**kw) == pytest.approx(lib_xyz)
+
+
+def test_mount_flags_reach_the_isaac_source_and_the_served_meta():
+    """The CLI plumbing, which the geometry gates above cannot see.
+
+    A --mount-prim that parses but never reaches IsaacFrameSource yields a
+    server that looks configured and still renders from the wall."""
+    mod = _load("camera_server")
+    ap = _camera_server_parser(mod)
+    args = ap.parse_args([
+        "--source", "isaac", "--mount-prim", "/World/Go2",
+        "--mount-forward", "0.31", "--mount-up", "0.27",
+        "--mount-tilt", "-12.5", "--attach-to", "sim_go2_01",
+    ])
+    assert args.mount_prim == "/World/Go2"
+    assert args.attach_to == "sim_go2_01"
+    assert args.mount_tilt == pytest.approx(-12.5)
+    # A synthetic run must NOT advertise a mount it does not have.
+    plain = ap.parse_args(["--source", "synthetic"])
+    assert plain.mount_prim == "" and plain.attach_to == ""
+
+    # ...and the flags must survive _build_source into the Isaac source. Stub
+    # the class out so this stays a no-GPU gate.
+    seen = {}
+    mod.IsaacFrameSource = lambda *a, **kw: seen.update(kw) or object()
+    mod._build_source(args)
+    assert seen["mount_prim"] == "/World/Go2"
+    assert seen["mount_forward"] == pytest.approx(0.31)
+    assert seen["mount_up"] == pytest.approx(0.27)
+    assert seen["mount_tilt"] == pytest.approx(-12.5)
+
+
+def _camera_server_parser(mod):
+    """main()'s parser, without running the server: parse a no-op argv and
+    grab it. Keeps the test honest about the REAL flag set rather than a
+    re-declared copy that can drift."""
+    import argparse
+    captured = {}
+    real_parse = argparse.ArgumentParser.parse_args
+
+    def spy(self, *a, **kw):
+        captured.setdefault("ap", self)
+        raise SystemExit(0)
+
+    argparse.ArgumentParser.parse_args = spy
+    try:
+        try:
+            mod.main([])
+        except SystemExit:
+            pass
+    finally:
+        argparse.ArgumentParser.parse_args = real_parse
+    assert "ap" in captured, "main() built no parser"
+    return captured["ap"]

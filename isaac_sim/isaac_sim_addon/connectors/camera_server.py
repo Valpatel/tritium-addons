@@ -226,6 +226,84 @@ def colorize_depth(depth: np.ndarray, near: float = 0.5, far: float = 60.0) -> n
 
 
 # --------------------------------------------------------------------------- #
+# Mounting a camera ON a body (capability 8b).
+# --------------------------------------------------------------------------- #
+#
+# A wall camera's pose is a constant.  A robot's camera is a function of body
+# pose, so the prim is PARENTED under the body and carries only a body-frame
+# offset plus a boresight orientation; USD then composes the world pose for
+# free, every frame, with no pose plumbing in this process.
+#
+# Both helpers below are duplicated from ``tritium_lib.geo.camera_mount`` on
+# purpose — connectors run inside Isaac's python, which has no tritium on its
+# path (see test_connectors_do_not_import_tritium).  The drift between the two
+# copies is pinned by test_mount_offset_contract_matches_the_lib_camera_mount:
+# if the render and the map's FOV cone ever disagree, that test goes red first.
+
+def mount_stage_offset(forward_m: float = 0.0, left_m: float = 0.0,
+                       up_m: float = 0.0) -> tuple:
+    """The mount offset as a Z-up USD stage translation (body axes -> XYZ)."""
+    return (float(forward_m), float(left_m), float(up_m))
+
+
+def mount_camera_quat(tilt_deg: float = 0.0) -> tuple:
+    """Orientation quaternion ``(w, x, y, z)`` for a mounted camera prim.
+
+    A USD camera looks down its own -Z with +Y up, but a nose camera must look
+    down the body's +X with +Z up — so the prim needs a fixed rotation even at
+    zero tilt.  ``tilt_deg`` is elevation, positive UP, applied about the body's
+    left axis, matching ``CameraMount.tilt_deg``.
+
+    Returned as a quaternion rather than an Euler triple deliberately:
+    ``rotateXYZ`` ordering is a coin-flip that renders plausibly either way,
+    whereas a basis built from the boresight is checkable one axis at a time.
+    """
+    t = math.radians(float(tilt_deg))
+    # Body frame, Z-up: +X forward, +Y left, +Z up.
+    fwd = (math.cos(t), 0.0, math.sin(t))          # boresight, tilted up
+    left = (0.0, 1.0, 0.0)
+    up = _cross(fwd, left)                          # level horizon at any tilt
+    right = _cross(fwd, up)                         # == -left at zero tilt
+    # Camera basis columns: X_cam = right, Y_cam = up, Z_cam = -boresight.
+    m = (
+        (right[0], up[0], -fwd[0]),
+        (right[1], up[1], -fwd[1]),
+        (right[2], up[2], -fwd[2]),
+    )
+    return _matrix_to_quat(m)
+
+
+def _cross(a: tuple, b: tuple) -> tuple:
+    return (a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0])
+
+
+def _matrix_to_quat(m) -> tuple:
+    """Row-major 3x3 rotation matrix -> ``(w, x, y, z)``, Shepperd's method.
+
+    Branching on the largest diagonal term avoids the near-zero divide that the
+    naive trace formula hits at 180 deg — reachable here with a rear-facing
+    mount."""
+    trace = m[0][0] + m[1][1] + m[2][2]
+    if trace > 0.0:
+        s = math.sqrt(trace + 1.0) * 2.0
+        return (0.25 * s, (m[2][1] - m[1][2]) / s,
+                (m[0][2] - m[2][0]) / s, (m[1][0] - m[0][1]) / s)
+    if m[0][0] > m[1][1] and m[0][0] > m[2][2]:
+        s = math.sqrt(1.0 + m[0][0] - m[1][1] - m[2][2]) * 2.0
+        return ((m[2][1] - m[1][2]) / s, 0.25 * s,
+                (m[0][1] + m[1][0]) / s, (m[0][2] + m[2][0]) / s)
+    if m[1][1] > m[2][2]:
+        s = math.sqrt(1.0 + m[1][1] - m[0][0] - m[2][2]) * 2.0
+        return ((m[0][2] - m[2][0]) / s, (m[0][1] + m[1][0]) / s,
+                0.25 * s, (m[1][2] + m[2][1]) / s)
+    s = math.sqrt(1.0 + m[2][2] - m[0][0] - m[1][1]) * 2.0
+    return ((m[1][0] - m[0][1]) / s, (m[0][2] + m[2][0]) / s,
+            (m[1][2] + m[2][1]) / s, 0.25 * s)
+
+
+# --------------------------------------------------------------------------- #
 # Frame sources.
 # --------------------------------------------------------------------------- #
 
@@ -405,18 +483,27 @@ class IsaacFrameSource(FrameSource):
 
     def __init__(self, width, height, cam_pos, cam_target, scene_usd=None,
                  physics_hz=30, with_depth=False, with_stereo=False,
-                 stereo_baseline=0.12):
+                 stereo_baseline=0.12, mount_prim=None, mount_forward=0.0,
+                 mount_left=0.0, mount_up=0.0, mount_tilt=0.0, body_spin_dps=0.0):
         self.width = width
         self.height = height
         self.with_depth = with_depth
         self.with_stereo = with_stereo
         self.stereo_baseline = stereo_baseline
+        self.mount_prim = mount_prim
+        self.mount_forward = mount_forward
+        self.mount_left = mount_left
+        self.mount_up = mount_up
+        self.mount_tilt = mount_tilt
+        self.body_spin_dps = body_spin_dps
         self._sim = None
         self._annot = None
         self._depth_annot = None
         self._annot_right = None
         self._world = None
         self._subject = None
+        self._body_xform = None
+        self._body_orient = None
         self._t0 = time.time()
         self._boot(cam_pos, cam_target, scene_usd, physics_hz)
 
@@ -469,8 +556,14 @@ class IsaacFrameSource(FrameSource):
                 color=np.array([0.15, 0.15, 0.15]),
             )
         )
-        # Camera prim + render product + rgb annotator.
-        cam = rep.create.camera(position=tuple(cam_pos), look_at=tuple(cam_target))
+        # Camera prim + render product + rgb annotator.  Two shapes: bolted to
+        # the world at a fixed pose (the wall camera this server has always
+        # served), or parented UNDER a body prim so USD composes the lens pose
+        # from the body's every frame (capability 8b).
+        if self.mount_prim:
+            cam = self._mount_camera_prim(stage)
+        else:
+            cam = rep.create.camera(position=tuple(cam_pos), look_at=tuple(cam_target))
         rp = rep.create.render_product(cam, (self.width, self.height))
         self._annot = rep.AnnotatorRegistry.get_annotator("rgb")
         self._annot.attach([rp])
@@ -492,8 +585,68 @@ class IsaacFrameSource(FrameSource):
         self._world.reset()
         self._physics_dt = 1.0 / max(1, physics_hz)
 
+    def _mount_camera_prim(self, stage) -> str:
+        """Define a camera prim parented under ``self.mount_prim`` and return
+        its path.
+
+        If the mount prim does not exist — the common case when this server
+        boots its OWN SimulationApp rather than attaching to an already-populated
+        stage — a stand-in body is created there: an Xform carrying a chassis
+        box, so there is something for the lens to be rigidly attached TO.
+
+        Note the chassis does NOT appear in frame at the default mount (0.30 m
+        forward, 0.25 m up clears it).  The evidence that the lens really rides
+        the body is therefore the sweep, not an occlusion: yaw the body and the
+        rendered scene rotates with it, which a world-posed camera cannot do.
+        """
+        from pxr import Gf, UsdGeom  # type: ignore
+
+        body_path = str(self.mount_prim)
+        body = stage.GetPrimAtPath(body_path)
+        if not body or not body.IsValid():
+            body_xform = UsdGeom.Xform.Define(stage, body_path)
+            body_xform.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, 0.4))
+            # quatd, not quatf: a Quatf handed to a quatd op is silently
+            # DROPPED by USD (env defect recorded 2026-07-18).
+            self._body_orient = body_xform.AddOrientOp(
+                UsdGeom.XformOp.PrecisionDouble
+            )
+            self._body_orient.Set(Gf.Quatd(1.0, 0.0, 0.0, 0.0))
+            self._body_xform = body_xform
+            chassis = UsdGeom.Cube.Define(stage, body_path + "/chassis")
+            chassis.CreateSizeAttr(1.0)
+            chassis.AddScaleOp().Set(Gf.Vec3f(0.35, 0.15, 0.08))
+            chassis.CreateDisplayColorAttr([Gf.Vec3f(0.85, 0.15, 0.35)])
+
+        cam_path = body_path + "/tritium_cam"
+        cam = UsdGeom.Camera.Define(stage, cam_path)
+        tx, ty, tz = mount_stage_offset(self.mount_forward, self.mount_left,
+                                        self.mount_up)
+        cam.AddTranslateOp().Set(Gf.Vec3d(tx, ty, tz))
+        w, x, y, z = mount_camera_quat(self.mount_tilt)
+        cam.AddOrientOp(UsdGeom.XformOp.PrecisionDouble).Set(
+            Gf.Quatd(w, Gf.Vec3d(x, y, z))
+        )
+        return cam_path
+
+    def _spin_body(self) -> None:
+        """Yaw the stand-in body so the mounted view actually sweeps.
+
+        A mounted camera that never moves is indistinguishable from a wall
+        camera in the resulting stream — the motion IS the demonstration."""
+        if self._body_xform is None or self.body_spin_dps == 0.0:
+            return
+        from pxr import Gf  # type: ignore
+
+        yaw = math.radians((time.time() - self._t0) * self.body_spin_dps)
+        half = yaw * 0.5
+        self._body_orient.Set(
+            Gf.Quatd(math.cos(half), Gf.Vec3d(0.0, 0.0, math.sin(half)))
+        )
+
     def get_frame(self) -> np.ndarray:
         import omni.replicator.core as rep  # type: ignore
+        self._spin_body()
         # Walk the subject across the view (deterministic sine sweep).
         if self._subject is not None:
             t = time.time() - self._t0
@@ -816,6 +969,10 @@ def _build_source(args) -> FrameSource:
             scene_usd=args.scene or None, physics_hz=args.physics_hz,
             with_depth=args.depth or args.depth16, with_stereo=args.stereo,
             stereo_baseline=args.stereo_baseline,
+            mount_prim=args.mount_prim or None,
+            mount_forward=args.mount_forward, mount_left=args.mount_left,
+            mount_up=args.mount_up, mount_tilt=args.mount_tilt,
+            body_spin_dps=args.body_spin_dps,
         )
     return SyntheticFrameSource(
         args.width, args.height, with_vehicle=args.with_vehicle,
@@ -882,6 +1039,24 @@ def main(argv=None) -> int:
     ap.add_argument("--target-y", type=float, default=-4.0)
     ap.add_argument("--target-z", type=float, default=0.9)
     ap.add_argument("--physics-hz", type=int, default=30)
+    # Capability 8b — mount the camera ON a body instead of on a wall. The
+    # offsets are body-frame metres and MUST match the CameraMount the operator
+    # side uses for the FOV cone, or image and cone drift apart.
+    ap.add_argument("--mount-prim", default="",
+                    help="parent the render camera under this prim (e.g. "
+                         "/World/Go2); created as a stand-in body if absent")
+    ap.add_argument("--mount-forward", type=float, default=0.30,
+                    help="mount offset out the body's nose, metres")
+    ap.add_argument("--mount-left", type=float, default=0.0)
+    ap.add_argument("--mount-up", type=float, default=0.25)
+    ap.add_argument("--mount-tilt", type=float, default=-10.0,
+                    help="boresight elevation, positive UP")
+    ap.add_argument("--body-spin-dps", type=float, default=0.0,
+                    help="yaw the stand-in body at this rate so the mounted "
+                         "view sweeps; 0 leaves the body still")
+    ap.add_argument("--attach-to", default="",
+                    help="tracked target id this camera rides; served in "
+                         "/meta so SC can register the feed with attach_to")
     ap.add_argument("--with-vehicle", action="store_true")
     # (capability 8) Depth + stereo extra channels — synthetic-safe (no GPU);
     # under --source isaac they wire the real annotators / a second camera.
@@ -916,6 +1091,16 @@ def main(argv=None) -> int:
         "fov_angle": args.fov, "fov_range": args.range_m,
         "width": args.width, "height": args.height,
     }
+    # A body-mounted feed advertises the mount so SC can bind it with attach_to
+    # and derive the cone from the SAME geometry the render used. Absent these
+    # keys the feed is a wall camera and the operator's pose stays a constant.
+    if args.attach_to or args.mount_prim:
+        meta["mount"] = {
+            "attach_to": args.attach_to or None,
+            "prim": args.mount_prim or None,
+            "forward_m": args.mount_forward, "left_m": args.mount_left,
+            "up_m": args.mount_up, "tilt_deg": args.mount_tilt,
+        }
     if "depth16" in channels and not depth16_available():
         # Fail at startup rather than advertise a metric channel that will
         # never produce a byte — the exact silent-healthy failure mode that
