@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import dataclasses
 import json
 import math
 import socket
@@ -156,7 +157,7 @@ SCENE_TEMPLATE = """
 import omni.usd
 from isaacsim.core.utils.stage import add_reference_to_stage
 from isaacsim.storage.native import get_assets_root_path
-from pxr import UsdGeom, UsdPhysics, Gf
+from pxr import UsdGeom, UsdPhysics, Gf, Sdf
 
 stage = omni.usd.get_context().get_stage()
 
@@ -178,6 +179,47 @@ if not stage.GetPrimAtPath("__GROUND_PATH__").IsValid():
     xf.AddScaleOp().Set(Gf.Vec3f(*__SLAB_HALF__))
     UsdPhysics.CollisionAPI.Apply(slab.GetPrim())
     # Deliberately NO RigidBodyAPI: static collider, so it does not fall itself.
+
+# Obstacles: static box colliders standing on the slab.  These exist so the
+# body has something to route AROUND -- capability 3 is pathfinding, and a
+# route through an empty world is indistinguishable from walking straight.
+# Same geometry contract as tritium_lib.planning.SceneObstacle (center +
+# half-extents in meters), so the boxes the planner avoids and the boxes the
+# solver collides with are the same numbers, not two hand-kept lists.
+#
+# Every obstacle prim is REMOVED and re-authored, and any left over from a
+# longer previous run is removed too.  Skipping a path that already exists --
+# the obvious way to write this -- is what made the guarantee above a lie in
+# practice: a stale /World/obstacle_0 survived across runs, so the planner
+# routed around the box it was handed while the solver held a box at a
+# different place and size (measured: asked for center (1.5,0.4) half
+# (0.5,0.5,0.35), stage held AABB x 1.65..2.35, y -1.0..1.0).  Every
+# clearance number that run produced graded geometry that was not there.
+# The stage is a live process that outlives any one trial, so identity of
+# path is not identity of geometry, and only re-authoring makes it so.
+_obs_specs = __OBSTACLES_JSON__
+_stale = 0
+while True:
+    _path = "/World/obstacle_%d" % (len(_obs_specs) + _stale)
+    if not stage.GetPrimAtPath(_path).IsValid():
+        break
+    stage.RemovePrim(_path)
+    _stale += 1
+for _i, _obs in enumerate(_obs_specs):
+    _path = "/World/obstacle_%d" % _i
+    if stage.GetPrimAtPath(_path).IsValid():
+        stage.RemovePrim(_path)
+    _box = UsdGeom.Cube.Define(stage, _path)
+    _box.CreateSizeAttr(2.0)  # unit cube; the scale op sets real half-extents
+    _bxf = UsdGeom.Xformable(_box.GetPrim())
+    _bxf.ClearXformOpOrder()
+    _bxf.AddTranslateOp().Set(Gf.Vec3d(*_obs["center"]))
+    _bxf.AddScaleOp().Set(Gf.Vec3f(*_obs["half"]))
+    UsdPhysics.CollisionAPI.Apply(_box.GetPrim())
+    # Static, like the slab: no RigidBodyAPI, so a nudge cannot shove a wall.
+    _box.GetPrim().CreateAttribute(
+        "primvars:displayColor", Sdf.ValueTypeNames.Color3fArray).Set(
+            [Gf.Vec3f(0.9, 0.2, 0.3)])
 
 robot = stage.GetPrimAtPath("__ROBOT_PATH__")
 if not robot.IsValid():
@@ -225,7 +267,8 @@ result = {"variant": variant, "robot_valid": bool(robot.IsValid()),
 """
 
 
-def build_scene_code(stiffness: float, damping: float) -> str:
+def build_scene_code(stiffness: float, damping: float,
+                     obstacles: "list | None" = None) -> str:
     """Render the scene-build snippet.
 
     Plain .replace() rather than .format()/f-string: the body is Python source
@@ -248,8 +291,34 @@ def build_scene_code(stiffness: float, damping: float) -> str:
             .replace("__SLAB_CENTER__", repr(tuple(slab.center)))
             .replace("__SLAB_HALF__", repr(tuple(slab.half_extents)))
             .replace("__TOP_Z__", repr(float(slab.top_z)))
+            .replace("__OBSTACLES_JSON__", repr(obstacle_specs(obstacles or [])))
             .replace("__STIFFNESS__", repr(float(stiffness)))
             .replace("__DAMPING__", repr(float(damping))))
+
+
+def obstacle_specs(obstacles) -> list[dict]:
+    """Convert ``SceneObstacle``s into the plain dicts the scene code authors.
+
+    The conversion exists so the SAME obstacle objects that are handed to the
+    planner are the ones authored into the solver's stage.  Keeping two lists
+    -- one to route around, one to collide with -- is how a demo ends up
+    routing around a wall that isn't there, or walking through one that is.
+    """
+    specs = []
+    for obs in obstacles:
+        if obs.yaw_deg:
+            # The scene authors axis-aligned boxes only.  Silently dropping a
+            # yaw would put the planner's obstacle and the solver's obstacle
+            # in different places -- exactly the divergence this function
+            # exists to prevent -- so refuse instead.
+            raise ValueError(
+                f"{obs.prim_path}: yaw_deg={obs.yaw_deg} is not authored by "
+                "this scene; pass an axis-aligned box")
+        specs.append({
+            "center": tuple(float(v) for v in obs.center),
+            "half": tuple(float(v) for v in obs.half_extents),
+        })
+    return specs
 
 
 # --------------------------------------------------------------------------
@@ -414,7 +483,10 @@ state = {"trace": [], "steps": 0, "t0": None, "err": None,
          # Disturbance bookkeeping.  `kicks` records what actually landed and
          # when -- a run that reports an empty list did NOT run the experiment
          # it claims to, and scoring it would compare two undisturbed arms.
-         "kicks": [], "d_prev": 0.0, "body_mass": None, "push": None}
+         "kicks": [], "d_prev": 0.0, "body_mass": None, "push": None,
+         # Route following.  Present but empty when no route was given, so a
+         # straight run and a followed run collect the same shape.
+         "follow": [], "arrived_at": None}
 
 
 PUSH_WINDOW_S = __PUSH_WINDOW__
@@ -497,6 +569,38 @@ if _TWIST:
     state["steer"] = {"left": round(_STEER_BIAS.left_scale, 4),
                       "right": round(_STEER_BIAS.right_scale, 4)}
 
+# ---- closed-loop route following ---------------------------------------
+# The difference from the block above is the whole point of this tick: that
+# steer bias is computed ONCE from the command line and never changes, so the
+# body drives a fixed arc and cannot be said to be following anything.  This
+# one recomputes the bias every step from the body's OWN measured pose, which
+# is what makes it closed-loop over position rather than open-loop over time.
+#
+# The tracker is not reimplemented here either -- it is
+# tritium_lib.control.PurePursuitFollower, the same object the headless tests
+# drive.  This block only knows how to read a pose out of Newton.
+_ROUTE = __ROUTE_JSON__
+_FOLLOWER = None
+_ROUTE_PTS = []
+if _ROUTE:
+    from tritium_lib.control import PurePursuitFollower, TwistCommand, differential_stride
+    from tritium_lib.geo.isaac_frame import quat_to_yaw_deg
+    _ROUTE_PTS = [(float(p[0]), float(p[1])) for p in _ROUTE["waypoints"]]
+    _FOLLOWER = PurePursuitFollower(
+        lookahead_m=float(_ROUTE["lookahead"]),
+        cruise_mps=float(_ROUTE["cruise"]),
+        max_angular_rps=float(_ROUTE["max_angular"]),
+        goal_tolerance_m=float(_ROUTE["goal_tolerance"]),
+        slow_radius_m=float(_ROUTE["slow_radius"]),
+    )
+    # Standing still is stride scale ZERO on both sides, not None: None means
+    # "never steered" and would leave the gait walking straight past the goal.
+    _STOP_BIAS = differential_stride(
+        TwistCommand.stop(), track_width_m=float(_ROUTE["track"]),
+        nominal_mps=float(_ROUTE["nominal"]))
+    state["follow"] = []
+    state["arrived_at"] = None
+
 # Left legs are FL/RL, right are FR/RR -- read off LegPlacement.y > 0 rather
 # than hardcoded, so a body with a different naming scheme stays correct.
 _SIDE_DOF = {"left": [], "right": []}
@@ -557,19 +661,57 @@ def _on_step(dt):
 
         targets = _sample_targets(elapsed).copy()
 
+        # Route following runs BEFORE the steer is applied, because it is what
+        # decides the steer.  Like the stabiliser, it reads the root EVERY
+        # step rather than on the trace's SAMPLE_EVERY cadence: a position
+        # loop closed at logging rate is a different, much slower controller
+        # than the one the headless tests characterise.
+        root = None
+        _bias = _STEER_BIAS
+        if _FOLLOWER is not None:
+            root = _to_numpy(view.get_root_transforms())
+            # Isaac hands back position + an XYZW quaternion; quat_to_yaw_deg
+            # speaks WXYZ.  This reorder is the same load-bearing one the
+            # stabiliser below does -- get it wrong and the body chases a
+            # heading rotated out from under it.
+            qx, qy, qz, qw = (float(v) for v in root[0][3:7])
+            _fs = _FOLLOWER.update(
+                (float(root[0][0]), float(root[0][1]),
+                 math.radians(quat_to_yaw_deg((qw, qx, qy, qz)))),
+                _ROUTE_PTS)
+            if _fs.arrived:
+                if state["arrived_at"] is None:
+                    state["arrived_at"] = round(float(elapsed), 3)
+                _bias = _STOP_BIAS
+            else:
+                _bias = differential_stride(
+                    _fs.twist, track_width_m=float(_ROUTE["track"]),
+                    nominal_mps=float(_ROUTE["nominal"]))
+            if state["steps"] % SAMPLE_EVERY == 0:
+                # Recorded for diagnosis only.  The VERDICT is scored offline
+                # from the ground-truth pose trace against the route, never
+                # from these numbers -- a controller grading its own tracking
+                # error is marking its own homework.
+                state["follow"].append(
+                    [round(float(elapsed), 3),
+                     round(float(_fs.cross_track_m), 4),
+                     round(float(_fs.distance_to_goal_m), 4),
+                     round(float(_fs.twist.angular_rps), 4),
+                     int(_fs.target_index)])
+
         # Steering is applied BEFORE the attitude trim, so the stabiliser's
         # vertical corrections ride on top of the steered stride rather than
         # being scaled away by it.
-        if _STEER_BIAS is not None:
-            targets = _apply_steer(targets, _STEER_BIAS)
+        if _bias is not None:
+            targets = _apply_steer(targets, _bias)
 
         # The root transform is read EVERY step when stabilising, not on the
         # SAMPLE_EVERY cadence -- feedback at the trace's logging rate would be
         # a control loop running an order of magnitude slower than the
         # disturbance it is meant to reject.
-        root = None
         if __STABILIZE__:
-            root = _to_numpy(view.get_root_transforms())
+            if root is None:
+                root = _to_numpy(view.get_root_transforms())
             t_prev = state["t_prev"]
             step_dt = (elapsed - t_prev) if t_prev is not None else 0.0
             if step_dt > 0.0:
@@ -624,7 +766,8 @@ def build_driver_code(gait: dict, duration: float, stiffness: float,
                       kd: float = None, lib_src: str = LIB_SRC,
                       disturb: list[dict] | None = None,
                       push_window: float = 0.1,
-                      twist: dict | None = None) -> str:
+                      twist: dict | None = None,
+                      route: dict | None = None) -> str:
     from tritium_lib.control.attitude_stabilizer import DEFAULT_KD, DEFAULT_KP
 
     code = DRIVER_CODE
@@ -639,6 +782,7 @@ def build_driver_code(gait: dict, duration: float, stiffness: float,
     code = code.replace("__DISTURB_JSON__", repr(list(disturb or [])))
     code = code.replace("__PUSH_WINDOW__", repr(float(push_window)))
     code = code.replace("__TWIST_JSON__", repr(dict(twist) if twist else None))
+    code = code.replace("__ROUTE_JSON__", repr(dict(route) if route else None))
     code = code.replace("__KP__", repr(float(DEFAULT_KP if kp is None else kp)))
     code = code.replace("__KD__", repr(float(DEFAULT_KD if kd is None else kd)))
     # IsaacEvents moved around between releases; resolve it remotely.
@@ -656,7 +800,8 @@ g = builtins._tritium_gait
 st = g["state"]
 result = {"steps": st["steps"], "err": st["err"], "trace": st["trace"],
           "joint_names": g["joint_names"], "kicks": st["kicks"],
-          "body_mass": st["body_mass"]}
+          "body_mass": st["body_mass"],
+          "follow": st.get("follow", []), "arrived_at": st.get("arrived_at")}
 """
 
 CLEANUP_CODE = """
@@ -789,6 +934,87 @@ def twist_spec(args) -> dict | None:
     }
 
 
+def parse_points(text: str) -> list[tuple[float, float]]:
+    """Parse ``"x,y;x,y;..."`` into world-meter points."""
+    points = []
+    for chunk in text.split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        parts = [p.strip() for p in chunk.split(",")]
+        if len(parts) != 2:
+            raise SystemExit(f"waypoint wants X,Y in meters, got {chunk!r}")
+        points.append((float(parts[0]), float(parts[1])))
+    return points
+
+
+def parse_obstacles(specs) -> list:
+    """Parse ``--obstacle X,Y,HX,HY,HZ`` into ``SceneObstacle``s.
+
+    Z is not asked for: an obstacle a ground body must route around stands ON
+    the ground, so the box is seated on the slab and ``HZ`` is its height
+    above it.  A floating box would be a different feature (and would not
+    obstruct anything a quadruped does).
+    """
+    from tritium_lib.planning.scene_costmap import SceneObstacle
+
+    obstacles = []
+    for i, spec in enumerate(specs or []):
+        parts = [p.strip() for p in spec.split(",")]
+        if len(parts) != 5:
+            raise SystemExit(
+                f"--obstacle wants X,Y,HX,HY,HZ in meters, got {spec!r}")
+        x, y, hx, hy, hz = (float(p) for p in parts)
+        if hx < 0 or hy < 0 or hz < 0:
+            # SceneObstacle would raise ValueError here.  A typo in a CLI flag
+            # should read as a CLI error, not a library traceback.
+            raise SystemExit(
+                f"--obstacle half-extents must be >= 0, got {spec!r}")
+        obstacles.append(SceneObstacle(
+            prim_path=f"/World/obstacle_{i}",
+            center=(x, y, hz),  # seated on the slab: center z == half height
+            half_extents=(hx, hy, hz),
+        ))
+    return obstacles
+
+
+def route_spec(args, waypoints) -> dict | None:
+    """Build the route-following command, or None to walk straight.
+
+    ``None`` rather than an empty route for the same reason ``twist_spec``
+    returns None: the unfollowed arm of an A/B must run the original code
+    path untouched, or it is not a control.
+    """
+    if not waypoints:
+        return None
+    return {
+        "waypoints": [list(p) for p in waypoints],
+        "lookahead": float(args.lookahead),
+        "cruise": float(args.speed),
+        "max_angular": float(args.max_angular),
+        "goal_tolerance": float(args.goal_tolerance),
+        "slow_radius": float(args.slow_radius),
+        "track": float(args.steer_track),
+        "nominal": float(args.speed),
+        # The scorer stands off by the BODY RADIUS, not by the planner's
+        # clearance.  These are two different quantities and conflating them
+        # breaks the referee in both directions:
+        #
+        #   plan_clearance is an INFLATION radius -- a preference for how much
+        #   room to leave, satisfied on a discrete grid, so a route planned at
+        #   0.15 m resolution legitimately lands ~0.18 m from a box it asked
+        #   to clear by 0.30 m.  Grading against it fails the planner's own
+        #   optimal path (measured: COLLIDED at clearance 0.177), so no run
+        #   could ever pass.
+        #   body_radius is the FOOTPRINT -- the half-width that physically
+        #   collides.  Below it the hull is inside the box, which is the only
+        #   thing "collided" can honestly mean.
+        #
+        # Nav2 draws exactly this line between inflation and footprint.
+        "clearance": float(args.body_radius),
+    }
+
+
 def disturb_spec(args) -> list[dict]:
     """Build the impulse schedule from the CLI, or an empty list for none."""
     if args.disturb_at is None:
@@ -911,7 +1137,38 @@ def main() -> int:
                          "tritium_lib.control.differential_stride.")
     ap.add_argument("--steer-track", type=float, default=0.26, metavar="M",
                     help="body track width used by the mixer (Go2: 0.26)")
+    ap.add_argument("--route", metavar="X,Y;X,Y;...",
+                    help="walk this polyline with closed-loop pure pursuit "
+                         "instead of a fixed steer")
+    ap.add_argument("--plan-to", metavar="X,Y",
+                    help="plan a route from the body to this goal around "
+                         "--obstacle boxes, then walk it (implies --route)")
+    ap.add_argument("--obstacle", action="append", metavar="X,Y,HX,HY,HZ",
+                    help="axis-aligned box on the slab; repeatable")
+    ap.add_argument("--lookahead", type=float, default=0.8, metavar="M",
+                    help="pure-pursuit lookahead distance")
+    ap.add_argument("--max-angular", type=float, default=0.8, metavar="RAD_S",
+                    help="yaw-rate clamp for the follower")
+    ap.add_argument("--goal-tolerance", type=float, default=0.35, metavar="M")
+    ap.add_argument("--slow-radius", type=float, default=0.0, metavar="M",
+                    help="ease off the throttle within this range of the goal")
+    ap.add_argument("--plan-resolution", type=float, default=0.15, metavar="M")
+    ap.add_argument("--plan-clearance", type=float, default=0.30, metavar="M",
+                    help="planner INFLATION radius — how much room to prefer")
+    ap.add_argument("--body-radius", type=float, default=0.16, metavar="M",
+                    help="body FOOTPRINT half-width used to judge collision; "
+                         "the Go2 is ~0.31 m wide. Not the same as "
+                         "--plan-clearance, which is only a preference")
     ap.add_argument("--capture", help="write a viewport PNG here")
+    ap.add_argument("--capture-distance", type=float, default=3.0, metavar="M",
+                    help="camera standoff for --capture. The 3 m default "
+                         "frames the BODY; framing a whole ROUTE needs enough "
+                         "range to see the obstacle and both endpoints, or "
+                         "the frame proves nothing about where it walked")
+    ap.add_argument("--capture-elevation", type=float, default=18.0,
+                    metavar="DEG", help="camera elevation for --capture; near "
+                                        "90 is top-down, which is the view "
+                                        "that shows a route being followed")
     ap.add_argument("--capture-at", type=float, default=None, metavar="SEC",
                     help="sim-time to capture at, default mid-window. Clamped "
                          "to the scored window: a frame taken after the driver "
@@ -970,6 +1227,21 @@ def main() -> int:
     with open(args.gait_file) as fh:
         gait = json.load(fh)
 
+    # Obstacles are authored into the stage AND handed to the planner from
+    # this one list, so the boxes the route avoids are the boxes the solver
+    # can trip over.
+    obstacles = parse_obstacles(args.obstacle)
+    if args.route and args.plan_to:
+        ap.error("--route and --plan-to are mutually exclusive: one hands the "
+                 "polyline over, the other plans it")
+    if args.plan_to:
+        waypoints = plan_route(args, obstacles)
+    else:
+        waypoints = parse_points(args.route) if args.route else []
+    route = route_spec(args, waypoints)
+    if obstacles:
+        print(f"[gait] {len(obstacles)} obstacle(s) on the slab")
+
     br = Bridge(args.host, args.port)
     print(f"[gait] bridge {args.host}:{args.port} -> {br.sim_state().get('result', {}).get('state')}")
 
@@ -992,12 +1264,19 @@ def main() -> int:
             if args.capture and trial == 1:
                 suffix = "closed" if stabilize else "open"
                 capture = args.capture.replace(".png", f"-{suffix}.png")
-            score = run_trial(br, gait, args, stabilize, capture)
+            score = run_trial(br, gait, args, stabilize, capture,
+                              route=route, obstacles=obstacles)
             runs.append(score)
             line = (f"[gait] {label} trial {trial}/{args.trials}: "
                     f"{score.get('verdict')} "
                     f"dist={score.get('displacement_m')} "
                     f"max_tilt={score.get('max_tilt_deg')}")
+            if route:
+                line += (f" | route={score.get('route_verdict')}"
+                         f" gap={score.get('route_final_gap_m')}"
+                         f" xtrack={score.get('route_max_cross_track_m')}"
+                         f" clear={score.get('route_min_clearance_m')}"
+                         f" progress={score.get('route_progress_ratio')}")
             dist_info = score.get("disturbance")
             if dist_info:
                 kicks = dist_info.get("kicks") or []
@@ -1106,8 +1385,101 @@ def main() -> int:
     return 0 if walked * 2 > len(primary) else 1
 
 
+def score_route(collected: dict, route: dict, obstacles) -> dict:
+    """Grade the run against the route it was told to walk.
+
+    Deliberately scored from the GROUND-TRUTH pose trace, not from the
+    follower's own ``cross_track_m`` samples.  The follower computes its error
+    from the same pose estimate it steers on, so a controller with a broken
+    pose reads zero error while walking into a wall; recomputing from the
+    solver's root transforms cannot flatter itself that way.  The follower's
+    own numbers are still reported, prefixed, for diagnosis only.
+    """
+    from tritium_lib.control.route_trace import score_route_trace
+
+    trace = collected.get("trace", [])
+    positions = [(row[1], row[2]) for row in trace]
+    waypoints = [(float(x), float(y)) for x, y in route["waypoints"]]
+    scored = score_route_trace(
+        positions, waypoints, obstacles,
+        goal_tolerance_m=float(route["goal_tolerance"]),
+        # Stand the referee off by the same half-width the planner used.  At
+        # clearance 0 the scorer grades the body's CENTER point, so a run whose
+        # hull clips a box by up to a half-width scores clean -- the referee
+        # would be more permissive about a wall than the plan that avoided it.
+        clearance_m=float(route.get("clearance", 0.0)),
+        # Every box here was typed on the command line, so the list is already
+        # curated and the library's terrain cap must not apply: it drops boxes
+        # over 100 m as scenery, which would score a body jammed against a
+        # long wall as a clean arrival.  Must match plan_route's costmap, or
+        # the scorer forgives exactly the walls the planner avoided.
+        max_footprint_m=None)
+    out = {f"route_{k}": v for k, v in dataclasses.asdict(scored).items()}
+    out["route_verdict"] = scored.verdict
+    out["route_arrived_at_s"] = collected.get("arrived_at")
+    follow = collected.get("follow", [])
+    out["follower_samples"] = len(follow)
+    if follow:
+        # Self-reported, and labelled as such.
+        out["follower_final_cross_track_m"] = follow[-1][1]
+    return out
+
+
+def plan_route(args, obstacles) -> list[tuple[float, float]]:
+    """Plan around ``obstacles`` with the planner lib already ships.
+
+    No planner is written here.  ``tritium_lib.planning`` has a tested
+    8-connected A* and a costmap builder, and ``scene_costmap`` already
+    projects 3-D boxes onto it through a body band -- the same boxes this
+    script authors into the stage.  This function is only the glue.
+    """
+    from tritium_lib.planning.astar import plan_route as _plan
+    from tritium_lib.planning.scene_costmap import costmap_from_scene
+
+    start = (0.0, 0.0)  # the scene seats the body at the origin
+    goals = parse_points(args.plan_to)
+    if not goals:
+        raise SystemExit(f"--plan-to wants X,Y in meters, got {args.plan_to!r}")
+    goal = goals[0]
+    grid = costmap_from_scene(
+        obstacles, resolution=args.plan_resolution,
+        bounds=_route_bounds(start, goal, margin_m=4.0),
+        # The obstacle list is hand-typed, not scraped off a stage, so the
+        # library's terrain cap has nothing to protect against here -- and
+        # applied, it silently DROPS any box over 100 m across, handing back a
+        # straight line through a wall the scene really authors.  None keeps
+        # every box the operator asked for.  score_route uses the same value.
+        max_footprint_m=None)
+    # clearance_m belongs to the PLANNER, not the costmap: it is the body's
+    # standoff from a wall, which is a property of the Go2 (~0.3 m half-width),
+    # not of the wall.
+    result = _plan(grid, start, goal, clearance_m=args.plan_clearance)
+    if not result.success:
+        raise SystemExit(f"no route from {start} to {goal}: {result.reason}")
+    if result.clearance_relaxed:
+        # Say so rather than walking a route that grazes a wall while the log
+        # claims the standoff was honoured.
+        print("[gait] WARNING: clearance could not be met; route relaxed to 0",
+              file=sys.stderr)
+    print(f"[gait] planned {len(result.path)} waypoints, cost {result.cost:.2f}, "
+          f"{result.expansions} expansions, strategy {result.strategy}")
+    return [(float(x), float(y)) for x, y in result.path]
+
+
+def _route_bounds(start, goal, margin_m: float):
+    """Crop the costmap to the start->goal corridor.
+
+    Sizing the grid to the whole stage is what produced a 39.8M-cell map on
+    the city scene; the corridor is the only part a route can use.
+    """
+    return (min(start[0], goal[0]) - margin_m, min(start[1], goal[1]) - margin_m,
+            max(start[0], goal[0]) + margin_m, max(start[1], goal[1]) + margin_m)
+
+
 def run_trial(br: "Bridge", gait: dict, args, stabilize: bool,
-              capture: str | None = None) -> dict:
+              capture: str | None = None,
+              route: dict | None = None,
+              obstacles: "list | None" = None) -> dict:
     """One scored run from a freshly rebuilt scene.
 
     The scene is torn down and rebuilt per trial rather than reusing the
@@ -1117,7 +1489,16 @@ def run_trial(br: "Bridge", gait: dict, args, stabilize: bool,
     """
     br.sim_control("stop")
     time.sleep(1.0)
-    _ok("scene", br.execute(build_scene_code(args.stiffness, args.damping)))
+    _ok("scene", br.execute(build_scene_code(args.stiffness, args.damping,
+                                             obstacles=obstacles)))
+    if route:
+        # Draw the ROUTE the body was told to walk, so a captured frame shows
+        # the plan and the body in the same picture.  A frame of a robot on an
+        # empty slab cannot distinguish following a route from wandering.
+        # Reuses nav_bridge's drawing rather than a second polyline authority.
+        from isaac_sim_addon.clients.nav_bridge import draw_route_src
+        _ok("draw", br.execute(draw_route_src(
+            [(p[0], p[1]) for p in route["waypoints"]])))
     br.sim_control("play")
     time.sleep(2.0)
 
@@ -1125,7 +1506,7 @@ def run_trial(br: "Bridge", gait: dict, args, stabilize: bool,
         gait, args.seconds, args.stiffness, args.damping, args.sample_every,
         stabilize=stabilize, kp=args.kp, kd=args.kd,
         disturb=disturb_spec(args), push_window=args.disturb_window,
-        twist=twist_spec(args))))
+        twist=twist_spec(args), route=route)))
     if stabilize and len(info.get("legs_wired", [])) != 4:
         # Silently trimming two legs would look like a weak controller rather
         # than a wiring bug, so it is fatal instead.
@@ -1148,7 +1529,8 @@ def run_trial(br: "Bridge", gait: dict, args, stabilize: bool,
     at = max(0.0, min(float(at), args.seconds))
     mid_deadline = time.time() + at
     if capture:
-        br.camera_look_at(ROBOT_PATH, distance=3.0)
+        br.camera_look_at(ROBOT_PATH, distance=args.capture_distance,
+                          elevation=args.capture_elevation)
     time.sleep(max(0.0, mid_deadline - time.time()))
     mid_shot = br.capture() if capture else None
     time.sleep(max(0.0, args.seconds * 0.5 + 2.0))
@@ -1164,6 +1546,8 @@ def run_trial(br: "Bridge", gait: dict, args, stabilize: bool,
     score["stabilized_steps"] = collected.get("stabilized")
     score["max_cmd_rad"] = collected.get("max_cmd_seen")
     score["stabilize"] = stabilize
+    if route:
+        score.update(score_route(collected, route, obstacles or []))
 
     if capture and mid_shot:
         data = mid_shot.get("result", {})
