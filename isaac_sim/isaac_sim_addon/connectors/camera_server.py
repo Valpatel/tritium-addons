@@ -162,6 +162,14 @@ class FrameSource:
 
     name = "abstract"
 
+    #: True when the source may ONLY be stepped from the process's main thread.
+    #: Omniverse Kit is such a source: ``world.step()`` /
+    #: ``rep.orchestrator.step()`` block forever — silently, with no exception —
+    #: when driven from a worker thread, which is why a healthy-looking
+    #: ``--source isaac`` server once served zero frames.  Pure-numpy sources
+    #: (the synthetic stand-in) are thread-safe and leave this False.
+    requires_main_thread = False
+
     def get_frame(self) -> np.ndarray:
         raise NotImplementedError
 
@@ -302,6 +310,8 @@ class IsaacFrameSource(FrameSource):
     """
 
     name = "isaac"
+    # Kit's update loop is main-thread-only — see FrameSource.requires_main_thread.
+    requires_main_thread = True
 
     def __init__(self, width, height, cam_pos, cam_target, scene_usd=None,
                  physics_hz=30, with_depth=False, with_stereo=False,
@@ -465,7 +475,50 @@ class CameraState:
         self.frames = 0
 
     def start(self):
+        """Render in a BACKGROUND thread. Only legal for thread-safe sources —
+        an Isaac/Kit source stepped off the main thread deadlocks silently, so
+        we refuse loudly rather than serve an eternally empty stream."""
+        if getattr(self.source, "requires_main_thread", False):
+            raise RuntimeError(
+                f"source {self.source.name!r} must be rendered on the main thread "
+                "(Omniverse Kit deadlocks in a worker); use run_main_thread() and "
+                "serve HTTP from the background thread instead"
+            )
         threading.Thread(target=self._loop, daemon=True, name="isaac-cam-render").start()
+
+    def render_once(self) -> bool:
+        """Render + encode ONE instant across all channels on the CALLING
+        thread, publishing to the latest-frame holder. Returns True on success.
+
+        This is the main-thread pump used for Isaac; :meth:`_loop` is the same
+        step plus pacing, for background-thread sources."""
+        try:
+            encoded = {}
+            for name, rgb in self._render_channels().items():
+                jpeg = self.encode(rgb)
+                if jpeg:
+                    encoded[name] = jpeg
+            if encoded.get("main"):
+                with self._lock:
+                    self._latest.update(encoded)
+                    self.frames += 1
+                return True
+            return False
+        except Exception as exc:
+            log.warning("frame render failed: %s", exc)
+            return False
+
+    def run_main_thread(self):
+        """Drive rendering on the CALLING (main) thread until stopped. Blocks —
+        the HTTP server runs in the background thread under this arrangement."""
+        interval = 1.0 / self.fps
+        while not self._stop.is_set():
+            t0 = time.time()
+            if not self.render_once():
+                self._stop.wait(0.5)
+            dt = time.time() - t0
+            if dt < interval:
+                self._stop.wait(interval - dt)
 
     def _render_channels(self) -> dict:
         """Render every enabled channel for the current instant. ``main`` first
@@ -482,25 +535,9 @@ class CameraState:
         return out
 
     def _loop(self):
-        interval = 1.0 / self.fps
-        while not self._stop.is_set():
-            t0 = time.time()
-            try:
-                encoded = {}
-                for name, rgb in self._render_channels().items():
-                    jpeg = self.encode(rgb)
-                    if jpeg:
-                        encoded[name] = jpeg
-                if encoded.get("main"):
-                    with self._lock:
-                        self._latest.update(encoded)
-                        self.frames += 1
-            except Exception as exc:
-                log.warning("frame render failed: %s", exc)
-                time.sleep(0.5)
-            dt = time.time() - t0
-            if dt < interval:
-                self._stop.wait(interval - dt)
+        # Background-thread variant — identical step, same pacing, so the two
+        # render paths cannot drift apart.
+        self.run_main_thread()
 
     def latest(self, channel: str = "main") -> bytes:
         with self._lock:
@@ -509,6 +546,27 @@ class CameraState:
     def stop(self):
         self._stop.set()
         self.source.close()
+
+
+#: Streaming routes -> channel, longest-prefix first so `/mjpeg_depth` and
+#: `/mjpeg_right` are never swallowed by the bare `/mjpeg` prefix.
+_STREAM_ROUTES = (
+    ("/mjpeg_right", "right"),
+    ("/mjpeg_depth", "depth"),
+    ("/depth", "depth"),
+    ("/mjpeg", "main"),
+)
+
+
+def resolve_channel(path: str) -> str | None:
+    """Map a request path to a channel name, or None when it is not a stream
+    route. Pure — the routing table is unit-testable without a socket."""
+    if path == "/":
+        return "main"
+    for prefix, channel in _STREAM_ROUTES:
+        if path.startswith(prefix):
+            return channel
+    return None
 
 
 def _make_handler(state: CameraState):
@@ -570,13 +628,8 @@ def _make_handler(state: CameraState):
                 self.send_header("Content-Length", str(len(jpeg)))
                 self.end_headers()
                 self.wfile.write(jpeg)
-            # Order matters: match the longer stereo/depth routes before /mjpeg.
-            elif self.path.startswith("/mjpeg_right"):
-                self._stream_channel("right")
-            elif self.path.startswith("/depth"):
-                self._stream_channel("depth")
-            elif self.path.startswith("/mjpeg") or self.path == "/":
-                self._stream_channel("main")
+            elif (channel := resolve_channel(self.path)) is not None:
+                self._stream_channel(channel)
             else:
                 self.send_response(404)
                 self.end_headers()
@@ -701,9 +754,17 @@ def main(argv=None) -> int:
         "width": args.width, "height": args.height,
     }
     state = CameraState(source, meta, args.fps, encode, channels=channels)
-    state.start()
-
     httpd = ThreadingHTTPServer((args.host, args.port), _make_handler(state))
+
+    # Which thread owns rendering vs HTTP depends on the source. Isaac/Kit must
+    # be pumped from the MAIN thread, so there the HTTP server is the one that
+    # moves to the background; thread-safe sources keep the classic split.
+    main_thread_render = getattr(source, "requires_main_thread", False)
+    if main_thread_render:
+        threading.Thread(target=httpd.serve_forever, daemon=True,
+                         name="isaac-cam-http").start()
+    else:
+        state.start()
 
     def _shutdown(*_a):
         log.info("shutting down")
@@ -715,12 +776,16 @@ def main(argv=None) -> int:
 
     log.info(
         "ISAAC CAMERA READY source=%s encoder=%s http://%s:%d/mjpeg id=%s "
-        "channels=%s pose=(%.4f,%.4f h=%.0f fov=%.0f r=%.0f)",
+        "channels=%s render=%s pose=(%.4f,%.4f h=%.0f fov=%.0f r=%.0f)",
         source.name, enc_name, args.host, args.port, args.camera_id,
-        ",".join(channels), args.lat, args.lng, args.heading, args.fov, args.range_m,
+        ",".join(channels), "main-thread" if main_thread_render else "background",
+        args.lat, args.lng, args.heading, args.fov, args.range_m,
     )
     try:
-        httpd.serve_forever()
+        if main_thread_render:
+            state.run_main_thread()   # blocks; HTTP is already serving
+        else:
+            httpd.serve_forever()
     finally:
         state.stop()
     return 0

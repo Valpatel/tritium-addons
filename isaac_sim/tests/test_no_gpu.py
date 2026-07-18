@@ -15,6 +15,8 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import pytest
+
 _CONN = Path(__file__).resolve().parents[1] / "isaac_sim_addon" / "connectors"
 
 
@@ -152,6 +154,83 @@ def test_camera_server_state_renders_all_channels():
     assert set(rendered) == {"main", "depth", "right"}
     for name, frame in rendered.items():
         assert frame.shape == (48, 64, 3), f"{name} bad shape {frame.shape}"
+
+
+# -- the MAIN-THREAD contract (regression: live Isaac rendered 0 frames) ----
+#
+# Observed on the RTX 4090 2026-07-18: `--source isaac` came up healthy
+# (/status 200, source=isaac, 3 channels) and served ZERO bytes on every MJPEG
+# route, forever, with no error in the log.  Cause: CameraState.start() drives
+# world.step()/rep.orchestrator.step() from a background thread, but Omniverse
+# Kit must be pumped from the MAIN thread — the worker blocks there silently.
+# The identical source stepped from the main thread rendered 12/12 frames.
+# The synthetic source is pure numpy and thread-safe, which is why every
+# previous headless test passed while the real path was dead.
+
+
+def test_frame_sources_declare_their_threading_requirement():
+    """Isaac needs the main thread; synthetic does not. The server must be able
+    to tell them apart WITHOUT importing isaacsim."""
+    mod = _load("camera_server")
+    assert mod.SyntheticFrameSource.requires_main_thread is False
+    assert mod.IsaacFrameSource.requires_main_thread is True
+
+
+def test_camera_state_start_refuses_background_thread_for_main_thread_source():
+    """start() must NOT spawn a render thread for a main-thread-only source —
+    that is exactly the deadlock that served 0 frames from live Isaac."""
+    mod = _load("camera_server")
+
+    class _MainThreadOnly(mod.SyntheticFrameSource):
+        requires_main_thread = True
+
+    src = _MainThreadOnly(width=64, height=48)
+    state = mod.CameraState(src, meta={}, fps=10, encoder=lambda rgb: b"x",
+                            channels=("main",))
+    with pytest.raises(RuntimeError, match="main thread"):
+        state.start()
+
+
+def test_camera_state_render_once_advances_frames_on_the_calling_thread():
+    """render_once() is the main-thread pump: one call, one frame, in-thread."""
+    import threading
+    mod = _load("camera_server")
+    src = mod.SyntheticFrameSource(width=64, height=48)
+    state = mod.CameraState(src, meta={}, fps=10, encoder=lambda rgb: b"jpeg",
+                            channels=("main",))
+    caller = threading.get_ident()
+    seen = []
+    orig = src.get_frame
+
+    def _spy():
+        seen.append(threading.get_ident())
+        return orig()
+
+    src.get_frame = _spy
+    assert state.frames == 0
+    state.render_once()
+    assert state.frames == 1, "render_once must produce a frame"
+    assert state.latest("main") == b"jpeg"
+    assert seen == [caller], "rendering must happen on the CALLING thread"
+
+
+def test_mjpeg_depth_route_is_not_silently_rgb():
+    """`/mjpeg_depth` must resolve to the DEPTH channel.
+
+    It previously fell through the `/mjpeg` prefix and served RGB with a 200 —
+    so an operator registering the natural sibling of `/mjpeg_right` got colour
+    frames labelled as depth, with nothing anywhere reporting a problem.
+    Caught on the wire against live Isaac, not by any unit test."""
+    mod = _load("camera_server")
+    for path, expected in [
+        ("/mjpeg", "main"),
+        ("/", "main"),
+        ("/mjpeg_right", "right"),
+        ("/depth", "depth"),
+        ("/mjpeg_depth", "depth"),
+    ]:
+        assert mod.resolve_channel(path) == expected, f"{path} -> wrong channel"
+    assert mod.resolve_channel("/nope") is None
 
 
 def test_camera_server_colorize_depth_near_bright_far_dark():
