@@ -176,3 +176,105 @@ The driver prints non-gameable motion metrics (`displacement_m`,
 transform trace — a dog that vibrates in place reads `STATIONARY`, and one
 that falls over reads `COLLAPSED`. Don't report a gait as working off a
 screenshot alone.
+
+## 2026-07-18 — the articulation was never the problem: the solver integrates nothing
+
+The previous entry concluded the Go2 was "present in the tensor view but not
+part of what Newton is stepping". That was too narrow, and one of its premises
+was wrong. Three findings, in the order they fell out, driven by
+`newton_world_probe.py` against a freshly restarted kit.
+
+### 1. A headless kit does not pump its own update loop
+
+With the timeline reporting `is_playing() == True`, the timeline clock advanced
+**0.033 s across 6 s of wall clock** — about one frame per bridge call. Physics
+time advanced only when something poked the app.
+
+This retroactively explains the old measurement. The gait driver's "471 writes
+over 7.8 s at ~60 Hz" were real writes into a world that barely stepped between
+them, and the `sim_time` it watched advancing was an artifact of *its own
+polling*. Sleeping on the client and expecting the kit to simulate does not
+work.
+
+The stepping primitive the lane was missing:
+
+```python
+app = omni.kit.app.get_app()
+for _ in range(240):
+    app.update()      # 240 updates -> +4.08 s of sim time, reproducibly
+```
+
+`world.step()` is **not** available here: `SimulationContext` only builds its
+`PhysicsContext` when `ISAAC_LAUNCHED_FROM_TERMINAL is False`
+(`simulation_context.py:150`), which is never true in a kit app. So
+`world.step()` dies on `'NoneType' object has no attribute '_step'`. Lead 1 of
+the previous entry — "build the scene through `World`" — is therefore a **dead
+end** for this deployment: `World()` in a kit app skips physics-context setup
+entirely.
+
+`world.reset()` does work, but only after `SimulationManager.set_backend("torch")`
+and only if nothing is registered in `world.scene` — an `XformPrim.post_reset()`
+feeds numpy arrays into `isaacsim.core.utils.**torch**.transformations` and
+raises `'numpy.ndarray' object has no attribute 'detach'`. Same
+wrapper-assumes-torch bug family as the `SingleArticulation` CUDA fault above.
+Use a plain USD ground plane, not `world.scene.add_default_ground_plane()`.
+
+### 2. Read poses from the physics view, never off USD
+
+Physics writes to Fabric and does not write back to USD attributes, so
+`UsdGeom.Xformable.GetLocalTransformation()` returns the *authored* value
+forever. A healthy falling body looks frozen. Every pose in this entry is read
+through `SM.get_physics_sim_view()` views.
+
+### 3. The scene's gravity is `(nan, nan, nan)`
+
+`SM.get_physics_scenes()[0].get_gravity()` returned `(nan, nan, nan)` on a kit
+whose solver is `newton`, integrator `euler`, dt `0.002`. Authoring
+`gravityDirection`/`gravityMagnitude` on the USD `/PhysicsScene` while stopped
+fixes the reading — it then reports `(0, 0, -9.81)`.
+
+**But fixing gravity did not make anything fall.** Which leads to the finding
+that supersedes the previous entry's conclusion:
+
+### The real blocker: nothing is simulated, articulation or not
+
+A control experiment removes the Go2 from the question entirely. A plain
+`UsdGeom.Cube` with `RigidBodyAPI` + `CollisionAPI` + a 1 kg `MassAPI`, sitting
+3 m above a collider ground plane, read through `NewtonRigidBodyView`:
+
+| Condition | sim time advanced | drop |
+|---|---|---|
+| default (gravity NaN) | 4.08 s | **0.0 m** |
+| gravity authored `(0,0,-9.81)` | 4.08 s | **0.0 m** |
+| everything authored before the process's FIRST play | 4.08 s | **0.0 m** |
+
+The Go2 under the same pumping, with all 12 drives zeroed and its base at
+z=0.8: `max_dof_delta 0.0 rad`, `root_drop 0.0 m`, verdict `NOT_STEPPED`.
+
+So the Newton solver in this kit build **advances its clock but integrates
+nothing** — for a free rigid body as much as for a 12-DOF articulation. The
+gait lane is not blocked on our trajectory, our joint mapping, or the
+articulation's presence in the model. It is blocked one layer below all of
+that.
+
+> **Honesty note.** This entry is a *diagnosis*, not a fix — nothing here made
+> a body move. The viewport capture that would corroborate it visually was not
+> obtained this tick (the camera-posing snippet errored before `/sim/capture`),
+> so the evidence is numeric only: three independent bodies, two different
+> tensor-view types, consistent zeros while sim time advanced 4.08 s.
+
+**Start the next tick here**, cheapest first:
+
+1. **Is the Newton model empty?** Inspect the solver's own model — body count,
+   shape count, joint count — via the `newton` package directly rather than
+   through the Isaac wrappers. A model with zero bodies would explain every
+   zero above and would be visible immediately.
+2. **Does the shipped Newton sample fall?** Run whatever
+   `newton`/`isaacsim.physics.newton` example the build ships, unmodified. If
+   NVIDIA's own sample is also frozen, this is a broken kit/build, not our
+   scene — and the fix is a rebuild or a different Isaac release, not more
+   scene-authoring.
+3. **Does `/PhysicsScene` need to be Newton-owned?** The scene reporting NaN
+   gravity by default smells like a scene the Newton backend adopted rather
+   than created. Try letting the Newton extension create its own scene.
+4. Only after a **cube visibly falls** is it worth returning to the gait.
