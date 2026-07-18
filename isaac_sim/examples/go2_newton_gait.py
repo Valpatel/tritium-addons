@@ -569,6 +569,59 @@ if _TWIST:
     state["steer"] = {"left": round(_STEER_BIAS.left_scale, 4),
                       "right": round(_STEER_BIAS.right_scale, 4)}
 
+# ---- LIVE command surface ----------------------------------------------
+# Both blocks above decide the body's motion BEFORE it starts moving: the
+# steer bias is baked from the command line, the route is fixed at build
+# time.  Either way a run is a recording.  This block is the first path by
+# which something outside the process can change what the body is doing
+# WHILE it is doing it -- which is what a teleop link, an operator console
+# or a re-planner all need, and none of them could have.
+#
+# UDP and non-blocking, both deliberately.  Kit is main-thread-only and a
+# blocking read inside a physics step callback hangs the whole app silently
+# (the failure mode tick 20 spent itself on), so the socket is drained with
+# recvfrom until it would block and never waits.  UDP because a command
+# stream wants the newest sample, not every sample: a TCP link that stalls
+# delivers a queue of stale commands, and a body executing history is worse
+# than a body that stopped.  Loss is handled by the watchdog, not by retry.
+#
+# The decode, the ordering gate and the staleness rules are NOT implemented
+# here -- they are tritium_lib.control.CommandLink, the same object the
+# headless tests drive.  This block only knows how to hold a socket.
+_LIVE = __LIVE_JSON__
+_LIVE_LINK = None
+_LIVE_SOCK = None
+if _LIVE:
+    import socket as _socket
+    from tritium_lib.control import CommandLimits, CommandLink, differential_stride
+    _LIVE_LINK = CommandLink(
+        limits=CommandLimits(max_linear_mps=float(_LIVE["max_linear"]),
+                             max_angular_rps=float(_LIVE["max_angular"])),
+        timeout_s=float(_LIVE["timeout"]),
+    )
+    _LIVE_SOCK = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+    _LIVE_SOCK.setblocking(False)
+    _LIVE_SOCK.bind(("0.0.0.0", int(_LIVE["port"])))
+    state["live"] = []
+    state["live_sock_err"] = None
+
+
+def _drain_live(elapsed):
+    # Read every datagram waiting right now; the link keeps the last accepted.
+    #
+    # Bounded on purpose.  An unbounded drain hands a flooding sender control
+    # of how long the physics step takes, which is a denial of service against
+    # the simulation dressed up as a control input.
+    for _ in range(__LIVE_DRAIN__):
+        try:
+            _pkt, _ = _LIVE_SOCK.recvfrom(2048)
+        except BlockingIOError:
+            break
+        except OSError as exc:
+            state["live_sock_err"] = repr(exc)
+            break
+        _LIVE_LINK.ingest(_pkt, elapsed)
+
 # ---- closed-loop route following ---------------------------------------
 # The difference from the block above is the whole point of this tick: that
 # steer bias is computed ONCE from the command line and never changes, so the
@@ -701,6 +754,30 @@ def _on_step(dt):
         # than the one the headless tests characterise.
         root = None
         _bias = _STEER_BIAS
+
+        # The live link is polled EVERY step, not on the trace's sample
+        # cadence: a command surface read at logging rate is a slower, laggier
+        # controller than the one the headless tests characterise, and the
+        # watchdog's timeout would be quantised to the log interval.
+        if _LIVE_LINK is not None:
+            _drain_live(elapsed)
+            _live_twist = _LIVE_LINK.poll(elapsed)
+            _bias = differential_stride(
+                _live_twist, track_width_m=float(_LIVE["track"]),
+                nominal_mps=float(_LIVE["nominal"]))
+            if state["steps"] % SAMPLE_EVERY == 0:
+                # Recorded so the run can be scored against what was actually
+                # SENT.  Without this column a live run is indistinguishable
+                # from a baked one -- the whole claim of this path is that the
+                # body followed an external command, and that claim needs the
+                # command in the trace to be checkable at all.
+                state["live"].append(
+                    [round(float(elapsed), 3),
+                     round(float(_live_twist.linear_mps), 4),
+                     round(float(_live_twist.angular_rps), 4),
+                     int(_LIVE_LINK.accepted),
+                     int(_LIVE_LINK.rejected)])
+
         if _FOLLOWER is not None:
             root = _to_numpy(view.get_root_transforms())
             # Isaac hands back position + an XYZW quaternion; quat_to_yaw_deg
@@ -845,7 +922,8 @@ handle = _sub
 
 import builtins
 builtins._tritium_gait = {"state": state, "handle": handle, "view": view,
-                          "joint_names": joint_names}
+                          "joint_names": joint_names,
+                          "live_sock": _LIVE_SOCK}
 result = {"joint_names": joint_names, "count": int(count),
           "dof": int(len(joint_names)), "stabilize": bool(__STABILIZE__),
           "legs_wired": sorted(leg_dof)}
@@ -859,7 +937,9 @@ def build_driver_code(gait: dict, duration: float, stiffness: float,
                       disturb: list[dict] | None = None,
                       push_window: float = 0.1,
                       twist: dict | None = None,
-                      route: dict | None = None) -> str:
+                      route: dict | None = None,
+                      live: dict | None = None,
+                      live_drain: int = 64) -> str:
     from tritium_lib.control.attitude_stabilizer import DEFAULT_KD, DEFAULT_KP
 
     code = DRIVER_CODE
@@ -875,6 +955,8 @@ def build_driver_code(gait: dict, duration: float, stiffness: float,
     code = code.replace("__PUSH_WINDOW__", repr(float(push_window)))
     code = code.replace("__TWIST_JSON__", repr(dict(twist) if twist else None))
     code = code.replace("__ROUTE_JSON__", repr(dict(route) if route else None))
+    code = code.replace("__LIVE_JSON__", repr(dict(live) if live else None))
+    code = code.replace("__LIVE_DRAIN__", repr(int(live_drain)))
     code = code.replace("__KP__", repr(float(DEFAULT_KP if kp is None else kp)))
     code = code.replace("__KD__", repr(float(DEFAULT_KD if kd is None else kd)))
     # IsaacEvents moved around between releases; resolve it remotely.
@@ -893,7 +975,8 @@ st = g["state"]
 result = {"steps": st["steps"], "err": st["err"], "trace": st["trace"],
           "joint_names": g["joint_names"], "kicks": st["kicks"],
           "body_mass": st["body_mass"],
-          "follow": st.get("follow", []), "arrived_at": st.get("arrived_at")}
+          "follow": st.get("follow", []), "arrived_at": st.get("arrived_at"),
+          "live": st.get("live", []), "live_sock_err": st.get("live_sock_err")}
 """
 
 CLEANUP_CODE = """
@@ -906,6 +989,16 @@ if g is not None:
         # an omni.kit update subscription is released by dropping the ref
         g["handle"] = None
         removed = True
+    except Exception:
+        pass
+    # Close the live socket explicitly.  Leaving it to GC leaks the bound
+    # port for the life of the kit process, so the NEXT run of this script
+    # dies on bind -- and since the kit is long-lived and reused across
+    # runs, that turns one leak into every subsequent run failing.
+    try:
+        _sock = g.get("live_sock")
+        if _sock is not None:
+            _sock.close()
     except Exception:
         pass
     del builtins._tritium_gait
@@ -1021,6 +1114,25 @@ def twist_spec(args) -> dict | None:
     return {
         "linear": float(args.speed),
         "angular": float(args.steer),
+        "track": float(args.steer_track),
+        "nominal": float(args.speed),
+    }
+
+
+def live_spec(args) -> dict | None:
+    """Build the live-command-surface config, or None to stay batch-driven.
+
+    ``None`` for the same reason ``twist_spec`` returns None: a run with no
+    ``--live-port`` must not open a socket at all, so the existing batch path
+    stays byte-for-byte the code every previous tick measured.
+    """
+    if not args.live_port:
+        return None
+    return {
+        "port": int(args.live_port),
+        "timeout": float(args.live_timeout),
+        "max_linear": float(args.live_max_linear),
+        "max_angular": float(args.live_max_angular),
         "track": float(args.steer_track),
         "nominal": float(args.speed),
     }
@@ -1243,6 +1355,19 @@ def main() -> int:
                          "tritium_lib.control.differential_stride.")
     ap.add_argument("--steer-track", type=float, default=0.26, metavar="M",
                     help="body track width used by the mixer (Go2: 0.26)")
+    ap.add_argument("--live-port", type=int, metavar="PORT",
+                    help="listen on this UDP port for live twist commands "
+                         "({\"cmd\":\"twist\",\"seq\":N,\"linear_mps\":..,"
+                         "\"angular_rps\":..}), overriding --steer every "
+                         "physics step. Without it the run is batch-driven "
+                         "exactly as before.")
+    ap.add_argument("--live-timeout", type=float, default=0.5, metavar="S",
+                    help="stop the body if no valid command arrives for this "
+                         "long (tritium_lib.control watchdog; default 0.5)")
+    ap.add_argument("--live-max-linear", type=float, default=1.0, metavar="MPS",
+                    help="clamp on commanded forward speed (default 1.0)")
+    ap.add_argument("--live-max-angular", type=float, default=2.0, metavar="RPS",
+                    help="clamp on commanded yaw rate (default 2.0)")
     ap.add_argument("--route", metavar="X,Y;X,Y;...",
                     help="walk this polyline with closed-loop pure pursuit "
                          "instead of a fixed steer")
@@ -1255,6 +1380,10 @@ def main() -> int:
                     help="pure-pursuit lookahead distance")
     ap.add_argument("--max-angular", type=float, default=0.8, metavar="RAD_S",
                     help="yaw-rate clamp for the follower")
+    ap.add_argument("--dump-live", metavar="PATH.json",
+                    help="write the live command column beside the "
+                         "ground-truth pose trace, on one clock — the "
+                         "evidence a live run needs to be graded at all")
     ap.add_argument("--dump-follow", metavar="PATH.json",
                     help="write the per-step follower trace for offline "
                          "diagnosis (commanded vs MEASURED yaw rate). Never "
@@ -1401,6 +1530,17 @@ def main() -> int:
                 with open(path, "w") as fh:
                     json.dump(score["follow_trace"], fh)
                 print(f"[gait] wrote {path}")
+            if args.dump_live:
+                path = args.dump_live.replace(
+                    ".json", f"-{'closed' if stabilize else 'open'}"
+                    f"-t{trial}.json")
+                with open(path, "w") as fh:
+                    json.dump({"live": score.get("live_trace", []),
+                               "pose": score.get("pose_trace", []),
+                               "live_sock_err": score.get("live_sock_err")}, fh)
+                print(f"[gait] wrote {path}")
+            score.pop("live_trace", None)
+            score.pop("pose_trace", None)
             score.pop("follow_trace", None)  # too big for the summary line
             runs.append(score)
             line = (f"[gait] {label} trial {trial}/{args.trials}: "
@@ -1648,7 +1788,7 @@ def run_trial(br: "Bridge", gait: dict, args, stabilize: bool,
         gait, args.seconds, args.stiffness, args.damping, args.sample_every,
         stabilize=stabilize, kp=args.kp, kd=args.kd,
         disturb=disturb_spec(args), push_window=args.disturb_window,
-        twist=twist_spec(args), route=route)))
+        twist=twist_spec(args), route=route, live=live_spec(args))))
     if stabilize and len(info.get("legs_wired", [])) != 4:
         # Silently trimming two legs would look like a weak controller rather
         # than a wiring bug, so it is fatal instead.
@@ -1688,6 +1828,15 @@ def run_trial(br: "Bridge", gait: dict, args, stabilize: bool,
     score["stabilized_steps"] = collected.get("stabilized")
     score["max_cmd_rad"] = collected.get("max_cmd_seen")
     score["stabilize"] = stabilize
+    # Carried out of the run so a live session can be graded against what was
+    # actually COMMANDED, not just how far the body got.  Distance alone
+    # cannot tell a body that obeyed a live operator from one running a baked
+    # twist -- both walk.  The command column is the only thing that can.
+    score["live_trace"] = collected.get("live", [])
+    score["live_sock_err"] = collected.get("live_sock_err")
+    # Ground-truth pose on the SAME clock as the command column, so the two
+    # can be sliced at the moment the link went quiet.
+    score["pose_trace"] = collected.get("trace", [])
     if route:
         score.update(score_route(collected, route, obstacles or []))
 
