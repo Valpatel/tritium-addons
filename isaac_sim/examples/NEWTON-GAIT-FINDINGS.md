@@ -598,3 +598,92 @@ commanded 0.6 rad/s over 8 s ≈ 275°, i.e. **~12% of commanded yaw** — open
 loop, with no yaw feedback closing the gap. Closing that loop is the obvious
 next lever, and it is also what route-following will need, since pure pursuit
 assumes a body that roughly achieves the yaw rate it is asked for.
+
+---
+
+## 2026-07-18, tick 19 — the reliability target was already met; measuring it was the work
+
+This tick was briefed as "make the walking gait reliable — it is open-loop and
+survives only 29–67% of trials". **That premise was stale by two ticks.** The
+closed-loop attitude path landed at tick 13 (`--stabilize`, driving
+`tritium_lib.control.AttitudeStabilizer` through the leg Jacobian trim), and
+nobody had since measured its *undisturbed* upright rate over a trial count
+large enough to quote. The 29–67% numbers everyone was still citing are the
+**open-loop control arm**. So no new controller was written this tick. What was
+missing was evidence, and the evidence is now unambiguous.
+
+### 34 of 34 upright, across two independent kit processes
+
+Every trial 6 s, `gait_trot.json` (trot, speed 0.6, stride 0.975 Hz), stiffness
+60 / damping 4, default gains `kp=0.8 kd=0.3`, graded by
+`tritium_lib.geo.body_attitude` (upright **and** moved — displacement alone
+still certifies a robot on its back).
+
+| session | arm | upright | walked | median tilt |
+|---|---|---|---|---|
+| A (`baseline12.log`) | **closed-loop** | **12/12 (100%)** | 12/12 | 6.38° |
+| A | open-loop control | 8/12 (67%) | 8/12 | 29.37° |
+| B, fresh kit (`confirm12.log`) | **closed-loop** | **12/12 (100%)** | 12/12 | 5.90° |
+| B | open-loop control | 9/12 (75%) | 9/12 | 27.88° |
+| C, speed 1.2 (`fast10.log`) | **closed-loop** | **10/10 (100%)** | 10/10 | 8.81° |
+
+**Closed-loop: 34/34 (100%). Open-loop: 17/24 (71%).** Session B was run against
+a kit restarted between batches specifically because this lane has been burned
+by session-to-session variance (67%, 29%, 100% from an identical gait file) —
+the point of a second process was to show the rate is a property of the
+controller and not of a lucky process. It reproduced exactly.
+
+The tilt distributions do not overlap at all, which is the stronger claim than
+the rate: closed-loop peaks at **5–10°**, open-loop at **22–30°** when it
+survives and 180° when it does not. The controller is not squeaking past the
+45° gate, it is holding the body an order of magnitude inside it.
+
+Open-loop failures remain **total, never partial** — 176–180°, fully inverted,
+the signature of a disturbance that compounds every stride. And open-loop trial
+3 of session B is the tick-10 lesson recurring on schedule: **1.19 m travelled,
+ending inverted**. Distance-only scoring would have called it the session's
+better runs.
+
+Visual confirmation at t=3.0 s, same scene, same camera:
+`docs/images/isaac/gait-stability-closedloop-2026-07-18.png` (level, legs under
+the body, mid-stride) vs `gait-stability-openloop-2026-07-18.png` (visibly
+rolled, legs splayed).
+
+### Commanding a faster stride makes the body slower
+
+Session C doubled stride frequency (speed 1.2, 1.95 Hz vs 0.975 Hz) expecting
+either more ground or a stability cliff. **Neither happened.** Upright stayed
+10/10, but median displacement *fell* from ~1.20 m to ~0.85 m over the same 6 s.
+The extra stride rate is going into foot slip, not travel, so the gait's
+useful envelope is bounded by traction well before it is bounded by balance.
+Anyone tuning for speed should tune stance/traction, not frequency.
+
+### The honest remaining failure mode
+
+**Undisturbed flat-ground walking is solved. Disturbance rejection is not, and
+the reusable path does not have the controller at all.**
+
+1. **The connector is still open-loop.** The closed loop lives *only* in
+   `examples/go2_newton_gait.py`, inside the generated driver-code string.
+   `isaac_sim_addon/connectors/newton_gait_driver.py` — the reusable, tested,
+   Isaac-free seam that anything else would consume — has no attitude feedback
+   whatsoever (`grep -c stabilize` → 0). **Any consumer wiring up the connector
+   inherits the 71% number, not the 100% one.** This is the single most
+   valuable follow-up and it is a wiring job, not a research one.
+2. **Pushes above ~5 N·s still invert it** (tick 13): J=3 N·s is rejected
+   cleanly (peak 8.1° vs open-loop's 179.9°), J=5 N·s tumbles both arms. The
+   controller trims foot height; it has no stepping reflex, so a disturbance
+   large enough to need a *recovery step* has no mechanism to produce one.
+3. **Flat ground only.** Every number here is a 50 × 50 × 1 m slab. Slopes,
+   steps and debris are unmeasured.
+4. **Yaw drift is unregulated** — heading wanders (session medians +7.6°,
+   −3.1°, −15.0°) because the attitude controller deliberately ignores yaw and
+   the tick-16 yaw loop is a separate, unmerged path.
+
+### Method note, for the next tick
+
+Cost is ~12 s of wall clock per 6 s trial, so **a 12-trial two-arm A/B is about
+5 minutes**. There is no budget excuse for reporting n=1 in this lane. Client
+side needs `PYTHONPATH=<repo>/tritium-lib/src` and
+`tritium-lib/.venv/bin/python` (system `python3` on the RTX host has neither
+pydantic nor numpy); the kit itself gets the lib through `__LIB_SRC__`.
