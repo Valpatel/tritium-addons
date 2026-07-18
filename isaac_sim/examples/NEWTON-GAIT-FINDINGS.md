@@ -465,3 +465,82 @@ problem rather than a physics one:
 3. **Report the rate, never a single run.** One trial of a 67%-stable gait is a
    coin flip that reads as proof either way. `--trials N` belongs in this
    script.
+
+---
+
+## 2026-07-18, tick 13 — two silent no-ops between "the code ran" and "the body moved"
+
+Building the push-recovery experiment surfaced two failures that are dangerous
+for the same reason: in both, everything reports success and nothing happens.
+
+### 1. `set_root_velocities()` is silently discarded on a floating-base articulation
+
+The natural way to deliver an impulse is to read the root velocity, add `J/m`,
+and write it back. `NewtonArticulationView.set_root_velocities()` accepts the
+call, raises nothing, and the solver **discards it entirely** — the velocity
+reads back bit-identical to what it was before the write.
+
+This is worse than an exception. The schedule fired, the kick counter
+incremented, and the first live run cheerfully reported **"recovered 1/1"** for
+an experiment in which the robot was never pushed. Only a read-back of the
+velocity immediately after the write exposed it:
+
+```
+dv_measured=[0.0, 0.0, 0.0]      # <-- the entire experiment, silently vacuous
+```
+
+**Deliver impulses as a force held over a window instead** (`J = F·T`, via
+`view.apply_forces(fd, idx, True)` with `fd` shaped `(count, links, 3)` and the
+force on link 0). Forces go through the solver's own accumulation path and
+actually move the body:
+
+```
+dv_measured=[-0.291, 0.5443, 0.3022]   # real, and ~half of J/m because the
+                                        # feet are in contact and friction
+                                        # absorbs the rest
+```
+
+**The general rule this earns:** "the actuation call returned" is never
+evidence the body was actuated. Read the state back and compare. Every
+disturbance run now records `vel_before`, `vel_after` and `measured_dv_mps`,
+and a trial whose kick did not land is reported `NOT_APPLIED` rather than
+folded into a recovery rate.
+
+### 2. The kit caches tritium-lib, including the *directory listing*
+
+The kit is a long-lived process, so a `tritium-lib` edit is invisible to it.
+Purging `sys.modules` of `tritium_lib*` is the obvious half of the fix and is
+**not sufficient**: `importlib`'s `FileFinder` caches each package directory's
+contents, so a module file *added* to a package after the kit last scanned it
+raises `ModuleNotFoundError` for a file that is plainly on disk. Both halves
+are now in the driver preamble:
+
+```python
+for _m in [m for m in _sys.modules if m == "tritium_lib" or m.startswith("tritium_lib.")]:
+    del _sys.modules[_m]
+import importlib as _importlib
+_importlib.invalidate_caches()
+```
+
+Without this, every lib edit costs a kit restart.
+
+### Calibrating the push
+
+Impulse magnitude was swept rather than guessed, since a disturbance that
+always tumbles both arms measures nothing and one that tumbles neither
+measures nothing either:
+
+| J (N·s) | open-loop | closed-loop |
+|---|---|---|
+| 2 | — | WALKED, peak 7.1° |
+| 3 | **TUMBLED, 179.9°** | **WALKED, peak 8.1°** |
+| 5 | TUMBLED, 179.9° | TUMBLED, 162.6° |
+| 8 | TUMBLED, 170.2° | — |
+| 15 | — | TUMBLED, 150.7° (thrown 8 m) |
+
+**J = 3 N·s lateral is the discriminating level** — the only one where the two
+arms disagree. Above 5 N·s the disturbance overwhelms the controller; below 2
+it does not challenge it. Note the run is 8 s with the kick at t=3 s, so the
+first ~2 s of start-up transient (peak tilt 22–25°) is excluded from the
+post-kick score by construction — `score_recovery` measures peak *after* the
+disturbance and reports the pre-kick worst separately as `baseline_deg`.

@@ -315,7 +315,40 @@ def tile(vec):
 import sys as _sys
 if __LIB_SRC__ not in _sys.path:
     _sys.path.insert(0, __LIB_SRC__)
-from tritium_lib.control import AttitudeStabilizer, LegPlacement
+# Drop any cached tritium_lib modules before importing.  The kit is a
+# long-lived process that has usually imported the lib on a previous run, so
+# without this an edit to tritium-lib is invisible until the kit is
+# restarted -- and worse, it fails as a confusing ImportError for a symbol
+# that plainly exists on disk.
+for _m in [m for m in _sys.modules if m == "tritium_lib" or m.startswith("tritium_lib.")]:
+    del _sys.modules[_m]
+# Purging sys.modules is NOT enough on its own: importlib's FileFinder caches
+# each directory's listing, so a module file added to tritium-lib AFTER the
+# kit last scanned that package is invisible and raises ModuleNotFoundError
+# for a file that is plainly on disk.  This is what makes lib edits land in a
+# long-running kit without a restart.
+import importlib as _importlib
+_importlib.invalidate_caches()
+from tritium_lib.control import AttitudeStabilizer, DisturbanceSchedule, Impulse, LegPlacement
+
+# ---- the disturbance ----------------------------------------------------
+# A controller that regulates tilt can only be credited with rejecting a
+# disturbance that actually happened.  Three sessions of this gait produced
+# upright rates of 67%, 29% and 100% from an identical gait file, so the
+# falls it was built to prevent arrive by luck and cannot be A/B'd.  This
+# injects a KNOWN push at a KNOWN sim time, identically in both arms, so the
+# manipulated variable is ours instead of the weather.
+#
+# Scheduling is tritium_lib.control.DisturbanceSchedule -- again the same
+# object the headless tests drive, not a reimplementation.  Firing is decided
+# by SIM TIME, so both arms are kicked at the same moment in the stride
+# regardless of frame rate.
+_disturb_spec = __DISTURB_JSON__
+disturb = (DisturbanceSchedule([Impulse(at_time=d["at_time"],
+                                        linear=tuple(d["linear"]),
+                                        label=d.get("label", ""))
+                                for d in _disturb_spec])
+           if _disturb_spec else None)
 
 # Go2 foot placements in the body frame (REP-103: +X forward, +Y left).
 # Hip x-offset is the real URDF value; y is the FOOT's lateral stance, which
@@ -376,7 +409,74 @@ def _apply_trim(targets, offsets):
 
 
 state = {"trace": [], "steps": 0, "t0": None, "err": None,
-         "t_prev": None, "stabilized": 0, "max_cmd_seen": 0.0}
+         "t_prev": None, "stabilized": 0, "max_cmd_seen": 0.0,
+         # Disturbance bookkeeping.  `kicks` records what actually landed and
+         # when -- a run that reports an empty list did NOT run the experiment
+         # it claims to, and scoring it would compare two undisturbed arms.
+         "kicks": [], "d_prev": 0.0, "body_mass": None, "push": None}
+
+
+PUSH_WINDOW_S = __PUSH_WINDOW__
+
+def _root_vel():
+    return [float(v) for v in _to_numpy(view.get_root_velocities())[0][:3]]
+
+
+def _apply_impulse(imp, elapsed):
+    # An impulse is delivered as a FORCE HELD OVER A WINDOW: J = F * T.
+    #
+    # The obvious route -- read the root velocity, add J/m, write it back --
+    # was tried first and is silently a no-op: NewtonArticulationView accepts
+    # set_root_velocities() on a floating-base articulation and the solver
+    # discards it, so the velocity reads back completely unchanged.  Every
+    # counter still incremented, and the run cheerfully reported "recovered
+    # 1/1" from an experiment in which nothing was ever pushed.  Forces go
+    # through the solver's own accumulation path and actually move the body.
+    if state["body_mass"] is None:
+        # Summed link masses, read from the solver rather than hardcoded --
+        # a constant here would silently lie the moment the asset changes.
+        state["body_mass"] = float(_to_numpy(view.get_masses())[0].sum())
+    state["push"] = {
+        "force": [imp.linear[i] / PUSH_WINDOW_S for i in range(3)],
+        "until": elapsed + PUSH_WINDOW_S,
+        "vel_at_start": _root_vel(),
+        "record": {
+            "at_time": imp.at_time, "fired_at": round(float(elapsed), 4),
+            "impulse_ns": list(imp.linear),
+            "window_s": PUSH_WINDOW_S,
+            "expected_dv_mps": [round(imp.linear[i] / state["body_mass"], 4)
+                                for i in range(3)],
+            "label": imp.label,
+        },
+    }
+
+
+def _pump_push(elapsed):
+    # Hold the push force across its window, then measure what it did.
+    # (Comment, not a docstring: this whole block is a triple-quoted Python
+    # string, so a nested docstring would terminate it.)
+    push = state.get("push")
+    if push is None:
+        return
+    if elapsed <= push["until"]:
+        # Force array is (count, links, 3); the push goes on link 0, the base.
+        fd = np.zeros((count, 17, 3), dtype=np.float32)
+        fd[:, 0, :] = np.array(push["force"], dtype=np.float32)
+        view.apply_forces(fd, idx, True)
+        return
+    # Window closed: compare the velocity the body actually gained against
+    # J/m.  This is the ONLY evidence that the disturbance was real, and it
+    # is what caught the silent no-op above.
+    end_vel = _root_vel()
+    rec = push["record"]
+    rec["vel_before"] = [round(v, 4) for v in push["vel_at_start"]]
+    rec["vel_after"] = [round(v, 4) for v in end_vel]
+    rec["measured_dv_mps"] = [round(end_vel[i] - push["vel_at_start"][i], 4)
+                              for i in range(3)]
+    rec["measured_dv_mag"] = round(
+        sum((end_vel[i] - push["vel_at_start"][i]) ** 2 for i in range(3)) ** 0.5, 4)
+    state["kicks"].append(rec)
+    state["push"] = None
 
 def _to_numpy(t):
     # Newton getters hand back torch tensors on cuda:0, and np.array() on one
@@ -405,6 +505,15 @@ def _on_step(dt):
         elapsed = t - state["t0"]
         if elapsed > DURATION:
             return
+
+        # Kick BEFORE this step's targets are commanded, so the controller
+        # first sees the disturbance on the very next step rather than
+        # half a stride later.
+        if disturb is not None:
+            for _imp in disturb.due(state["d_prev"], elapsed):
+                _apply_impulse(_imp, elapsed)
+            state["d_prev"] = elapsed
+            _pump_push(elapsed)
 
         targets = _sample_targets(elapsed).copy()
 
@@ -466,7 +575,9 @@ result = {"joint_names": joint_names, "count": int(count),
 def build_driver_code(gait: dict, duration: float, stiffness: float,
                       damping: float, sample_every: int,
                       stabilize: bool = True, kp: float = None,
-                      kd: float = None, lib_src: str = LIB_SRC) -> str:
+                      kd: float = None, lib_src: str = LIB_SRC,
+                      disturb: list[dict] | None = None,
+                      push_window: float = 0.1) -> str:
     from tritium_lib.control.attitude_stabilizer import DEFAULT_KD, DEFAULT_KP
 
     code = DRIVER_CODE
@@ -478,6 +589,8 @@ def build_driver_code(gait: dict, duration: float, stiffness: float,
     code = code.replace("SAMPLE_EVERY", str(sample_every))
     code = code.replace("__STABILIZE__", repr(bool(stabilize)))
     code = code.replace("__LIB_SRC__", repr(lib_src))
+    code = code.replace("__DISTURB_JSON__", repr(list(disturb or [])))
+    code = code.replace("__PUSH_WINDOW__", repr(float(push_window)))
     code = code.replace("__KP__", repr(float(DEFAULT_KP if kp is None else kp)))
     code = code.replace("__KD__", repr(float(DEFAULT_KD if kd is None else kd)))
     # IsaacEvents moved around between releases; resolve it remotely.
@@ -494,7 +607,8 @@ import builtins
 g = builtins._tritium_gait
 st = g["state"]
 result = {"steps": st["steps"], "err": st["err"], "trace": st["trace"],
-          "joint_names": g["joint_names"]}
+          "joint_names": g["joint_names"], "kicks": st["kicks"],
+          "body_mass": st["body_mass"]}
 """
 
 CLEANUP_CODE = """
@@ -589,6 +703,69 @@ def score_trace(trace: list[list[float]]) -> dict:
     }
 
 
+def disturb_spec(args) -> list[dict]:
+    """Build the impulse schedule from the CLI, or an empty list for none."""
+    if args.disturb_at is None:
+        return []
+    parts = [p.strip() for p in args.disturb_impulse.split(",")]
+    if len(parts) != 3:
+        raise SystemExit(
+            f"--disturb-impulse wants X,Y,Z in N-s, got {args.disturb_impulse!r}")
+    linear = [float(p) for p in parts]
+    if not any(linear):
+        raise SystemExit(
+            "--disturb-impulse is all zeros: that run would measure nothing, "
+            "because the two arms would be identical undisturbed gaits")
+    return [{"at_time": float(args.disturb_at), "linear": linear,
+             "label": "cli"}]
+
+
+def score_disturbance(collected: dict, args) -> dict:
+    """Score recovery from the kick, or say plainly that no kick landed.
+
+    The trap this guards is specific: if the impulse never fires, both arms
+    score identically well and the null result reads as successful rejection.
+    So a run configured with a disturbance that did not land is reported as
+    ``NOT_APPLIED``, never as a clean recovery.
+    """
+    kicks = collected.get("kicks") or []
+    if args.disturb_at is None:
+        return {"disturbance": None}
+    if not kicks:
+        return {"disturbance": {"verdict": "NOT_APPLIED"},
+                "disturb_ok": False}
+
+    from tritium_lib.control import score_recovery
+    from tritium_lib.geo.body_attitude import tilt_from_upright_deg
+
+    samples = []
+    for row in collected.get("trace", []):
+        if len(row) < 8:
+            continue
+        qx, qy, qz, qw = row[4], row[5], row[6], row[7]
+        try:
+            samples.append((float(row[0]), tilt_from_upright_deg((qw, qx, qy, qz))))
+        except ValueError:
+            continue
+
+    fired_at = kicks[0]["fired_at"]
+    try:
+        rec = score_recovery(samples, disturbed_at=fired_at,
+                             settled_below_deg=args.settle_below,
+                             hold_for=args.settle_hold)
+    except ValueError as exc:
+        # e.g. the kick landed after the last logged sample.  Reporting the
+        # reason beats reporting a number nobody can trust.
+        return {"disturbance": {"verdict": "UNSCORABLE", "reason": str(exc)},
+                "disturb_ok": False}
+
+    payload = rec.as_dict()
+    payload["verdict"] = "RECOVERED" if rec.recovered else "NOT_RECOVERED"
+    payload["kicks"] = kicks
+    payload["body_mass_kg"] = collected.get("body_mass")
+    return {"disturbance": payload, "disturb_ok": True}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -616,6 +793,27 @@ def main() -> int:
     ap.add_argument("--stabilize", choices=("on", "off", "both"), default="on",
                     help="closed-loop attitude feedback: on, off (open-loop "
                          "control), or both arms A/B in one session")
+    ap.add_argument("--disturb-at", type=float, default=None, metavar="T",
+                    help="inject a push at sim time T seconds. Without this "
+                         "the run waits for a spontaneous fall, which across "
+                         "three sessions arrived 67%%, 29%% and 0%% of the "
+                         "time -- you cannot A/B rejection of a disturbance "
+                         "that shows up by luck.")
+    ap.add_argument("--disturb-impulse", default="0,15,0", metavar="X,Y,Z",
+                    help="world-frame linear impulse in N-s (default a 15 N-s "
+                         "LATERAL shove; the body walks +X, so +Y pushes it "
+                         "sideways, which is the axis a trot is least able to "
+                         "recover on its own)")
+    ap.add_argument("--disturb-window", type=float, default=0.1, metavar="SEC",
+                    help="how long the push force is held. The impulse is "
+                         "delivered as force*time (J = F*T), because a "
+                         "root-velocity write is silently discarded by the "
+                         "Newton solver on a floating-base articulation.")
+    ap.add_argument("--settle-below", type=float, default=10.0, metavar="DEG",
+                    help="tilt considered level again for recovery scoring")
+    ap.add_argument("--settle-hold", type=float, default=1.0, metavar="SEC",
+                    help="how long tilt must STAY below --settle-below before "
+                         "recovery is believed")
     ap.add_argument("--kp", type=float, default=None,
                     help="attitude proportional gain (default: tritium-lib's)")
     ap.add_argument("--kd", type=float, default=None,
@@ -663,10 +861,21 @@ def main() -> int:
                 capture = args.capture.replace(".png", f"-{suffix}.png")
             score = run_trial(br, gait, args, stabilize, capture)
             runs.append(score)
-            print(f"[gait] {label} trial {trial}/{args.trials}: "
-                  f"{score.get('verdict')} "
-                  f"dist={score.get('displacement_m')} "
-                  f"max_tilt={score.get('max_tilt_deg')}")
+            line = (f"[gait] {label} trial {trial}/{args.trials}: "
+                    f"{score.get('verdict')} "
+                    f"dist={score.get('displacement_m')} "
+                    f"max_tilt={score.get('max_tilt_deg')}")
+            dist_info = score.get("disturbance")
+            if dist_info:
+                kicks = dist_info.get("kicks") or []
+                # Print the measured velocity delta, not just "fired" -- this
+                # is the line that shows whether the solver honoured the push.
+                dv = kicks[0]["measured_dv_mps"] if kicks else None
+                line += (f" | kick={dist_info.get('verdict')}"
+                         f" dv_measured={dv}"
+                         f" peak={dist_info.get('peak_deg')}"
+                         f" settle={dist_info.get('settle_time')}")
+            print(line)
         results[stabilize] = runs
 
     print("\n" + "=" * 62)
@@ -690,14 +899,51 @@ def main() -> int:
             "median_displacement_m": round(sorted(dists)[len(dists) // 2], 3) if dists else None,
             "verdicts": [r.get("verdict") for r in runs],
         }
+        if args.disturb_at is not None:
+            # Recovery is scored only over trials where the kick actually
+            # landed.  Counting a NOT_APPLIED run as a recovery would inflate
+            # exactly the number this experiment exists to measure.
+            applied = [r for r in runs if r.get("disturb_ok")]
+            recovered = sum(1 for r in applied
+                            if r["disturbance"].get("verdict") == "RECOVERED")
+            peaks = [r["disturbance"]["peak_deg"] for r in applied]
+            settles = [r["disturbance"]["settle_time"] for r in applied
+                       if r["disturbance"].get("settle_time") is not None]
+            summary[label]["disturbance"] = {
+                "kick_applied": len(applied),
+                "kick_missing": len(runs) - len(applied),
+                "recovered": recovered,
+                "recovered_rate": (round(recovered / len(applied), 3)
+                                   if applied else None),
+                "median_peak_tilt_deg": (round(sorted(peaks)[len(peaks) // 2], 2)
+                                         if peaks else None),
+                "worst_peak_tilt_deg": round(max(peaks), 2) if peaks else None,
+                "median_settle_s": (round(sorted(settles)[len(settles) // 2], 3)
+                                    if settles else None),
+            }
         print(f"{label:20s} walked {walked}/{len(runs)}  upright {upright}/{len(runs)}  "
-              f"median_tilt={summary[label]['median_max_tilt_deg']}deg")
+              f"median_tilt={summary[label]['median_max_tilt_deg']}deg"
+              + (f"  recovered {summary[label]['disturbance']['recovered']}/"
+                 f"{summary[label]['disturbance']['kick_applied']}"
+                 if args.disturb_at is not None else ""))
     print(json.dumps(summary, indent=1))
 
     if len(results) == 2:
         c = summary["closed_loop"]["upright_rate"]
         o = summary["open_loop_control"]["upright_rate"]
         print(f"\n[gait] upright rate: closed-loop {c} vs open-loop control {o}")
+        if args.disturb_at is not None:
+            cd = summary["closed_loop"]["disturbance"]
+            od = summary["open_loop_control"]["disturbance"]
+            print(f"[gait] push recovery: closed-loop {cd['recovered']}/"
+                  f"{cd['kick_applied']} (peak {cd['median_peak_tilt_deg']}deg) "
+                  f"vs open-loop {od['recovered']}/{od['kick_applied']} "
+                  f"(peak {od['median_peak_tilt_deg']}deg)")
+            missing = cd["kick_missing"] + od["kick_missing"]
+            if missing:
+                print(f"[gait] WARNING: {missing} trial(s) had NO kick applied — "
+                      "those are undisturbed runs and prove nothing about "
+                      "rejection.")
         if args.trials < 10:
             print(f"[gait] NOTE: {args.trials} trials per arm is too few to call "
                   "a difference significant; this is a direction, not a rate.")
@@ -729,7 +975,8 @@ def run_trial(br: "Bridge", gait: dict, args, stabilize: bool,
 
     info = _ok("driver", br.execute(build_driver_code(
         gait, args.seconds, args.stiffness, args.damping, args.sample_every,
-        stabilize=stabilize, kp=args.kp, kd=args.kd)))
+        stabilize=stabilize, kp=args.kp, kd=args.kd,
+        disturb=disturb_spec(args), push_window=args.disturb_window)))
     if stabilize and len(info.get("legs_wired", [])) != 4:
         # Silently trimming two legs would look like a weak controller rather
         # than a wiring bug, so it is fatal instead.
@@ -753,6 +1000,7 @@ def run_trial(br: "Bridge", gait: dict, args, stabilize: bool,
     _ok("cleanup", br.execute(CLEANUP_CODE))
 
     score = score_trace(collected.get("trace", []))
+    score.update(score_disturbance(collected, args))
     score["physics_steps"] = collected.get("steps")
     score["stabilized_steps"] = collected.get("stabilized")
     score["max_cmd_rad"] = collected.get("max_cmd_seen")
