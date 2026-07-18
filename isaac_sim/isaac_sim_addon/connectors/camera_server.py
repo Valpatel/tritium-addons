@@ -43,6 +43,14 @@ Channels / routes
                            Isaac side = ``distance_to_image_plane`` annotator;
                            synthetic side = a plausible depth ramp, so depth is
                            testable headless.
+  * ``/depth16``           ``--depth16``: the METRIC depth stream — lossless
+                           uint16-millimetre PNG (ROS ``16UC1``, 0 = no return),
+                           the same encoding RealSense/ZED/``depth_image_proc``
+                           speak.  This is the channel a perception consumer
+                           needs; ``/depth`` is only viewable (a colormap cannot
+                           be turned back into metres).
+  * ``/intrinsics``        JSON pinhole model (fx/fy/cx/cy from ``--hfov``) —
+                           what a consumer needs to unproject ``/depth16``.
   * ``/mjpeg_right``       ``--stereo``: the right eye of a stereo pair. Isaac
                            side = a second posed camera offset by
                            ``--stereo-baseline`` metres; synthetic side = a
@@ -126,6 +134,76 @@ def _make_jpeg_encoder():
 # Depth colorizing (shared by synthetic + Isaac depth channels).
 # --------------------------------------------------------------------------- #
 
+#: ``depth16`` wire contract — uint16 PNG, millimetres, 0 = no return. This is
+#: ROS ``16UC1``, the encoding RealSense / ZED / Kinect / ``depth_image_proc``
+#: already share, so an Isaac depth frame and a real ZED frame reach perception
+#: in the same units with the same holes.
+DEPTH16_SCALE = 1000.0          # units per metre (millimetres)
+_DEPTH16_MAX = 65535            # ~65.5 m at mm scale
+
+
+def encode_depth16(depth_m: np.ndarray) -> bytes:
+    """Encode a HxW float depth (METRES) as a lossless uint16-millimetre PNG.
+
+    Deliberately written out in full rather than imported from
+    ``tritium_lib.perception.depth_codec``, which is the CANONICAL definition of
+    this format: connectors run inside Isaac's python and must stay tritium-free
+    (the dependency-hygiene gate), exactly as the gait contract is mirrored from
+    ``tritium_lib.models.gait_trajectory``.  The two sides are held together by a
+    contract test that round-trips this encoder through the lib decoder — if
+    they ever drift, that test fails rather than an operator silently reading
+    wrong ranges.
+
+    ``NaN``/``inf``/non-positive become the 0 no-return sentinel; values past the
+    ceiling CLAMP (a wrapped 70 m sky pixel reading as 4 m would put a phantom
+    contact in the operator's lap).
+    """
+    d = np.asarray(depth_m, dtype=np.float32)
+    if d.ndim == 3:
+        d = d[..., 0]
+    if d.ndim != 2:
+        raise ValueError(f"depth must be HxW metres, got shape {d.shape}")
+
+    invalid = ~np.isfinite(d) | (d <= 0.0)
+    d = np.where(invalid, 0.0, d)
+    units = np.clip(np.rint(d * DEPTH16_SCALE), 0, _DEPTH16_MAX)
+    # A valid-but-sub-millimetre reading must not round down into the hole
+    # sentinel and masquerade as "no return".
+    units[(units == 0) & ~invalid] = 1
+    units[invalid] = 0
+    return _encode_png16(units.astype(np.uint16))
+
+
+def _encode_png16(units: np.ndarray) -> bytes:
+    """16-bit single-channel PNG via cv2, else Pillow — same optional-codec
+    pattern as the JPEG encoder above, so this works in Isaac's python."""
+    try:
+        import cv2
+
+        ok, buf = cv2.imencode(".png", units)
+        if not ok:
+            raise RuntimeError("cv2 failed to encode the depth PNG")
+        return buf.tobytes()
+    except ImportError:
+        pass
+    from PIL import Image
+
+    bio = io.BytesIO()
+    Image.fromarray(units, mode="I;16").save(bio, format="PNG")
+    return bio.getvalue()
+
+
+def depth16_available() -> bool:
+    """True when a 16-bit PNG encoder is present, i.e. the metric channel can
+    actually serve bytes. Checked at startup so a missing codec fails loudly
+    instead of advertising a channel that never produces a frame."""
+    try:
+        _encode_png16(np.zeros((2, 2), dtype=np.uint16))
+    except Exception:
+        return False
+    return True
+
+
 def colorize_depth(depth: np.ndarray, near: float = 0.5, far: float = 60.0) -> np.ndarray:
     """Map a HxW float depth (metres; ``inf``/``nan`` = sky/no-return) to an
     HxWx3 RGB uint8 image — bright/warm = near, dark = far — so the depth channel
@@ -173,8 +251,20 @@ class FrameSource:
     def get_frame(self) -> np.ndarray:
         raise NotImplementedError
 
-    def get_depth(self) -> np.ndarray | None:
+    def get_depth_metres(self) -> np.ndarray | None:
+        """The METRIC depth for the current instant — HxW float32 metres, with
+        ``inf``/``nan`` for no-return.  This, not :meth:`get_depth`, is the
+        source of truth: a colorized depth image is many-to-one and JPEG is
+        lossy, so range cannot be recovered from it.  Sources implement THIS."""
         return None
+
+    def get_depth(self) -> np.ndarray | None:
+        """The viewable (colorized) depth image, derived from the metric one so
+        the two channels can never disagree about what they are showing."""
+        metres = self.get_depth_metres()
+        if metres is None:
+            return None
+        return colorize_depth(metres)
 
     def get_right_frame(self) -> np.ndarray | None:
         return None
@@ -285,10 +375,10 @@ class SyntheticFrameSource(FrameSource):
         self._tick += 1
         return frame
 
-    def get_depth(self) -> np.ndarray | None:
+    def get_depth_metres(self) -> np.ndarray | None:
         if not self.with_depth:
             return None
-        return colorize_depth(self._depth_metres(self._render_tick))
+        return self._depth_metres(self._render_tick)
 
     def get_right_frame(self) -> np.ndarray | None:
         if not self.with_stereo:
@@ -423,15 +513,20 @@ class IsaacFrameSource(FrameSource):
             return np.ascontiguousarray(rgba[:, :, :3])
         return rgba
 
-    def get_depth(self) -> np.ndarray | None:
+    def get_depth_metres(self) -> np.ndarray | None:
         # The depth annotator was filled by the orchestrator.step in the
-        # preceding get_frame — read + colorize it (same instant as the RGB).
+        # preceding get_frame — read it at the same instant as the RGB.  Isaac's
+        # distance_to_image_plane annotator is already in METRES; hand it over
+        # unconverted and let the codec quantize once, at the wire.
         if self._depth_annot is None:
             return None
         data = self._depth_annot.get_data()
         if data is None:
             return None
-        return colorize_depth(np.asarray(data, dtype=np.float32))
+        depth = np.asarray(data, dtype=np.float32)
+        if depth.ndim == 3:
+            depth = depth[..., 0]
+        return depth
 
     def get_right_frame(self) -> np.ndarray | None:
         # The right camera renders in the same orchestrator.step as the left.
@@ -463,12 +558,13 @@ class CameraState:
     """
 
     def __init__(self, source: FrameSource, meta: dict, fps: int, encoder,
-                 channels=("main",)):
+                 channels=("main",), hfov_deg: float = 60.0):
         self.source = source
         self.meta = meta
         self.fps = max(1, fps)
         self.encode = encoder
         self.channels = tuple(channels)
+        self.hfov_deg = float(hfov_deg)
         self._latest: dict[str, bytes] = {c: b"" for c in self.channels}
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -494,10 +590,12 @@ class CameraState:
         step plus pacing, for background-thread sources."""
         try:
             encoded = {}
-            for name, rgb in self._render_channels().items():
-                jpeg = self.encode(rgb)
-                if jpeg:
-                    encoded[name] = jpeg
+            for name, frame in self._render_channels().items():
+                # depth16 is metric float metres and must go out LOSSLESS —
+                # JPEG-ing it would destroy the very numbers it exists to carry.
+                blob = encode_depth16(frame) if name == "depth16" else self.encode(frame)
+                if blob:
+                    encoded[name] = blob
             if encoded.get("main"):
                 with self._lock:
                     self._latest.update(encoded)
@@ -524,10 +622,16 @@ class CameraState:
         """Render every enabled channel for the current instant. ``main`` first
         (it advances the source's animation clock); depth/right reuse it."""
         out = {"main": self.source.get_frame()}
-        if "depth" in self.channels:
-            d = self.source.get_depth()
-            if d is not None:
-                out["depth"] = d
+        if "depth" in self.channels or "depth16" in self.channels:
+            # Read the metric depth ONCE and derive both channels from it, so
+            # the viewable ramp and the metric PNG always describe the same
+            # instant and the same distances.
+            metres = self.source.get_depth_metres()
+            if metres is not None:
+                if "depth" in self.channels:
+                    out["depth"] = colorize_depth(metres)
+                if "depth16" in self.channels:
+                    out["depth16"] = metres
         if "right" in self.channels:
             r = self.source.get_right_frame()
             if r is not None:
@@ -538,6 +642,27 @@ class CameraState:
         # Background-thread variant — identical step, same pacing, so the two
         # render paths cannot drift apart.
         self.run_main_thread()
+
+    def intrinsics(self) -> dict:
+        """The pinhole intrinsics implied by the frame size + horizontal FOV.
+
+        A square-pixel pinhole is the right model here: Isaac renders through an
+        ideal lens with no distortion, so ``fx = (w/2) / tan(hfov/2)`` is exact
+        rather than an approximation, and ``fy == fx``.  Shape matches
+        ``tritium_lib.perception.CameraIntrinsics`` so a consumer can build one
+        straight from this JSON.
+        """
+        w = int(self.meta.get("width", 0))
+        h = int(self.meta.get("height", 0))
+        fx = (w / 2.0) / math.tan(math.radians(self.hfov_deg) / 2.0) if w else 0.0
+        return {
+            "width": w, "height": h,
+            "fx": fx, "fy": fx,
+            "cx": w / 2.0, "cy": h / 2.0,
+            "hfov_deg": self.hfov_deg,
+            "depth_scale": 1000.0,   # depth16 units per metre (millimetres)
+            "depth_encoding": "16UC1_png",
+        }
 
     def latest(self, channel: str = "main") -> bytes:
         with self._lock:
@@ -553,9 +678,20 @@ class CameraState:
 _STREAM_ROUTES = (
     ("/mjpeg_right", "right"),
     ("/mjpeg_depth", "depth"),
+    # depth16 MUST precede /depth — otherwise the bare prefix swallows it and
+    # an operator asking for metric depth silently receives a colormap.
+    ("/depth16", "depth16"),
     ("/depth", "depth"),
     ("/mjpeg", "main"),
 )
+
+#: Per-channel wire MIME type. Everything is JPEG except the metric depth
+#: channel, which is a lossless 16-bit PNG.
+_CHANNEL_MIME = {"depth16": "image/png"}
+
+
+def channel_mime(channel: str) -> str:
+    return _CHANNEL_MIME.get(channel, "image/jpeg")
 
 
 def resolve_channel(path: str) -> str | None:
@@ -584,6 +720,11 @@ def _make_handler(state: CameraState):
             return ch if ch in state.channels else default
 
         def _stream_channel(self, channel: str):
+            if channel not in state.channels:
+                self.send_response(404)
+                self.end_headers()
+                return
+            mime = channel_mime(channel).encode()
             self.send_response(200)
             self.send_header(
                 "Content-Type", "multipart/x-mixed-replace; boundary=frame",
@@ -592,14 +733,14 @@ def _make_handler(state: CameraState):
             try:
                 interval = 1.0 / state.fps
                 while True:
-                    jpeg = state.latest(channel)
-                    if jpeg:
+                    blob = state.latest(channel)
+                    if blob:
                         self.wfile.write(b"--frame\r\n")
-                        self.wfile.write(b"Content-Type: image/jpeg\r\n")
+                        self.wfile.write(b"Content-Type: " + mime + b"\r\n")
                         self.wfile.write(
-                            f"Content-Length: {len(jpeg)}\r\n\r\n".encode()
+                            f"Content-Length: {len(blob)}\r\n\r\n".encode()
                         )
-                        self.wfile.write(jpeg)
+                        self.wfile.write(blob)
                         self.wfile.write(b"\r\n")
                     time.sleep(interval)
             except (BrokenPipeError, ConnectionResetError):
@@ -617,17 +758,28 @@ def _make_handler(state: CameraState):
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+            elif self.path.startswith("/intrinsics"):
+                # The pinhole model a depth consumer needs to unproject
+                # depth16 into camera-frame XYZ. Without this the metric
+                # channel is just numbers with no geometry attached.
+                body = json.dumps(state.intrinsics()).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
             elif self.path.startswith("/snapshot"):
-                jpeg = state.latest(self._channel_from_query())
-                if not jpeg:
+                channel = self._channel_from_query()
+                blob = state.latest(channel)
+                if not blob:
                     self.send_response(503)
                     self.end_headers()
                     return
                 self.send_response(200)
-                self.send_header("Content-Type", "image/jpeg")
-                self.send_header("Content-Length", str(len(jpeg)))
+                self.send_header("Content-Type", channel_mime(channel))
+                self.send_header("Content-Length", str(len(blob)))
                 self.end_headers()
-                self.wfile.write(jpeg)
+                self.wfile.write(blob)
             elif (channel := resolve_channel(self.path)) is not None:
                 self._stream_channel(channel)
             else:
@@ -646,6 +798,10 @@ def _channels_for(args) -> tuple:
     channels = ["main"]
     if getattr(args, "depth", False):
         channels.append("depth")
+    # --depth16 implies depth capture; it is the metric sibling of the same
+    # annotator, so asking for it alone is legal (viewable ramp not required).
+    if getattr(args, "depth16", False):
+        channels.append("depth16")
     if getattr(args, "stereo", False):
         channels.append("right")
     return tuple(channels)
@@ -658,12 +814,12 @@ def _build_source(args) -> FrameSource:
         return IsaacFrameSource(
             args.width, args.height, cam_pos, cam_target,
             scene_usd=args.scene or None, physics_hz=args.physics_hz,
-            with_depth=args.depth, with_stereo=args.stereo,
+            with_depth=args.depth or args.depth16, with_stereo=args.stereo,
             stereo_baseline=args.stereo_baseline,
         )
     return SyntheticFrameSource(
         args.width, args.height, with_vehicle=args.with_vehicle,
-        with_depth=args.depth, with_stereo=args.stereo,
+        with_depth=args.depth or args.depth16, with_stereo=args.stereo,
     )
 
 
@@ -731,6 +887,13 @@ def main(argv=None) -> int:
     # under --source isaac they wire the real annotators / a second camera.
     ap.add_argument("--depth", action="store_true",
                     help="serve a colorized DEPTH channel at /depth")
+    ap.add_argument("--depth16", action="store_true",
+                    help="serve METRIC depth at /depth16 — lossless uint16-mm "
+                         "PNG (ROS 16UC1). This is the channel a perception "
+                         "consumer needs; /depth is only viewable")
+    ap.add_argument("--hfov", type=float, default=60.0,
+                    help="horizontal field of view in degrees, used to publish "
+                         "pinhole intrinsics at /intrinsics (default 60)")
     ap.add_argument("--stereo", action="store_true",
                     help="serve a right-eye STEREO channel at /mjpeg_right")
     ap.add_argument("--stereo-baseline", type=float, default=0.12,
@@ -753,7 +916,14 @@ def main(argv=None) -> int:
         "fov_angle": args.fov, "fov_range": args.range_m,
         "width": args.width, "height": args.height,
     }
-    state = CameraState(source, meta, args.fps, encode, channels=channels)
+    if "depth16" in channels and not depth16_available():
+        # Fail at startup rather than advertise a metric channel that will
+        # never produce a byte — the exact silent-healthy failure mode that
+        # cost a tick when the Isaac render path served zero frames.
+        ap.error("--depth16 needs a 16-bit PNG encoder (cv2 or Pillow) in the "
+                 "render env — install one or drop --depth16")
+    state = CameraState(source, meta, args.fps, encode, channels=channels,
+                        hfov_deg=args.hfov)
     httpd = ThreadingHTTPServer((args.host, args.port), _make_handler(state))
 
     # Which thread owns rendering vs HTTP depends on the source. Isaac/Kit must

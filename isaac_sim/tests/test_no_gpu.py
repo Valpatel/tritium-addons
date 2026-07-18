@@ -437,3 +437,127 @@ def test_connectors_do_not_import_tritium():
             f"{f.name} imports tritium — connectors must stay tritium-free "
             "(the Scene3D JSON / MJPEG / TCP contracts are the only seam)"
         )
+
+
+# -- metric depth (depth16): the channel that carries RANGE, not a picture ----
+
+def test_depth16_route_precedes_the_depth_prefix():
+    """`/depth16` must resolve to the METRIC channel, not the colorized one.
+
+    `/depth` is a prefix of `/depth16`, so a naive longest-prefix-last table
+    would hand a perception consumer a TURBO colormap while it believed it was
+    reading millimetres — the same silent-wrong-channel failure that once made
+    `/mjpeg_depth` serve RGB, but far worse: colormapped pixels parse as
+    plausible distances instead of looking obviously broken."""
+    mod = _load("camera_server")
+    assert mod.resolve_channel("/depth16") == "depth16"
+    assert mod.resolve_channel("/depth") == "depth"
+    assert mod.channel_mime("depth16") == "image/png"
+    assert mod.channel_mime("depth") == "image/jpeg"
+    assert mod.channel_mime("main") == "image/jpeg"
+
+
+def test_depth16_encoder_preserves_metres():
+    """The whole point: metres in, the same metres out. A colorized JPEG
+    cannot do this, which is why the metric channel exists at all."""
+    import numpy as np
+    mod = _load("camera_server")
+    depth = np.array([[1.0, 12.5], [40.0, 0.25]], dtype=np.float32)
+    blob = mod.encode_depth16(depth)
+    assert blob[:8] == b"\x89PNG\r\n\x1a\n", "depth16 must be a lossless PNG"
+    # Decode with the CANONICAL lib codec — see the contract test below.
+    import numpy as np
+    units = _decode_png16_bytes(blob)
+    back = units.astype(np.float32) / mod.DEPTH16_SCALE
+    assert np.allclose(back, depth, atol=0.001)
+
+
+def test_depth16_holes_and_saturation_do_not_lie():
+    """Sky/no-return folds to the 0 sentinel; beyond-range CLAMPS.
+
+    Wrapping instead of clamping would turn a 70 m sky pixel into a ~4 m
+    contact standing in front of the robot."""
+    import numpy as np
+    mod = _load("camera_server")
+    units = _decode_png16_bytes(mod.encode_depth16(
+        np.array([[np.nan, np.inf, 0.0, -2.0, 70.0, 1000.0]], dtype=np.float32)))
+    assert list(units[0, :4]) == [0, 0, 0, 0], "invalid must be the 0 sentinel"
+    assert units[0, 4] == 65535 and units[0, 5] == 65535, "must clamp, not wrap"
+
+
+def test_depth_channels_derive_from_one_metric_read():
+    """The viewable ramp and the metric PNG must describe the SAME instant.
+
+    They come from a single get_depth_metres() call per render, so a moving
+    scene can never produce a colormap of frame N beside millimetres of N+1."""
+    import numpy as np
+    mod = _load("camera_server")
+    src = mod.SyntheticFrameSource(width=32, height=24, with_depth=True)
+    calls = []
+    orig = src.get_depth_metres
+
+    def _spy():
+        calls.append(1)
+        return orig()
+
+    src.get_depth_metres = _spy
+    state = mod.CameraState(src, meta={"width": 32, "height": 24}, fps=10,
+                            encoder=lambda rgb: b"jpeg",
+                            channels=("main", "depth", "depth16"))
+    state.render_once()
+    assert len(calls) == 1, "depth must be read ONCE and both channels derived"
+    assert state.latest("depth") == b"jpeg"
+    assert state.latest("depth16")[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_intrinsics_match_the_pinhole_model():
+    """A consumer cannot unproject depth without fx/fy/cx/cy. Isaac renders
+    through an ideal distortion-free lens, so the pinhole relation is exact."""
+    import math
+    mod = _load("camera_server")
+    state = mod.CameraState(mod.SyntheticFrameSource(width=640, height=480),
+                            meta={"width": 640, "height": 480}, fps=10,
+                            encoder=lambda rgb: b"", channels=("main",),
+                            hfov_deg=90.0)
+    k = state.intrinsics()
+    assert k["cx"] == 320.0 and k["cy"] == 240.0
+    # hfov 90 deg -> fx = (w/2)/tan(45) = w/2
+    assert k["fx"] == pytest.approx(320.0) and k["fy"] == pytest.approx(k["fx"])
+    assert k["depth_scale"] == 1000.0 and k["depth_encoding"] == "16UC1_png"
+
+
+def test_depth16_contract_matches_the_lib_codec():
+    """CONTRACT: the connector's inlined encoder and tritium_lib's canonical
+    decoder must agree exactly.
+
+    The encoder is duplicated on purpose — connectors run in Isaac's python and
+    must stay tritium-free (see test_connectors_do_not_import_tritium) — so this
+    is the test that stops the two copies drifting. Skipped where tritium_lib is
+    absent, which is precisely the Isaac-python case."""
+    import numpy as np
+    lib = pytest.importorskip("tritium_lib.perception.depth_codec")
+    mod = _load("camera_server")
+    depth = np.linspace(0.5, 50.0, 64, dtype=np.float32).reshape(8, 8)
+    from_connector = lib.decode_depth16_png(mod.encode_depth16(depth))
+    assert np.allclose(from_connector, depth, atol=0.001)
+    assert mod.DEPTH16_SCALE == lib.DEPTH_SCALE_MM, "scale must not drift"
+    # Holes must survive as NaN through the canonical decoder, not as 0 m.
+    holed = lib.decode_depth16_png(
+        mod.encode_depth16(np.array([[np.nan, 5.0]], dtype=np.float32)))
+    assert np.isnan(holed[0, 0]) and holed[0, 1] == pytest.approx(5.0, abs=0.001)
+
+
+def _decode_png16_bytes(blob: bytes):
+    """Read a 16-bit PNG back with whatever codec is present — test-local so the
+    depth16 tests do not depend on tritium_lib being installed."""
+    import io
+
+    import numpy as np
+    try:
+        import cv2
+
+        return cv2.imdecode(np.frombuffer(blob, np.uint8), cv2.IMREAD_UNCHANGED)
+    except ImportError:
+        from PIL import Image
+
+        return np.array(Image.open(io.BytesIO(blob)))
