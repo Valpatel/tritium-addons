@@ -156,6 +156,209 @@ def test_scheduler_rejects_bad_construction():
         drv.GaitScheduler(drv.mock_targets_fn, dt=0.0)
 
 
+# ------------------------------------------- attitude stabilization (injected)
+#
+# The closed loop is what turns the measured 71% upright (open loop) into
+# 34/34 (100%) — see examples/NEWTON-GAIT-FINDINGS.md tick 19.  The controller
+# itself is tritium_lib's AttitudeStabilizer and arrives INJECTED, so these
+# tests bind mocks exactly the way the live runner binds the lib — and pin
+# that a scheduler WITHOUT the injection is byte-identical to the old one.
+
+def _open_loop_reference(targets_fn, dt, t0, limits, n):
+    """The pre-hook contract, composed from the public pieces: sample the
+    injected trajectory on an ACCUMULATED clock (t += dt, the scheduler's
+    float behavior since day one), convert, clamp.  Byte-identical is
+    measured against THIS, not against another scheduler instance."""
+    out, t = [], float(t0)
+    for _ in range(n):
+        out.append((t, drv.radians_to_drive_targets(targets_fn(float(t)),
+                                                    limits)))
+        t = t + float(dt)
+    return out
+
+
+def test_no_stabilize_fn_is_byte_identical_to_the_open_loop_contract():
+    dt, t0, n = 1.0 / 60.0, 0.25, 24
+    sched = drv.GaitScheduler(drv.mock_targets_fn, dt=dt, t0=t0,
+                              limits=drv.DEFAULT_LIMITS_DEG)
+    got = [sched.step() for _ in range(n)]
+    assert got == _open_loop_reference(drv.mock_targets_fn, dt, t0,
+                                       drv.DEFAULT_LIMITS_DEG, n)
+    assert sched.stabilized == 0
+
+
+def test_stabilize_fn_injected_but_never_fed_changes_nothing():
+    """Injection alone must not alter output — only a measured attitude may."""
+    dt, n = 0.02, 16
+    plain = drv.GaitScheduler(drv.mock_targets_fn, dt=dt,
+                              limits=drv.DEFAULT_LIMITS_DEG)
+    wired = drv.GaitScheduler(drv.mock_targets_fn, dt=dt,
+                              limits=drv.DEFAULT_LIMITS_DEG,
+                              stabilize_fn=drv.mock_stabilize_fn)
+    assert [wired.step() for _ in range(n)] == [plain.step() for _ in range(n)]
+    assert wired.stabilized == 0
+
+
+def test_attitude_without_stabilize_fn_raises_loudly():
+    """A consumer who feeds attitude into an open-loop scheduler believes the
+    loop is closed while running the 71% arm — the exact silent trap the hook
+    exists to remove, so it must be loud."""
+    sched = drv.GaitScheduler(drv.mock_targets_fn, dt=0.02)
+    with pytest.raises(ValueError, match="no stabilize_fn"):
+        sched.step(attitude=(0.1, 0.0))
+
+
+def test_stabilize_fn_must_be_callable():
+    with pytest.raises(TypeError, match="stabilize_fn"):
+        drv.GaitScheduler(drv.mock_targets_fn, stabilize_fn="not-callable")
+
+
+def test_first_measured_step_is_dry_and_dt_spans_measured_steps():
+    """Mirrors the example driver exactly: the first measured step only
+    records its time (no rate basis -> no trim); after a skipped measurement
+    the stabilizer receives the TRUE interval since the last measured step."""
+    calls: list[tuple[dict, object, float]] = []
+
+    def spy(targets_rad, attitude, dt):
+        calls.append((dict(targets_rad), attitude, dt))
+        return targets_rad
+
+    att = (0.05, -0.02)
+    sched = drv.GaitScheduler(lambda t: {"FL_thigh": 0.5}, dt=0.25,
+                              stabilize_fn=spy)
+    _, deg1 = sched.step(attitude=att)          # t=0.00: dry — records time
+    sched.step()                                # t=0.25: no measurement
+    sched.step(attitude=att)                    # t=0.50: dt spans two steps
+    sched.step(attitude=att)                    # t=0.75: dt is one step
+    assert deg1["FL_thigh"] == pytest.approx(math.degrees(0.5))
+    assert len(calls) == 2 and sched.stabilized == 2
+    assert calls[0][2] == pytest.approx(0.50)   # since the DRY measured step
+    assert calls[1][2] == pytest.approx(0.25)
+    assert calls[0][1] is att                   # attitude is opaque passthrough
+    assert calls[0][0] == {"FL_thigh": 0.5}     # raw RADIANS, pre-conversion
+
+
+def test_trim_is_applied_before_conversion_and_clamping():
+    """The injected trim lands on RADIAN targets; the actuator envelope still
+    has the last word on the DEGREE output."""
+    def add_trim(targets_rad, attitude, dt):
+        targets_rad["FL_thigh"] += attitude     # attitude doubles as the trim
+        return targets_rad
+
+    sched = drv.GaitScheduler(lambda t: {"FL_thigh": 0.8}, dt=0.1,
+                              limits={"thigh": (0.0, 103.0)},
+                              stabilize_fn=add_trim)
+    sched.step(attitude=0.0)                    # dry
+    _, deg = sched.step(attitude=0.1)           # moderate trim: converts
+    assert deg["FL_thigh"] == pytest.approx(math.degrees(0.9))
+    _, deg = sched.step(attitude=10.0)          # absurd trim: clamp wins
+    assert deg["FL_thigh"] == 103.0
+
+
+def test_zero_attitude_error_is_a_no_op():
+    dt, n = 0.02, 12
+    plain = drv.GaitScheduler(drv.mock_targets_fn, dt=dt,
+                              limits=drv.DEFAULT_LIMITS_DEG)
+    level = drv.GaitScheduler(drv.mock_targets_fn, dt=dt,
+                              limits=drv.DEFAULT_LIMITS_DEG,
+                              stabilize_fn=drv.mock_stabilize_fn)
+    got = [level.step(attitude=(0.0, 0.0)) for _ in range(n)]
+    assert got == [plain.step() for _ in range(n)]
+    assert level.stabilized == n - 1            # the loop RAN, trimming zero
+
+
+def test_synthetic_roll_trims_the_two_sides_apart():
+    """+roll is right-side-down: the right calves must extend (trim UP from
+    the open-loop track) and the left calves retract — the lib's pinned sign
+    convention, visible through the whole scheduler pipeline."""
+    dt, n = 0.02, 12
+    plain = drv.GaitScheduler(drv.mock_targets_fn, dt=dt,
+                              limits=drv.DEFAULT_LIMITS_DEG)
+    rolled = drv.GaitScheduler(drv.mock_targets_fn, dt=dt,
+                               limits=drv.DEFAULT_LIMITS_DEG,
+                               stabilize_fn=drv.mock_stabilize_fn)
+    open_run = [plain.step() for _ in range(n)]
+    closed_run = [rolled.step(attitude=(0.1, 0.0)) for _ in range(n)]
+    assert closed_run[0] == open_run[0]         # dry first step
+    for (_, deg_o), (_, deg_c) in zip(open_run[1:], closed_run[1:]):
+        for leg, sign in (("FR", 1), ("RR", 1), ("FL", -1), ("RL", -1)):
+            delta = deg_c[f"{leg}_calf"] - deg_o[f"{leg}_calf"]
+            assert delta * sign > 0.0, f"{leg}_calf trimmed the wrong way"
+        for joint, val in deg_c.items():        # clamps still respected
+            lim = drv.limit_for(joint, drv.DEFAULT_LIMITS_DEG)
+            assert lim[0] <= val <= lim[1]
+
+
+def test_run_stays_open_loop():
+    """run() samples no attitude, so an injected stabilizer must never fire."""
+    def explode(targets_rad, attitude, dt):     # pragma: no cover
+        raise AssertionError("stabilize_fn fired during run()")
+
+    sched = drv.GaitScheduler(drv.mock_targets_fn, dt=0.05,
+                              stabilize_fn=explode)
+    assert len(list(sched.run(0.5))) == 10
+    assert sched.stabilized == 0
+
+
+# ------------------------------------ apply_foot_height_trim (the pure math)
+
+def test_foot_trim_magnitude_pinned_at_the_stand_pose():
+    """At stand (thigh +50 deg, calf -100 deg) the leg is symmetric about
+    vertical, so j1 = 0 and a dz extension lands entirely on the calf as
+    dz / j2 — the closed-form pin for the least-norm split."""
+    q1, q2 = math.radians(50.0), math.radians(-100.0)
+    j2 = -drv.GO2_CALF_LEN_M * math.sin(q1 + q2)          # +0.1632 m/rad
+    out = drv.apply_foot_height_trim(
+        {"FL_thigh": q1, "FL_calf": q2}, {"FL": 0.01})
+    assert out["FL_calf"] - q2 == pytest.approx(0.01 / j2)  # ~ +0.0613 rad
+    assert out["FL_thigh"] == pytest.approx(q1)             # j1 = 0 exactly
+    # Retraction mirrors extension.
+    neg = drv.apply_foot_height_trim(
+        {"FL_thigh": q1, "FL_calf": q2}, {"FL": -0.01})
+    assert neg["FL_calf"] - q2 == pytest.approx(-0.01 / j2)
+
+
+def test_foot_trim_direction_extend_means_foot_further_down():
+    """Positive dz must INCREASE the leg's downward reach at the trimmed
+    pose — checked against the forward kinematics, not against a sign table."""
+    def depth(q1, q2):
+        return (drv.GO2_THIGH_LEN_M * math.cos(q1)
+                + drv.GO2_CALF_LEN_M * math.cos(q1 + q2))
+
+    q1, q2 = math.radians(35.0), math.radians(-80.0)      # asymmetric pose
+    out = drv.apply_foot_height_trim(
+        {"RR_thigh": q1, "RR_calf": q2}, {"RR": 0.02})
+    assert depth(out["RR_thigh"], out["RR_calf"]) > depth(q1, q2)
+
+
+def test_foot_trim_clamps_singular_and_partial_legs():
+    q1, q2 = math.radians(50.0), math.radians(-100.0)
+    # A huge offset saturates at MAX_TRIM_RAD per joint, never beyond.
+    big = drv.apply_foot_height_trim(
+        {"FL_thigh": q1, "FL_calf": q2}, {"FL": 5.0})
+    assert big["FL_calf"] - q2 == pytest.approx(drv.MAX_TRIM_RAD)
+    # A straight leg is singular (no joint motion moves the foot vertically):
+    # trimming it would divide by ~0, so it is skipped untouched.
+    straight = drv.apply_foot_height_trim(
+        {"FL_thigh": 0.0, "FL_calf": 0.0}, {"FL": 0.01})
+    assert straight == {"FL_thigh": 0.0, "FL_calf": 0.0}
+    # A leg absent from the targets is skipped; wired legs still trim; the
+    # input dict is never mutated.
+    src = {"FL_thigh": q1, "FL_calf": q2}
+    out = drv.apply_foot_height_trim(src, {"FL": 0.01, "RR": 0.01})
+    assert out["FL_calf"] != q2 and "RR_calf" not in out
+    assert src == {"FL_thigh": q1, "FL_calf": q2}
+
+
+def test_mock_stabilize_fn_is_level_neutral():
+    """Zero tilt in, targets out unchanged — the mock must not inject a bias
+    that would mask a broken zero-error path in the scheduler tests above."""
+    targets = {f"{leg}_{part}": 0.1 * i
+               for i, (leg, part) in enumerate(
+                   (l, p) for l in drv.LEG_NAMES for p in drv.JOINT_PARTS)}
+    assert drv.mock_stabilize_fn(dict(targets), (0.0, 0.0), 0.02) == targets
+
+
 # -------------------------------------------------- stage mapping (duck-typed)
 class _FakePrim:
     def __init__(self, name: str, path: str):

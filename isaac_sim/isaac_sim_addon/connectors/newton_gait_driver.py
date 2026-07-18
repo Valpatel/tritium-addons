@@ -26,12 +26,38 @@ binds tritium-lib's ``joint_targets_at``; tests and ``--selftest`` bind a
 mock), and ``apply_to_stage`` imports ``pxr`` lazily only when actually
 applying to a live stage.  No dependency bleed in either direction.
 
+Closed-loop attitude stabilization — a consumer MUST inject it
+--------------------------------------------------------------
+The open-loop gait table survives **17/24 trials (71%)** upright; with the
+closed attitude loop it survives **34/34 (100%)** across two independent kit
+processes, with tilt distributions that do not overlap (5-10 deg closed vs
+22-30 deg open — see ``examples/NEWTON-GAIT-FINDINGS.md``, tick 19).  The
+controller is ``tritium_lib.control.AttitudeStabilizer`` (PD on body
+roll/pitch, distributed to the legs as foot-height offsets); like the
+trajectory, it arrives INJECTED so this module stays lib-free:
+
+    ``GaitScheduler(targets_fn, ..., stabilize_fn=...)`` where
+    ``stabilize_fn(targets_rad, attitude, dt) -> dict[joint, radians]``
+
+Per control step the runner measures the body attitude and passes it to
+``step(attitude=...)``; the scheduler hands the RAW radian targets, the
+opaque attitude, and the seconds since the previous measured step to the
+injected stabilizer, then converts/clamps its trimmed output.  A scheduler
+wired without ``stabilize_fn`` is the OPEN-LOOP arm — any consumer that skips
+the injection inherits the 71% number, not the 100% one.  See
+:class:`GaitScheduler` for the exact live binding.
+
 Pieces
 ------
   * ``radians_to_drive_targets(angles_rad, limits=None)`` — pure rad -> deg
     with optional per-joint clamping (full joint name beats part suffix).
-  * ``GaitScheduler(targets_fn, dt=...)`` — walks injected trajectory time in
-    fixed control steps, yielding per-step drive-target dicts in DEGREES.
+  * ``GaitScheduler(targets_fn, dt=..., stabilize_fn=None)`` — walks injected
+    trajectory time in fixed control steps, yielding per-step drive-target
+    dicts in DEGREES; optionally closes the attitude loop per step.
+  * ``apply_foot_height_trim(targets_rad, leg_offsets_m)`` — pure leg-Jacobian
+    mapping from per-leg vertical foot offsets (metres) to thigh/calf angle
+    trims (radians) — the exact application math the 34/34 example driver
+    uses, reusable so a runner's ``stabilize_fn`` is a 3-line closure.
   * ``steps_for_duration`` / ``steps_per_period`` / ``period_s`` — the step
     arithmetic a runner needs to size a run.
   * ``apply_to_stage(stage, drive_targets_deg, joint_prim_paths)`` — the ONLY
@@ -88,6 +114,23 @@ DEFAULT_LIMITS_DEG: dict[str, tuple[float, float]] = {
     "calf": (-2.4 * DEG_PER_RAD, -1.2 * DEG_PER_RAD),      # -137.51..-68.75
 }
 
+# Go2 leg geometry for the attitude trim — real URDF values, duplicated as
+# literals for the same reason as the limits above: this module must import
+# with no tritium_lib on the box.  Thigh and calf links are the same length;
+# placements are (x, y) of each FOOT in the body frame (REP-103: +X forward,
+# +Y left), the lever arms the stabilizer's leg-height offsets assume.
+GO2_THIGH_LEN_M = 0.213
+GO2_CALF_LEN_M = 0.213
+GO2_LEG_PLACEMENTS_M: dict[str, tuple[float, float]] = {
+    "FL": (0.1881, 0.1300),
+    "FR": (0.1881, -0.1300),
+    "RL": (-0.1881, 0.1300),
+    "RR": (-0.1881, -0.1300),
+}
+# Per-joint trim clamp (radians), so one bad pose read cannot fling a leg —
+# the same 0.30 the measured 34/34 closed-loop runs used.
+MAX_TRIM_RAD = 0.30
+
 
 # --------------------------------------------------------------------------- #
 # Pure conversion + step arithmetic (no Isaac, no GPU — fully unit-tested).
@@ -135,6 +178,60 @@ def radians_to_drive_targets(
     return out
 
 
+def apply_foot_height_trim(
+    targets_rad: Mapping[str, float],
+    leg_offsets_m: Mapping[str, float],
+    thigh_len_m: float = GO2_THIGH_LEN_M,
+    calf_len_m: float = GO2_CALF_LEN_M,
+    max_trim_rad: float = MAX_TRIM_RAD,
+) -> dict[str, float]:
+    """Map per-leg vertical foot offsets (METRES) to thigh/calf trims (RADIANS).
+
+    The application half of the closed attitude loop, verbatim from the
+    example driver that measured 34/34 upright (``examples/go2_newton_gait.py``
+    ``_apply_trim``), re-keyed by joint NAME because names are this module's
+    currency.  For a 2-link planar leg the downward reach is
+    ``depth = L1*cos(q1) + L2*cos(q1 + q2)``, so the row Jacobian is
+    ``d(depth)/d(q1, q2)`` evaluated at the CURRENTLY commanded pose — the
+    gait sweeps the legs through a wide arc, and a Jacobian frozen at stand
+    would be badly wrong mid-stride.  The correction is distributed least-norm
+    (``J^T * dz / (J . J)``) so both joints share it instead of one joint
+    taking all of it and hitting its limit; each joint's trim is clamped to
+    ``+/-max_trim_rad`` so one bad pose read cannot fling a leg.
+
+    ``leg_offsets_m`` is keyed by leg name (``"FL"``...); positive extends the
+    leg (foot reaches further down, that corner of the body rises) — the
+    contract of ``AttitudeCorrection.leg_height_offsets`` in
+    ``tritium_lib.control``.  A leg at a singular pose (straight — no small
+    joint change moves the foot vertically) is skipped, exactly like the
+    example: the pseudo-inverse would divide by ~0 and command an enormous
+    trim.  A leg whose thigh/calf keys are absent from ``targets_rad`` is
+    skipped too, mirroring the example's wiring-time drop — but note its
+    runner then FAILS the trial unless all four legs are wired; a consumer
+    trimming a partial rig should check the same or it will read as a weak
+    controller instead of a wiring bug.  Returns a new dict; the input is not
+    mutated."""
+    out = dict(targets_rad)
+    for leg, dz in leg_offsets_m.items():
+        dz = float(dz)
+        if dz == 0.0:
+            continue
+        key_thigh, key_calf = f"{leg}_thigh", f"{leg}_calf"
+        if key_thigh not in out or key_calf not in out:
+            continue
+        q1 = float(out[key_thigh])
+        q2 = float(out[key_calf])
+        j1 = -thigh_len_m * math.sin(q1) - calf_len_m * math.sin(q1 + q2)
+        j2 = -calf_len_m * math.sin(q1 + q2)
+        denom = j1 * j1 + j2 * j2
+        if denom < 1e-6:
+            continue
+        scale = dz / denom
+        out[key_thigh] = q1 + max(-max_trim_rad, min(max_trim_rad, j1 * scale))
+        out[key_calf] = q2 + max(-max_trim_rad, min(max_trim_rad, j2 * scale))
+    return out
+
+
 def period_s(stride_hz: float) -> float:
     """One gait period in seconds for a stride frequency in Hz."""
     if stride_hz <= 0.0:
@@ -167,7 +264,53 @@ class GaitScheduler:
 
     Each :meth:`step` advances the clock by ``dt`` and returns
     ``(t, drive_targets_deg)`` — the converted, clamped dict ready for
-    :func:`apply_to_stage`.  :meth:`run` yields a whole timed run."""
+    :func:`apply_to_stage`.  :meth:`run` yields a whole timed run.
+
+    Closed-loop attitude stabilization (INJECTED — required for the 100% arm)
+    ------------------------------------------------------------------------
+    ``stabilize_fn(targets_rad, attitude, dt) -> dict[joint_name, radians]``
+    closes the attitude loop.  Without it this scheduler is the measured
+    OPEN-LOOP arm: 17/24 trials (71%) upright vs the closed loop's 34/34
+    (100%) — see ``examples/NEWTON-GAIT-FINDINGS.md`` tick 19.  Per step the
+    caller measures the body attitude (roll/pitch — how far body-up is from
+    world-up) and passes it to ``step(attitude=...)``; the scheduler hands
+    the RAW radian targets, the attitude (OPAQUE — never interpreted here),
+    and the seconds since the previous measured step to ``stabilize_fn``,
+    then converts and clamps its trimmed output.  Semantics mirror the
+    example driver that produced the 34/34 exactly:
+
+      * the trim is applied to RADIAN targets BEFORE the rad->deg conversion
+        and actuator clamping;
+      * the first measured step only records its time — no previous sample
+        means no rate estimate, so no trim (``stabilized`` stays 0);
+      * ``stabilize_fn`` runs only with a positive ``dt`` since the previous
+        measured step, and ``stabilized`` counts exactly those runs;
+      * measure the attitude EVERY step — feedback at a logging cadence is an
+        order-of-magnitude slower controller than the one the 34/34
+        characterized;
+      * passing ``attitude`` with no ``stabilize_fn`` injected raises — a
+        consumer who believes the loop is closed while running open would
+        silently inherit the 71%, the exact trap this hook exists to remove.
+
+    The live binding (runner-side; the hygiene gate keeps it OUT of this
+    module) — ``AttitudeStabilizer`` and ``LegPlacement`` come out of
+    ``tritium_lib.control``, and the attitude is the body quaternion in WXYZ
+    (Isaac's root transform hands back XYZW — the reorder is load-bearing)::
+
+        stab = AttitudeStabilizer(kp=0.8, kd=0.3)
+        legs = [LegPlacement(n, x, y)
+                for n, (x, y) in GO2_LEG_PLACEMENTS_M.items()]
+
+        def stabilize_fn(targets_rad, quat_wxyz, dt):
+            corr = stab.update(quat_wxyz, dt)
+            return apply_foot_height_trim(targets_rad,
+                                          corr.leg_height_offsets(legs))
+
+        sched = GaitScheduler(jt, dt=1.0 / 60.0, limits=DEFAULT_LIMITS_DEG,
+                              stabilize_fn=stabilize_fn)
+        # per control step, with a FRESH pose read:
+        _, targets_deg = sched.step(attitude=(qw, qx, qy, qz))
+    """
 
     def __init__(
         self,
@@ -175,22 +318,29 @@ class GaitScheduler:
         dt: float = 1.0 / 60.0,
         t0: float = 0.0,
         limits: Mapping[str, tuple[float, float]] | None = None,
+        stabilize_fn: Callable[[dict[str, float], object, float],
+                               Mapping[str, float]] | None = None,
     ):
         if not callable(targets_fn):
             raise TypeError("targets_fn must be callable: (t) -> {joint: rad}")
+        if stabilize_fn is not None and not callable(stabilize_fn):
+            raise TypeError("stabilize_fn must be callable: "
+                            "(targets_rad, attitude, dt) -> {joint: rad}")
         if dt <= 0.0:
             raise ValueError(f"dt must be > 0, got {dt}")
         self.targets_fn = targets_fn
+        self.stabilize_fn = stabilize_fn
         self.dt = float(dt)
         self.t = float(t0)
         self.limits = limits
         self.steps = 0
+        self.stabilized = 0                 # steps on which the trim ran
         self.joints: tuple[str, ...] = ()   # set from the first sample
+        self._att_t_prev: float | None = None   # clock of last measured step
 
-    def targets_at(self, t: float) -> dict[str, float]:
-        """Drive targets (DEGREES) at absolute trajectory time ``t`` — pure
-        lookup, does not advance the scheduler clock."""
-        deg = radians_to_drive_targets(self.targets_fn(float(t)), self.limits)
+    def _finish(self, t: float, angles_rad: Mapping[str, float]) -> dict[str, float]:
+        """rad -> deg + clamp + joint-set stability check (shared tail)."""
+        deg = radians_to_drive_targets(angles_rad, self.limits)
         if not self.joints:
             self.joints = tuple(sorted(deg))
         elif tuple(sorted(deg)) != self.joints:
@@ -200,14 +350,36 @@ class GaitScheduler:
             )
         return deg
 
-    def step(self) -> tuple[float, dict[str, float]]:
+    def targets_at(self, t: float) -> dict[str, float]:
+        """Drive targets (DEGREES) at absolute trajectory time ``t`` — pure
+        lookup, does not advance the scheduler clock and never stabilizes."""
+        return self._finish(t, self.targets_fn(float(t)))
+
+    def step(self, attitude: object | None = None) -> tuple[float, dict[str, float]]:
         """Sample at the current clock, then advance by ``dt``.
 
         Returns ``(t_sampled, drive_targets_deg)`` — call once per control
         step (e.g. per Isaac app-update tick) and hand the dict to
-        :func:`apply_to_stage`."""
+        :func:`apply_to_stage`.  ``attitude`` is this step's fresh body
+        attitude measurement, forwarded opaquely to the injected
+        ``stabilize_fn`` (see the class docstring); omit it and the step is
+        open-loop and byte-identical to a scheduler with no stabilizer."""
         t = self.t
-        deg = self.targets_at(t)
+        rad: Mapping[str, float] = self.targets_fn(float(t))
+        if attitude is not None:
+            if self.stabilize_fn is None:
+                raise ValueError(
+                    "step() got an attitude but no stabilize_fn was injected "
+                    "— the loop you think is closed is open (71% upright, "
+                    "not 100%); construct GaitScheduler(..., stabilize_fn=...)"
+                )
+            t_prev = self._att_t_prev
+            step_dt = (t - t_prev) if t_prev is not None else 0.0
+            if step_dt > 0.0:
+                rad = self.stabilize_fn(dict(rad), attitude, step_dt)
+                self.stabilized += 1
+            self._att_t_prev = t
+        deg = self._finish(t, rad)
         self.t = t + self.dt
         self.steps += 1
         return t, deg
@@ -300,10 +472,38 @@ def mock_targets_fn(t: float) -> dict[str, float]:
     return out
 
 
+def mock_stabilize_fn(targets_rad: dict[str, float], attitude: object,
+                      dt: float) -> dict[str, float]:
+    """A stand-in for the injected closed loop — NOT the production controller.
+
+    The live runner binds ``tritium_lib.control.AttitudeStabilizer`` (see the
+    :class:`GaitScheduler` docstring); this mock exists so tests and
+    ``--selftest`` can prove the scheduler-side contract lib-free.  It takes
+    ``attitude`` as a plain ``(roll_rad, pitch_rad)`` pair — how far body-up
+    leans from world-up about each axis — runs a cartoon P-only law with the
+    lib's SIGN conventions (positive roll is left-side-up, positive pitch is
+    nose-down; the restoring command opposes the tilt), spreads the command
+    over the legs as mean-centred foot-height offsets
+    (``dz = -pitch_cmd*x + roll_cmd*y``, so the trim rotates the body without
+    changing ride height), and applies them through the real
+    :func:`apply_foot_height_trim`."""
+    roll_rad, pitch_rad = (float(v) for v in attitude)  # type: ignore[misc]
+    kp = 0.8                            # the measured runs' default gain
+    roll_cmd = -kp * roll_rad
+    pitch_cmd = -kp * pitch_rad
+    raw = {leg: -pitch_cmd * x + roll_cmd * y
+           for leg, (x, y) in GO2_LEG_PLACEMENTS_M.items()}
+    mean = sum(raw.values()) / len(raw)
+    offsets = {leg: dz - mean for leg, dz in raw.items()}
+    return apply_foot_height_trim(targets_rad, offsets)
+
+
 def selftest(args) -> int:
     """No-GPU: schedule the mock trajectory for a few periods and assert the
     drive-target contract — step count, full 12-joint set every step, finite
-    DEGREE values inside the clamp envelope, and the clock actually advances."""
+    DEGREE values inside the clamp envelope, and the clock actually advances.
+    Then the stabilizer hook: no attitude / zero error = byte-identical to
+    open-loop; a synthetic roll trims the two sides apart; clamps hold."""
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     dt = 1.0 / args.hz
     stride_hz = 1.0                      # the mock trot's stride frequency
@@ -335,10 +535,58 @@ def selftest(args) -> int:
     thigh_mid = (lo["FL_thigh"] + hi["FL_thigh"]) / 2.0
     assert 40.0 < thigh_mid < 60.0, f"thigh centre {thigh_mid:.2f} not in degrees"
 
+    # ---- the attitude-stabilization hook (still no GPU, no lib) ----------
+    n_check = min(30, expect_steps)
+    base = GaitScheduler(mock_targets_fn, dt=dt, limits=DEFAULT_LIMITS_DEG)
+    open_run = [base.step() for _ in range(n_check)]
+
+    # No attitude passed -> byte-identical to the open loop, trim never runs.
+    idle = GaitScheduler(mock_targets_fn, dt=dt, limits=DEFAULT_LIMITS_DEG,
+                         stabilize_fn=mock_stabilize_fn)
+    assert [idle.step() for _ in range(n_check)] == open_run
+    assert idle.stabilized == 0, "trim ran without a single attitude sample"
+
+    # Zero attitude error -> zero offsets -> byte-identical, trim DID run.
+    level = GaitScheduler(mock_targets_fn, dt=dt, limits=DEFAULT_LIMITS_DEG,
+                          stabilize_fn=mock_stabilize_fn)
+    assert [level.step(attitude=(0.0, 0.0)) for _ in range(n_check)] == open_run
+    assert level.stabilized == n_check - 1, "first measured step must be dry"
+
+    # A constant +roll (right-side-down): right calves extend ABOVE the
+    # open-loop track, left calves retract below it, everything clamped.
+    rolled = GaitScheduler(mock_targets_fn, dt=dt, limits=DEFAULT_LIMITS_DEG,
+                           stabilize_fn=mock_stabilize_fn)
+    closed_run = [rolled.step(attitude=(0.1, 0.0)) for _ in range(n_check)]
+    assert closed_run[0] == open_run[0], "step 1 has no rate basis — no trim"
+    for (t_o, deg_o), (t_c, deg_c) in zip(open_run[1:], closed_run[1:]):
+        assert t_o == t_c
+        for leg, sign in (("FR", 1.0), ("RR", 1.0), ("FL", -1.0), ("RL", -1.0)):
+            delta = deg_c[f"{leg}_calf"] - deg_o[f"{leg}_calf"]
+            assert delta * sign > 0.0, \
+                f"{leg}_calf trimmed the wrong way at t={t_c:.3f}: {delta:+.3f}"
+        for joint, val in deg_c.items():
+            lim = limit_for(joint, DEFAULT_LIMITS_DEG)
+            assert lim[0] <= val <= lim[1], f"trim broke clamp on {joint}"
+    assert rolled.stabilized == n_check - 1
+
+    # Trim magnitude, pinned at the stand pose: the vertical Jacobian there
+    # has j1 = 0 (thigh 50 deg, calf -100 deg are symmetric about vertical),
+    # so a +1 cm extension lands entirely on the calf as dz / j2.
+    stand = {"thigh": math.radians(50.0), "calf": math.radians(-100.0)}
+    trimmed = apply_foot_height_trim(
+        {"FL_thigh": stand["thigh"], "FL_calf": stand["calf"]}, {"FL": 0.01})
+    j2 = -GO2_CALF_LEN_M * math.sin(stand["thigh"] + stand["calf"])
+    want = 0.01 / j2
+    got = trimmed["FL_calf"] - stand["calf"]
+    assert abs(got - want) < 1e-9, f"calf trim {got:.6f} != dz/j2 {want:.6f}"
+    assert abs(trimmed["FL_thigh"] - stand["thigh"]) < 1e-9, "j1=0 pose"
+
     span = {p: (min(lo[f"{l}_{p}"] for l in LEG_NAMES),
                 max(hi[f"{l}_{p}"] for l in LEG_NAMES)) for p in JOINT_PARTS}
     print(f"SELFTEST OK steps={steps} periods={args.periods} dt={dt:.4f}s "
           f"joints={len(JOINT_NAMES)} no_nan clamped "
+          f"stabilize_hook(idle={idle.stabilized} level={level.stabilized} "
+          f"rolled={rolled.stabilized} calf_trim={math.degrees(got):+.2f}deg) "
           + " ".join(f"{p}=[{a:.1f}..{b:.1f}]deg" for p, (a, b) in span.items()))
     return 0
 
