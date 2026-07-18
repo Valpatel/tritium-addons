@@ -2,7 +2,7 @@
 id = "isaac-sim"
 name = "NVIDIA Isaac Sim Connector"
 version = "0.1.0"
-description = "Connect Tritium to NVIDIA Isaac Sim — render real map areas as 3D digital twins, drive simulated cameras and robot bodies, all over the LAN. Optional heavy-GPU integration; the core runs without it."
+description = "Connect Tritium to NVIDIA Isaac Sim — render real map areas as 3D digital twins, drive simulated cameras, LiDARs, and physics robot bodies over the LAN, and report live-fired rounds to the operator map. Optional heavy-GPU integration; the core runs without it."
 author = "Valpatel Software LLC"
 license = "AGPL-3.0"
 addon_api = ">=1.0, <2.0"

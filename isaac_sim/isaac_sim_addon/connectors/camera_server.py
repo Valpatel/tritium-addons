@@ -4,7 +4,7 @@
 # Licensed under AGPL-3.0 — see LICENSE for details.
 """Isaac Sim camera as an MJPEG IP camera — a fake camera stream for testing.
 
-The camera twin of ``examples/isaac-bridge/isaac_quadruped_server.py``.  Where
+The camera twin of ``isaac_quadruped_server.py`` (this directory).  Where
 the quadruped server exposes a robot BODY behind a TCP seam, this exposes a
 camera SENSOR behind the SAME transport a real IP security camera uses: MJPEG
 over HTTP (plus a single-frame ``/snapshot`` and a ``/status`` JSON).  Tritium

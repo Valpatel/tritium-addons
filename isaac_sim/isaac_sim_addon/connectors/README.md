@@ -8,7 +8,12 @@ exercise the transport and geometry chain in CI with no GPU.
 
 **Dependency hygiene (enforced by a test):** nothing here imports `tritium`, and
 nothing in `tritium-sc` imports anything here. The `Scene3D` JSON, the camera
-MJPEG/MQTT frames, and the robot TCP wire are the only seams.
+MJPEG/MQTT frames, the LiDAR `/scan` JSON, and the robot TCP wire are the only
+seams. (`isaac_camera_bridge`'s optional local detector resolves `tritium_lib`
+by name at runtime, opt-in, only where it happens to be installed — there is no
+static tritium import anywhere in this package.) The consumer mirror image —
+code that runs *outside* Isaac and may import `tritium_lib` — is
+[`../clients/`](../clients/).
 
 ## The connectors
 
@@ -18,7 +23,9 @@ MJPEG/MQTT frames, and the robot TCP wire are the only seams.
 | `render_city.py` | Headless Isaac render of a USD twin → PNG. The real-GPU proof the map → 3D-scene pipeline renders. | — (needs Isaac + GPU) |
 | `camera_server.py` | Serves an Isaac camera as an **MJPEG IP camera** (`/mjpeg`, `/snapshot`, `/status`) — SC registers it like any security camera; nothing in SC knows it is Isaac. | `--source synthetic` (numpy/cv2 moving subject), `--selftest` |
 | `isaac_camera_bridge.py` | Publishes a unit's onboard camera frames as JPEG on the `camera_feeds` MQTT topic `tritium/{site}/cameras/{cam_id}/frame`, keyed to the unit id; optional local `build_frame_detector` publishes detections on `.../detections`. Isaac-free — only `numpy` + JPEG + MQTT. | Imports & unit-tests headless (no Isaac); `isaac_camera_rgb()` lazy-imports Isaac only inside a live sim |
-| `isaac_quadruped_server.py` | The physics **robot BODY** behind the brain/body TCP seam: owns an Isaac stage, steps physics, moves a quadruped from the same twist/gait contract as `robot-template`, serves body state back. | `--selftest` (gait integrator + footfalls + TCP loopback, no Isaac) |
+| `isaac_quadruped_server.py` | The physics **robot BODY** behind the brain/body TCP seam: owns an Isaac stage, steps physics, moves a quadruped from the same twist/gait contract as `robot-template`, serves body state back. Also speaks `turret` / `{cmd: "targets"}` / `fire` — hitscan against the registered targets **plus** the ground terrain, so a round below the horizon stops at the dirt. | `--selftest` (gait integrator + footfalls + TCP loopback + terrain fire, no Isaac) |
+| `lidar_server.py` | Serves an Isaac RTX Lidar as a **JSON range server** (`GET /scan`, `/status`, port 8110) — the LaserScan-style document `tritium-edge`'s `SensorBridgeNode` ingests via `scan_url`. | `--source synthetic` (DEFAULT — analytic room + orbiting obstacle), `--selftest` |
+| `newton_gait_driver.py` | Gait trajectory → per-joint USD drive targets for the Go2 under Newton: fixed-step scheduling, rad→deg, actuator clamping, `apply_to_stage`. Trajectory **and** attitude stabilizer arrive injected (`targets_fn` / `stabilize_fn`) — a consumer that skips `stabilize_fn` runs open-loop, the measured 71% arm rather than the 34/34 closed-loop one (see `../../examples/NEWTON-GAIT-FINDINGS.md`). | `--selftest` (mock trajectory; no Isaac, no tritium) |
 | `__init__.py` | Empty package marker. | — |
 
 ### Two ways an Isaac camera reaches Tritium
@@ -45,10 +52,14 @@ python isaac_sim_addon/connectors/camera_server.py --source isaac --scene dublin
 
 # Robot-dog body behind the TCP seam (brain = tritium-sc/examples/robot-template)
 python isaac_sim_addon/connectors/isaac_quadruped_server.py --port 18973
+
+# LiDAR as a JSON /scan server (synthetic default runs under plain python3)
+python isaac_sim_addon/connectors/lidar_server.py --source isaac --port 8110
 ```
 
 ## Related
 
 - [Isaac Sim addon overview](../../README.md) — full pipeline diagram + run recipes
-- [Examples](../../examples/) (`spot_policy_walk.py`, `smoke_boot.py`, `robot_bridge.md`)
+- [Clients](../clients/) — the consumer tier (pose/nav/fire/teleop bridges)
+- [Examples](../../examples/) (`go2_newton_gait.py`, `spot_policy_walk.py`, `robot_bridge.md`, `NEWTON-GAIT-FINDINGS.md`)
 - [No-GPU tests](../../tests/) · [Package README](../README.md)
