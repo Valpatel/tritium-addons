@@ -33,19 +33,62 @@ driver = _load_driver()
 
 
 # ---------------------------------------------------------------- score_trace
-def _trace(points):
-    """[(t, x, y, z)] -> the driver's row format [t, x, y, z, qx, qy, qz]."""
-    return [[t, x, y, z, 0.0, 0.0, 0.0] for (t, x, y, z) in points]
+LEVEL_XYZW = (0.0, 0.0, 0.0, 1.0)
+INVERTED_XYZW = (1.0, 0.0, 0.0, 0.0)   # 180 deg roll -- flat on its back
 
 
-def test_walking_forward_reads_moved():
+def _trace(points, quat=LEVEL_XYZW):
+    """[(t, x, y, z)] -> the driver's rows [t, x, y, z, qx, qy, qz, qw].
+
+    Isaac's root transform stores the quaternion **xyzw**, so that is the order
+    here; `score_trace` reorders to wxyz for `tritium_lib.geo`.
+    """
+    return [[t, x, y, z, *quat] for (t, x, y, z) in points]
+
+
+def test_walking_forward_reads_walked():
     trace = _trace([(0.0, 0.0, 0.0, 0.40), (2.0, 0.8, 0.0, 0.40)])
     score = driver.score_trace(trace)
-    assert score["verdict"] == "MOVED"
+    assert score["verdict"] == "WALKED"
     assert score["displacement_m"] == pytest.approx(0.8)
     assert score["forward_dx_m"] == pytest.approx(0.8)
     assert score["mean_speed_mps"] == pytest.approx(0.4)
     assert score["collapsed"] is False
+    assert score["tumbled"] is False
+    assert score["max_tilt_deg"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_a_body_that_travels_on_its_back_is_not_a_walk():
+    """The exact run this gate was added for.
+
+    A live trot covered 1.27 m and ended fully inverted.  Distance and height
+    both certified it -- an upside-down quadruped sits at nearly standing
+    height, so `collapsed` never fired -- and the render showed a robot lying
+    on its back.  Displacement without attitude rewards tumbling.
+    """
+    trace = _trace(
+        [(0.0, 0.0, 0.0, 0.40), (6.0, 1.27, 0.0, 0.38)],
+        quat=INVERTED_XYZW,
+    )
+    score = driver.score_trace(trace)
+    assert score["max_tilt_deg"] == pytest.approx(180.0, abs=1e-6)
+    assert score["tumbled"] is True
+    assert score["collapsed"] is False        # the old gate, still fooled
+    assert score["displacement_m"] > 1.0      # it really did cover ground
+    assert score["verdict"] == "TUMBLED"      # and it still must not pass
+
+
+def test_stride_lean_is_not_a_tumble():
+    """A clean live walk peaks at 24-28 deg; the gate must sit above that."""
+    import math
+
+    lean = math.radians(28.0)
+    quat = (math.sin(lean / 2), 0.0, 0.0, math.cos(lean / 2))
+    trace = _trace([(0.0, 0.0, 0.0, 0.40), (6.0, 1.4, 0.0, 0.40)], quat=quat)
+    score = driver.score_trace(trace)
+    assert score["max_tilt_deg"] == pytest.approx(28.0, abs=1e-6)
+    assert score["tumbled"] is False
+    assert score["verdict"] == "WALKED"
 
 
 def test_vibrating_in_place_reads_stationary_not_moved():

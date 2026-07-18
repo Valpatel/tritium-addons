@@ -44,6 +44,9 @@ import time
 DEFAULT_PORT = 8212  # the Newton kit's MCP bridge (8211 is the PhysX kit)
 ROBOT_PATH = "/World/Tritium/go2"
 ARTICULATION_PATH = f"{ROBOT_PATH}/base"
+GROUND_PATH = "/World/GroundSlab"
+GROUND_SIZE_M = 50.0
+GROUND_THICKNESS_M = 1.0
 
 
 # --------------------------------------------------------------------------
@@ -146,13 +149,30 @@ def emit_gait(gait: str, speed: float, steps: int = 48) -> dict:
 # --------------------------------------------------------------------------
 SCENE_TEMPLATE = """
 import omni.usd
-from isaacsim.core.api.objects.ground_plane import GroundPlane
 from isaacsim.core.utils.stage import add_reference_to_stage
 from isaacsim.storage.native import get_assets_root_path
+from pxr import UsdGeom, UsdPhysics, Gf
 
 stage = omni.usd.get_context().get_stage()
-if not stage.GetPrimAtPath("/World/GroundPlane").IsValid():
-    GroundPlane(prim_path="/World/GroundPlane", z_position=0.0)
+
+# The ground is a box SLAB, never `GroundPlane`.  A GroundPlane is a
+# zero-thickness quad, its four corners are coplanar, and Newton's MuJoCo
+# solver convex-hulls every collision shape -- qhull cannot seed a simplex from
+# a rank-2 point set.  The resulting exception escapes the physics extension's
+# initializer with its `_initializing` latch still set, so physics is dead for
+# the life of the process while the timeline, the frame counter and sim time
+# all keep advancing.  This scene ran against that for four ticks and every
+# joint command went into a world that never integrated.  Geometry from
+# `tritium_lib.geo.collider_shape.ground_slab` (rank 3, surface at __TOP_Z__).
+if not stage.GetPrimAtPath("__GROUND_PATH__").IsValid():
+    slab = UsdGeom.Cube.Define(stage, "__GROUND_PATH__")
+    slab.CreateSizeAttr(2.0)  # unit cube; the scale op below sets real extents
+    xf = UsdGeom.Xformable(slab.GetPrim())
+    xf.ClearXformOpOrder()
+    xf.AddTranslateOp().Set(Gf.Vec3d(*__SLAB_CENTER__))
+    xf.AddScaleOp().Set(Gf.Vec3f(*__SLAB_HALF__))
+    UsdPhysics.CollisionAPI.Apply(slab.GetPrim())
+    # Deliberately NO RigidBodyAPI: static collider, so it does not fall itself.
 
 robot = stage.GetPrimAtPath("__ROBOT_PATH__")
 if not robot.IsValid():
@@ -207,8 +227,22 @@ def build_scene_code(stiffness: float, damping: float) -> str:
     full of dict and set literals, and every one of those braces would have to
     be doubled.
     """
+    from tritium_lib.geo.collider_shape import check_convex_hull_input, ground_slab
+
+    slab = ground_slab(size_m=GROUND_SIZE_M, thickness_m=GROUND_THICKNESS_M, top_z=0.0)
+    # Assert the thing that silently killed this lane, on the client, before the
+    # geometry is ever authored into the stage.  Free, and it can only fail if
+    # someone edits the numbers above into something degenerate.
+    report = check_convex_hull_input(slab.vertices)
+    if not report.is_hullable:
+        raise ValueError(f"ground slab is not hullable: {report.reason}")
+
     return (SCENE_TEMPLATE
             .replace("__ROBOT_PATH__", ROBOT_PATH)
+            .replace("__GROUND_PATH__", GROUND_PATH)
+            .replace("__SLAB_CENTER__", repr(tuple(slab.center)))
+            .replace("__SLAB_HALF__", repr(tuple(slab.half_extents)))
+            .replace("__TOP_Z__", repr(float(slab.top_z)))
             .replace("__STIFFNESS__", repr(float(stiffness)))
             .replace("__DAMPING__", repr(float(damping))))
 
@@ -374,10 +408,22 @@ result = {"removed": removed}
 def score_trace(trace: list[list[float]]) -> dict:
     """Honest, non-gameable motion metrics from the recorded root transforms.
 
-    Each row is [t, x, y, z, qx, qy, qz].  Displacement is measured in the
-    ground plane; height is the mean z; "upright" means the body never
-    dropped below 60% of its starting height (a collapsed dog reads as a
-    large z drop, and a dog that merely vibrates reads as ~0 displacement).
+    Each row is [t, x, y, z, qx, qy, qz, qw] -- Isaac's root transform is
+    position followed by an **xyzw** quaternion, while ``tritium_lib.geo``
+    speaks wxyz, so the reorder below is load-bearing.
+
+    Two independent gates, because neither is sufficient alone:
+
+    * **Displacement** in the ground plane -- did it cover ground?  On its own
+      this certifies a body that is merely sliding.
+    * **Attitude** -- did it stay the right way up?  On its own this certifies
+      a body standing perfectly still.
+
+    Height retention is kept for context but is explicitly NOT a fall
+    detector.  It was the only attitude-ish check here for one tick and it
+    passed a robot that was lying on its back: an inverted quadruped sits at
+    almost exactly standing height, so height cannot see rotation.  That is
+    what ``max_tilt_deg`` is for.
     """
     if len(trace) < 2:
         return {"verdict": "NO_TRACE", "samples": len(trace)}
@@ -389,6 +435,25 @@ def score_trace(trace: list[list[float]]) -> dict:
     min_z = min(zs)
     dt = max(t1 - t0, 1e-6)
     collapsed = min_z < 0.6 * z0
+
+    from tritium_lib.geo.body_attitude import (
+        DEFAULT_MAX_TILT_DEG,
+        tilt_from_upright_deg,
+    )
+
+    tilts = []
+    for row in trace:
+        if len(row) < 8:
+            continue  # a short row predates the quaternion; skip, don't guess
+        qx, qy, qz, qw = row[4], row[5], row[6], row[7]
+        try:
+            tilts.append(tilt_from_upright_deg((qw, qx, qy, qz)))
+        except ValueError:
+            continue
+    max_tilt = max(tilts) if tilts else None
+    end_tilt = tilts[-1] if tilts else None
+    tumbled = max_tilt is not None and max_tilt > DEFAULT_MAX_TILT_DEG
+
     return {
         "samples": len(trace),
         "duration_s": round(dt, 3),
@@ -401,7 +466,17 @@ def score_trace(trace: list[list[float]]) -> dict:
         "min_z_m": round(min_z, 4),
         "height_retained": round(min_z / z0, 3) if z0 else None,
         "collapsed": collapsed,
-        "verdict": "COLLAPSED" if collapsed else ("MOVED" if dist > 0.10 else "STATIONARY"),
+        "max_tilt_deg": round(max_tilt, 2) if max_tilt is not None else None,
+        "end_tilt_deg": round(end_tilt, 2) if end_tilt is not None else None,
+        "tumbled": tumbled,
+        # Order matters: a tumble outranks distance, because a tumbling body
+        # covers ground and would otherwise be reported as a working gait.
+        "verdict": (
+            "TUMBLED" if tumbled
+            else "COLLAPSED" if collapsed
+            else "WALKED" if dist > 0.10
+            else "STATIONARY"
+        ),
     }
 
 
@@ -484,7 +559,10 @@ def main() -> int:
             print(f"[gait] no image in capture response: {list(data)[:8]}",
                   file=sys.stderr)
 
-    return 0 if score.get("verdict") == "MOVED" else 1
+    # "WALKED" is the only passing verdict: TUMBLED must exit nonzero even
+    # though it covers ground, or a CI gate happily green-lights a robot that
+    # travels on its back.
+    return 0 if score.get("verdict") == "WALKED" else 1
 
 
 if __name__ == "__main__":

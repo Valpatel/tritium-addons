@@ -466,7 +466,9 @@ def _run_session(sim_app, args, experience: str | None) -> int:
     # on the walk verdict (the separately-validated continuous-drive path).
     ok = stood and not missing and applied_total == walk_steps * len(paths)
     if args.require_moved:
-        ok = ok and walk_score.get("verdict") == "MOVED"
+        # "WALKED", not "MOVED": a TUMBLED run covers ground while inverted,
+        # so accepting anything that merely moved green-lights a fall.
+        ok = ok and walk_score.get("verdict") == "WALKED"
     return 0 if ok else 1
 
 
@@ -504,7 +506,7 @@ def main(argv=None) -> int:
     ap.add_argument("--capture", help="write a viewport PNG here")
     ap.add_argument("--record", help="write the JSON run record here")
     ap.add_argument("--require-moved", action="store_true",
-                    help="exit nonzero unless the walk verdict is MOVED")
+                    help="exit nonzero unless the walk verdict is WALKED")
     args = ap.parse_args(argv)
 
     if args.selftest:

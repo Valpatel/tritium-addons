@@ -369,3 +369,99 @@ that.
    gravity by default smells like a scene the Newton backend adopted rather
    than created. Try letting the Newton extension create its own scene.
 4. Only after a **cube visibly falls** is it worth returning to the gait.
+
+---
+
+## 2026-07-18, tick 10 — the body walks, and one third of the time it does not
+
+The previous entry's four-tick diagnosis was right about the symptom and the
+tick-9 entry found the cause: a zero-thickness ground quad that qhull cannot
+hull, whose exception latched the physics extension's `_initializing` flag and
+disabled integration process-wide while the clock kept advancing.
+
+**This driver was still authoring that exact ground.** `SCENE_TEMPLATE` opened
+with `GroundPlane(prim_path="/World/GroundPlane", z_position=0.0)`, so every
+gait run this lane ever made was commanding joints into a world that never
+integrated. Replacing it with a box slab from
+`tritium_lib.geo.collider_shape.ground_slab` (rank 3, surface at z=0) is the
+whole fix. Nothing about the trajectory or the joint mapping changed.
+
+### The body walks
+
+A trot at `--speed 0.6` over 6 s of sim, driven through the Newton articulation
+view, 353 physics steps:
+
+| run | forward dx | max tilt | verdict |
+|---|---|---|---|
+| trot | **+1.34 m** | 28.0° | WALKED |
+
+**The control is what makes that mean something.** The same scene, same drives,
+same 353 physics steps, with every frame of the table frozen at the stand pose:
+
+| run | displacement | verdict |
+|---|---|---|
+| trot gait | **1.49 m** | MOVED |
+| frozen stand pose | **0.05 m** | STATIONARY |
+
+A 30× ratio under identical conditions. The motion comes from the leg
+trajectory, not from solver drift, scene settling, or the body sliding down
+something. Confirmed visually against a provably static camera
+(`/World/GaitCam` at `(1, -7, 2.6)`, a non-physics prim): the Go2 is a third of
+the way across the frame at t=1.5 s and most of the way across at t=6 s.
+Evidence: `docs/images/isaac/newton-gait-walk-and-tumble-2026-07-18.png`.
+
+### The metric that certified a robot lying on its back
+
+The t=4.5 s frame of that contact sheet shows the Go2 **upside down with its
+legs in the air**. Its score card for that run read `displacement_m: 1.27`,
+`height_retained: 0.89`, `collapsed: false`, `verdict: MOVED`. Every number is
+correct and the conclusion is completely wrong.
+
+`collapsed` watched height, and an inverted quadruped occupies almost exactly
+the height of a standing one — the body is a similar distance off the floor
+either way. **Height cannot see rotation.** A robot that flips and skitters
+along on its shoulders covers ground and passes every gate this scorer had.
+
+The fix is `tritium_lib.geo.body_attitude`: the angle between the body's own up
+axis and world up — 0° standing, 90° on its side, 180° on its back. Sliding and
+bouncing cannot move it, and yaw deliberately does not register, because a
+walking body changes heading constantly and that is not a fall. `score_trace`
+now reports `max_tilt_deg` and ranks `TUMBLED` **above** distance, since a
+tumbling body is precisely the thing distance would otherwise reward.
+
+### Honest stability: 4 of 6
+
+Six identical 6 s trials:
+
+| trial | forward dx | max tilt | verdict |
+|---|---|---|---|
+| 1 | +1.457 m | 28.0° | WALKED |
+| 2 | +1.455 m | 25.9° | WALKED |
+| 3 | +1.373 m | 23.7° | WALKED |
+| 4 | −0.249 m | 180.0° | TUMBLED |
+| 5 | +1.566 m | 25.8° | WALKED |
+| 6 | +1.269 m | 179.8° | TUMBLED |
+
+**67% success.** A clean walk covers 1.37–1.57 m in 6 s (≈0.25 m/s) with peak
+tilt 24–28°, comfortably inside the 45° gate — that band is stride lean, not
+instability. The failures are total: 180°, fully inverted.
+
+Note trial 6 especially. It travelled **1.27 m and ended on its back** — a
+result the old scorer would have called a successful walk, and the single best
+argument for keeping the attitude gate.
+
+**So: the gait is real and it is open-loop.** The trajectory is a fixed
+kinematic table with no feedback, so nothing corrects an accumulating roll;
+whether a given run survives depends on how the initial contact transient
+happens to settle. That is the next piece of work, and it is a controls
+problem rather than a physics one:
+
+1. **Close the loop on attitude.** Feed body roll/pitch back into hip targets.
+   A stabilizer that only ever fights tilt should take 67% toward the high 90s
+   without touching the gait table.
+2. **Settle before walking.** Every failure develops out of the first stride.
+   Hold the stand pose until the body's tilt and height are quiet, *then* start
+   the cycle.
+3. **Report the rate, never a single run.** One trial of a 67%-stable gait is a
+   coin flip that reads as proof either way. `--trials N` belongs in this
+   script.
