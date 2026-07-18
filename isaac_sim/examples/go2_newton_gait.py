@@ -624,9 +624,11 @@ if _ROUTE:
     from tritium_lib.control import StrideFilter
     _YAW_FILT = None
     if _ROUTE.get("yaw_filter"):
-        # stride_hz here is the SCALED value the gait is actually running at
-        # (0.52 Hz at a 0.3 m/s cruise, not the 2.6 Hz table entry) -- the
-        # null must land on the emitted frequency, not the nominal one.
+        # stride_hz comes from the GAIT FILE, which is the frequency the body
+        # actually emits -- and it is NOT a function of --speed.  The gait
+        # table's own generation speed sets the stride (0.6 m/s -> 0.975 Hz);
+        # --speed is only the pure-pursuit cruise.  Deriving the window from
+        # the cruise instead would notch a frequency nothing is producing.
         _YAW_FILT = StrideFilter.from_stride_hz(stride_hz)
 
     state["yaw_prev"] = None
