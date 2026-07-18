@@ -41,13 +41,22 @@ the impact point on the dirt.
 
 The stage snapshot and the shot are one round trip each, so a walking body
 does not move between reading its pose and firing from it.
+
+**The operator sees the round.**  Every resolved shot is reported to SC's
+``POST /api/engagement/shot`` (see :class:`ShotPoster`) so the tactical map
+draws the tracer and impact, the kill feed logs it, and Amy narrates it.
+Reporting is fire-and-forget: a run with no SC loses nothing but the
+audience.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import time
+import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -272,6 +281,150 @@ result = "tracer %s" % ("HIT" if {hit!r} else "MISS")
 '''
 
 
+# --- reporting a round to the Command Center ------------------------------
+
+DEFAULT_SC_URL = "http://localhost:8000"
+SC_URL_ENV = "TRITIUM_SC_URL"
+ENGAGEMENT_PATH = "/api/engagement/shot"
+
+
+def default_shooter_id(body_prim: str) -> str:
+    """A stable operator-facing id derived from the body prim.
+
+    ``/World/Tritium/go2/base`` -> ``isaac_go2``: the scaffolding segments
+    name the scene, not the machine, so they are dropped and the remaining
+    stem is what a track on the tactical map gets called.
+    """
+    skip = {"world", "tritium", "base"}
+    parts = [p for p in body_prim.split("/") if p and p.lower() not in skip]
+    return f"isaac_{parts[-1] if parts else 'body'}"
+
+
+class ShotPoster:
+    """Reports each resolved round to SC's ``POST /api/engagement/shot``.
+
+    Before this class, a round fired and graded in the live Newton sim
+    stopped existing at the connector: the operator's map showed nothing.
+    The payload is ``ShotResult.to_dict()`` plus ``shooter_id`` /
+    ``shooter_type`` / ``timestamp`` -- exactly the wire shape the SC router
+    hands to ``ShotEvent.from_payload``, so the map's tracer, the impact dot,
+    the kill feed, and the announcer all light up from the same record this
+    client graded.
+
+    **Fire-and-forget, by contract.**  A live sim run must never fail, hang,
+    or slow down because SC is absent, so every failure -- connection
+    refused, timeout, non-2xx -- is COUNTED, logged once, and swallowed.
+    After :data:`MAX_CONSECUTIVE_FAILURES` consecutive failures the poster
+    opens its circuit and stops attempting for the rest of the run: against
+    the default localhost URL an absent SC refuses instantly, but a
+    black-holed remote URL would otherwise tax every shot with a full
+    timeout.
+
+    ``opener`` is the injection seam for tests: ``(url, body_bytes) ->
+    http status``.  The default is stdlib ``urllib.request`` -- this addon
+    never imports tritium.
+    """
+
+    MAX_CONSECUTIVE_FAILURES = 3
+
+    def __init__(
+        self,
+        base_url: str,
+        shooter_id: str,
+        *,
+        shooter_type: str | None = None,
+        timeout_s: float = 1.0,
+        opener: Callable[[str, bytes], int] | None = None,
+    ) -> None:
+        self.url = base_url.rstrip("/") + ENGAGEMENT_PATH
+        self.shooter_id = shooter_id
+        self.shooter_type = shooter_type
+        self.timeout_s = timeout_s
+        self._opener = opener if opener is not None else self._http_post
+        self.posted = 0
+        self.failures = 0
+        self._consecutive = 0
+        self._warned = False
+
+    def build_payload(self, shot: ShotResult) -> dict:
+        """The exact body ``/api/engagement/shot`` accepts.
+
+        ``ShotResult.to_dict()`` untouched -- re-shaping it here is how the
+        connector and the Command Center come to disagree about a round --
+        plus the three fields only this side knows: who fired, what kind of
+        machine it is (picks the SC magazine loadout), and when.
+        """
+        payload = dict(shot.to_dict())
+        payload["shooter_id"] = self.shooter_id
+        if self.shooter_type:
+            payload["shooter_type"] = self.shooter_type
+        payload["timestamp"] = time.time()
+        return payload
+
+    def _http_post(self, url: str, body: bytes) -> int:
+        req = urllib.request.Request(
+            url,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
+            return int(resp.status)
+
+    def post(self, shot: ShotResult) -> bool:
+        """Report one round.  True on a 2xx; never raises, never blocks long.
+
+        A 409 from SC is a dry trigger pull (the shooter's magazine ran
+        empty), which lands in the same failure count -- the trial's own
+        verdict is already graded locally and does not depend on it.
+        """
+        if self._consecutive >= self.MAX_CONSECUTIVE_FAILURES:
+            return False
+        body = json.dumps(self.build_payload(shot)).encode("utf-8")
+        try:
+            status = self._opener(self.url, body)
+        except Exception as exc:  # noqa: BLE001 -- graceful is the contract
+            return self._fail(f"{type(exc).__name__}: {exc}")
+        if not 200 <= int(status) < 300:
+            return self._fail(f"HTTP {status}")
+        self.posted += 1
+        self._consecutive = 0
+        return True
+
+    def stats(self) -> dict:
+        """For the run report: where the rounds went, and how many arrived."""
+        return {"url": self.url, "posted": self.posted, "failures": self.failures}
+
+    def _fail(self, why: str) -> bool:
+        self.failures += 1
+        self._consecutive += 1
+        if not self._warned:
+            self._warned = True
+            print(
+                f"[fire_bridge] SC engagement POST failed ({why}) -- "
+                "continuing without the operator map",
+                file=sys.stderr,
+            )
+        return False
+
+
+def poster_from_args(args: argparse.Namespace) -> ShotPoster | None:
+    """The CLI's poster, or None when reporting is switched off.
+
+    Posting is ON by default: against the default localhost URL an absent SC
+    is an instant connection-refused, so the common no-SC run pays one log
+    line, while a run WITH SC lights the operator map with zero extra flags.
+    ``--no-sc`` (or an empty ``--sc-url``) is the explicit off switch.
+    """
+    if getattr(args, "no_sc", False) or not getattr(args, "sc_url", ""):
+        return None
+    return ShotPoster(
+        args.sc_url,
+        args.shooter_id or default_shooter_id(args.body_prim),
+        shooter_type=getattr(args, "shooter_type", None) or None,
+    )
+
+
 # --- the client ----------------------------------------------------------
 
 
@@ -369,6 +522,9 @@ class FireBridge:
         target_root: scope owned by this client; swept every run.
         terrain_prims: prims whose world AABBs terminate the round (ground).
         transport: injection seam for tests -- ``(path, payload) -> dict``.
+        poster: optional :class:`ShotPoster`; every resolved round is
+            reported through it so the operator's map sees what the sim
+            fired.  None (the default here) posts nothing.
     """
 
     def __init__(
@@ -383,6 +539,7 @@ class FireBridge:
         barrel_m: float = DEFAULT_BARREL_M,
         max_range_m: float = DEFAULT_MAX_RANGE_M,
         transport: Callable[[str, Mapping[str, Any]], Mapping[str, Any]] | None = None,
+        poster: ShotPoster | None = None,
     ) -> None:
         self.body_prim = body_prim
         self.target_root = target_root
@@ -390,6 +547,7 @@ class FireBridge:
         self.mount = mount
         self.barrel_m = barrel_m
         self.max_range_m = max_range_m
+        self.poster = poster
         if transport is not None:
             self._transport = transport
         elif host:
@@ -427,6 +585,12 @@ class FireBridge:
         body, targets = self.read_scene()
         muzzle = muzzle_from_body(body, mount, self.barrel_m)
         shot = resolve_shot(muzzle, list(targets), self.max_range_m)
+
+        # The round is resolved: tell the Command Center BEFORE drawing, so
+        # the operator's record does not depend on the tracer round trip.
+        # post() never raises and never blocks past its short timeout.
+        if self.poster is not None:
+            self.poster.post(shot)
 
         if draw:
             origin = muzzle.origin()
@@ -613,6 +777,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="print the stage snippets and exit (no GPU, no bridge)",
     )
+    parser.add_argument(
+        "--sc-url",
+        default=os.environ.get(SC_URL_ENV, DEFAULT_SC_URL),
+        help="Tritium SC base URL for live shot reporting "
+        f"(env {SC_URL_ENV}; default {DEFAULT_SC_URL})",
+    )
+    parser.add_argument(
+        "--no-sc",
+        action="store_true",
+        help="do not report shots to the SC engagement endpoint",
+    )
+    parser.add_argument(
+        "--shooter-id",
+        default="",
+        help="track id SC shows for this shooter (default: derived from the body prim)",
+    )
+    parser.add_argument(
+        "--shooter-type",
+        default="robot_dog",
+        help="asset type SC uses to pick the shooter's magazine loadout",
+    )
     args = parser.parse_args(argv)
 
     if args.print_src:
@@ -623,7 +808,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not args.host:
         parser.error("--host is required unless --print-src")
 
-    bridge = FireBridge(host=args.host, port=args.port, body_prim=args.body_prim)
+    poster = poster_from_args(args)
+    bridge = FireBridge(
+        host=args.host, port=args.port, body_prim=args.body_prim, poster=poster
+    )
     if args.capture:
         # Pose the camera BEFORE firing: the tracer is transient debug-draw,
         # and moving the viewport afterwards can outlive the line it was
@@ -645,6 +833,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     if args.capture:
         report["frames"] = frames
+    if poster is not None:
+        # How many of this run's rounds actually reached the operator: a
+        # trial can pass with SC absent, and the report must say which.
+        report["sc"] = poster.stats()
 
     json.dump(report, sys.stdout, indent=2)
     print()
