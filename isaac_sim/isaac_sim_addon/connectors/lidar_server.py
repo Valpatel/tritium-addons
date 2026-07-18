@@ -262,7 +262,7 @@ class IsaacScanSource(ScanSource):
     def __init__(self, num_beams: int = 360, range_min: float = 0.1,
                  range_max: float = 30.0, angle_min: float = -math.pi,
                  mount_prim: str = "/World/Tritium/Robot/lidar",
-                 scene_usd: str | None = None, lidar_config: str = "Example_Rotary",
+                 scene_usd: str | None = None, lidar_config: str = "Example_Rotary_2D",
                  physics_hz: int = 30):
         super().__init__(num_beams, range_min, range_max, angle_min)
         self.mount_prim = mount_prim
@@ -332,7 +332,13 @@ class IsaacScanSource(ScanSource):
                         scale=np.array([0.8, 0.8, 1.5]),
                     )
                 )
-        # The RTX Lidar prim on the robot mount — range/azimuth read per frame.
+        # The RTX Lidar prim on the robot mount.
+        #
+        # CONFIG MUST BE A 2D LIDAR.  `IsaacComputeRTXLidarFlatScan` refuses to
+        # execute against a multi-beam sensor -- with `Example_Rotary` it logs
+        # "elevationDeg contains nonzero value -15.0 ... not a 2D Lidar, and
+        # node will not execute" and emits nothing.  A LaserScan is a 2D
+        # contract, so the sensor has to be 2D at the source.
         self._lidar = LidarRtx(
             prim_path=self.mount_prim,
             name="tritium_lidar",
@@ -340,16 +346,35 @@ class IsaacScanSource(ScanSource):
             config_file_name=lidar_config,
         )
         self._world.reset()
-        self._lidar.add_range_data_to_frame()
-        self._lidar.add_azimuth_data_to_frame()
+        # DATA PATH: attach the replicator annotator DIRECTLY.  The obvious
+        # `add_range_data_to_frame()` / `add_azimuth_data_to_frame()` pair is
+        # DEPRECATED AS OF ISAAC SIM 5.0 AND ATTACHES NOTHING -- it logs a
+        # deprecation warning and leaves `_annotators` empty, so `range` and
+        # `azimuth` never entered the frame and EVERY sweep fell into
+        # get_scan()'s all-range_max branch.  That is what made the sensor look
+        # healthy while producing an empty room for two ticks; it was never the
+        # GPU.  `IsaacComputeRTXLidarFlatScan` is Isaac's own ROS LaserScan
+        # producer -- the standard wheel, not a reinvention.
+        import omni.replicator.core as rep  # type: ignore
+        render_product = rep.create.render_product(self.mount_prim, [1, 1],
+                                                   name="tritium_lidar_rp")
+        self._flat = rep.AnnotatorRegistry.get_annotator(
+            "IsaacComputeRTXLidarFlatScan")
+        self._flat.attach([render_product])
         self._physics_dt = 1.0 / max(1, physics_hz)
 
     def get_scan(self) -> np.ndarray:
         self._world.step(render=True)
-        frame = self._lidar.get_current_frame() or {}
-        ranges = frame.get("range")
-        azimuths = frame.get("azimuth")
-        if ranges is None or azimuths is None or len(np.asarray(ranges)) == 0:
+        frame = self._flat.get_data() or {}
+        depth = np.asarray(frame.get("linearDepthData", []),
+                           dtype=np.float64).ravel()
+        # -1 is the flat scan's NO-RETURN SENTINEL, not a range.  Feeding it
+        # through unmasked makes every empty bearing the nearest contact in the
+        # sweep -- an obstacle detector would brake for open air.  Drop the
+        # non-returns here and let resample_to_beams leave those beams at
+        # range_max, which is what "nothing out there" means in a LaserScan.
+        valid = depth > 0.0
+        if depth.size == 0 or not valid.any():
             # A sweep of all-range_max is what an empty room looks like AND
             # what a sensor that never rendered looks like.  That ambiguity
             # cost a tick: with the Newton kit app holding 18 of 24 GB, the
@@ -370,9 +395,16 @@ class IsaacScanSource(ScanSource):
                 )
             return np.full(self.num_beams, self.range_max, dtype=np.float64)
         self._warmed = True
-        az = np.deg2rad(np.asarray(azimuths, dtype=np.float64))  # RTX gives deg
-        return resample_to_beams(ranges, az, self.num_beams, self.angle_min,
-                                 self.range_min, self.range_max)
+        # The flat scan reports its sweep as an azimuth RANGE in degrees plus a
+        # dense row of depths, not a per-point azimuth array -- bearings are
+        # implied by index, so they are reconstructed here.  endpoint=False
+        # because the last bearing wraps onto the first (a 360 deg sweep must
+        # not sample -180 and +180 as two distinct beams).
+        az_lo, az_hi = np.deg2rad(np.asarray(
+            frame.get("azimuthRange", (-180.0, 180.0)), dtype=np.float64))
+        bearings = np.linspace(az_lo, az_hi, depth.size, endpoint=False)
+        return resample_to_beams(depth[valid], bearings[valid], self.num_beams,
+                                 self.angle_min, self.range_min, self.range_max)
 
     def close(self) -> None:
         try:
@@ -593,7 +625,7 @@ def main(argv=None) -> int:
     # Isaac scene / mount.
     ap.add_argument("--scene", default="")
     ap.add_argument("--mount-prim", default="/World/Tritium/Robot/lidar")
-    ap.add_argument("--lidar-config", default="Example_Rotary")
+    ap.add_argument("--lidar-config", default="Example_Rotary_2D")
     ap.add_argument("--physics-hz", type=int, default=30)
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--selftest-scans", type=int, default=12)

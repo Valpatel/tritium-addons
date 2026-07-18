@@ -12,6 +12,7 @@ heavy runtime at module load.
 from __future__ import annotations
 
 import importlib.util
+import math
 import sys
 from pathlib import Path
 
@@ -355,6 +356,68 @@ def test_lidar_ground_is_a_slab_not_a_zero_thickness_quad():
         f"silently; found call(s): {calls}"
     )
     assert "GroundSlab" in src
+
+
+def test_lidar_does_not_read_via_the_deprecated_frame_api():
+    """The sensor was never broken -- the READ was, for three ticks.
+
+    ``add_range_data_to_frame()`` / ``add_azimuth_data_to_frame()`` are
+    DEPRECATED AS OF ISAAC SIM 5.0 and attach no annotator: ``_annotators``
+    stays empty, ``get_current_frame()`` returns only ``rendering_time`` /
+    ``rendering_frame``, and so ``range``/``azimuth`` never arrive.  Every
+    sweep then fell into the all-``range_max`` branch, which is byte-identical
+    to an empty room -- the sensor reported ``errors: 0`` while producing
+    nothing, and the failure was misattributed to GPU memory for two ticks.
+    Guard the CALL, not the mention, so the explanatory comment does not
+    self-trip this test."""
+    src = (_CONN / "lidar_server.py").read_text()
+    body = [ln for ln in src.splitlines() if not ln.lstrip().startswith("#")]
+    for dead in ("add_range_data_to_frame(", "add_azimuth_data_to_frame("):
+        hits = [ln for ln in body if dead in ln]
+        assert not hits, (
+            f"{dead} is a deprecated no-op in Isaac Sim 5.0+ and silently "
+            f"yields an empty sweep; read the flat-scan annotator instead. "
+            f"found: {hits}"
+        )
+    assert "IsaacComputeRTXLidarFlatScan" in src, (
+        "the live read path must attach Isaac's own ROS LaserScan producer")
+
+
+def test_lidar_config_is_2d_because_flat_scan_refuses_multibeam():
+    """``IsaacComputeRTXLidarFlatScan`` will not execute against a 3D sensor.
+
+    With ``Example_Rotary`` (elevation +/-15 deg) the node logs "Lidar prim is
+    not a 2D Lidar, and node will not execute" and emits nothing at all -- a
+    second, independent route to the same silent empty sweep.  A LaserScan is a
+    2D contract, so the sensor must be 2D at the source."""
+    src = (_CONN / "lidar_server.py").read_text()
+    body = [ln for ln in src.splitlines() if not ln.lstrip().startswith("#")]
+    defaults = [ln for ln in body if "Example_Rotary" in ln]
+    assert defaults, "expected a lidar config default"
+    for ln in defaults:
+        assert "Example_Rotary_2D" in ln, (
+            f"flat scan needs a 2D lidar config; a multi-beam config emits "
+            f"nothing: {ln.strip()}"
+        )
+
+
+def test_lidar_no_return_sentinel_is_not_read_as_a_range():
+    """The flat scan marks "nothing out there" as ``-1``, not as ``range_max``.
+
+    Passed through unmasked, ``-1`` becomes the CLOSEST reading in the sweep,
+    so an obstacle detector would brake for open air -- a silent inversion of
+    the sensor's meaning.  Non-returns must land at ``range_max``."""
+    ranges = [-1.0, 3.5, -1.0, 12.0]
+    bearings = [0.0, math.pi / 2, math.pi, -math.pi / 2]
+    valid = [r > 0.0 for r in ranges]
+    lidar_server = _load("lidar_server")
+    out = lidar_server.resample_to_beams(
+        [r for r, v in zip(ranges, valid) if v],
+        [b for b, v in zip(bearings, valid) if v],
+        num_beams=8, angle_min=-math.pi, range_min=0.1, range_max=30.0)
+    assert out.min() >= 0.1, "a -1 sentinel must never survive as a range"
+    assert 3.5 in out and 12.0 in out, "real returns must survive the mask"
+    assert list(out).count(30.0) == 6, "non-returns must read as range_max"
 
 
 def test_lidar_payload_matches_edge_scan_contract():
