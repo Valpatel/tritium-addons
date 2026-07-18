@@ -4,6 +4,97 @@ Notes from driving Isaac Sim 6.0 with **Newton physics** on the RTX 4090 via
 the Omniverse MCP bridge. Everything here was observed against a live kit, not
 inferred from docs. Dated so a later tick can tell stale from current.
 
+## 2026-07-18 (tick 9) — SOLVED: the ground plane was killing physics
+
+**A body falls.** After four ticks stuck at "the solver advances its clock but
+integrates nothing", a 1 kg cube released 3 m above the ground **fell 2.489 m
+and came to rest at z = 0.498 m** — exactly half a 1 m cube sitting on a slab
+whose top face is z = 0. Verified in the live kit and looked at:
+`docs/images/isaac/newton-cube-falls-2026-07-18.png`. Reproduce with
+`newton_ground_fix_proof.py` (prints `verdict STEPPED`).
+
+**The cause was the ground plane.** Newton's MuJoCo solver reduces every
+collision shape to a convex hull. Our ground was authored the obvious way — a
+100 × 100 quad, four corners, all at z = 0 — and qhull cannot seed a simplex
+from a rank-2 point set:
+
+```
+QH6154 Qhull precision error: Initial simplex is flat
+- p3(v4):   -50    50     0
+- p2(v3):    50    50     0
+- p1(v2):    50   -50     0
+- p0(v1):   -50   -50     0
+  2:         0         0  difference=    0      <-- no thickness
+```
+
+Bitterly, the *workaround* recorded in the previous entry — "`world.step()` is
+unavailable, use a plain USD ground plane" — is what planted the bug. The plain
+ground plane was the poison.
+
+**Why it stayed invisible for four ticks** is the part worth carrying forward.
+In `isaacsim/physics/newton/impl/newton_stage.py`:
+
+```python
+def initialize_newton(self, device):
+    if getattr(self, "_initializing", False):
+        return                       # <-- latched
+    ...
+    self._initializing = True        # <-- set BEFORE the work
+    ...                              # <-- qhull raises in here
+                                     # <-- never cleared on the error path
+
+def step_sim(self, dt):
+    if not self.initialized:
+        self.initialize_newton(self.device)   # returns instantly, forever
+    self.sim_time += dt                       # clock advances anyway
+    self.simulation_step_count += 1           # counter advances anyway
+    if self.playing:
+        self.simulate(dt=dt)                  # on a half-built model
+```
+
+One exception, once, disables physics for the **entire life of the process** —
+while every observable a person would check to see whether the sim is healthy
+keeps moving. The wedged kit confirmed the latch directly: `_initializing=True`
+and `initialized=False` after **329,580 steps and 329 s of sim time**. This is
+why "sim time is advancing" was such a convincing false signal, and why the
+diagnosis kept landing one layer too high.
+
+**Diagnostic shortcut for next time.** `isaacsim.physics.newton.acquire_stage()`
+returns the `NewtonStage`, and it answers the health question in one call:
+
+```python
+import isaacsim.physics.newton as ipn
+st = ipn.acquire_stage()
+st.initialized, getattr(st, "_initializing", None)   # (True, False) = healthy
+                                                     # (False, True) = wedged
+st.model.body_count, st.model.shape_count, st.model.gravity
+```
+
+`initialized=False` with `_initializing=True` means the latch has stuck and
+**no scene will ever simulate in that process** — restart the kit
+(`newton_kit.sh restart 8212`) before doing anything else.
+
+**The fix, and the guard.** Give the ground thickness: a 50 × 50 × 1 m box slab
+has the same footprint and is rank 3. The general guard now lives in the
+library as **`tritium_lib.geo.collider_shape`**, which runs qhull's own rank
+test on a vertex list with no GPU, no USD and no Isaac, so a scene builder can
+refuse to author a shape that would kill physics silently. It is a *rank* test,
+not a per-axis extent test, and deliberately so: tilt the flat quad and all
+three of its AABB extents become non-zero while the point set stays rank 2 and
+qhull still fails.
+
+**Premises from the previous entry that are now retired:** the solver is not
+broken, the kit build is fine, the Newton model was never empty (it reported
+`body_count 1`, correct gravity `(0,0,-9.81)`), and NVIDIA's shipped sample did
+not need to be run. What was true and still is: a headless kit does not pump
+its own update loop (`omni.kit.app.get_app().update()` is the stepping
+primitive), physics writes to Fabric rather than USD, and `SingleArticulation`
+remains retracted.
+
+**Next:** the gait itself. The blocker that justified four ticks of deferral is
+gone, so the Go2's 12 drives can now be commanded against a solver that
+actually integrates.
+
 ## 2026-07-17 — `SingleArticulation` is unusable under Newton on this build
 
 **Symptom.** Constructing `isaacsim.core.prims.SingleArticulation` against a
