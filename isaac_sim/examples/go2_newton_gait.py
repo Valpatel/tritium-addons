@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import math
 import socket
 import sys
 import time
@@ -478,6 +479,45 @@ def _pump_push(elapsed):
     state["kicks"].append(rec)
     state["push"] = None
 
+
+# ---- open-loop steering -------------------------------------------------
+# The mixing law is NOT reimplemented here either: tritium_lib.control's
+# differential_stride is the same function the headless tests drive.  This
+# block only knows which DOF belongs to which side of the body.
+_TWIST = __TWIST_JSON__
+_STEER_BIAS = None
+if _TWIST:
+    from tritium_lib.control import TwistCommand, differential_stride
+    _STEER_BIAS = differential_stride(
+        TwistCommand(linear_mps=float(_TWIST["linear"]),
+                     angular_rps=float(_TWIST["angular"])),
+        track_width_m=float(_TWIST["track"]),
+        nominal_mps=float(_TWIST["nominal"]),
+    )
+    state["steer"] = {"left": round(_STEER_BIAS.left_scale, 4),
+                      "right": round(_STEER_BIAS.right_scale, 4)}
+
+# Left legs are FL/RL, right are FR/RR -- read off LegPlacement.y > 0 rather
+# than hardcoded, so a body with a different naming scheme stays correct.
+_SIDE_DOF = {"left": [], "right": []}
+for _leg in GO2_LEGS:
+    if _leg.name in leg_dof:
+        _SIDE_DOF["left" if _leg.y > 0 else "right"].extend(leg_dof[_leg.name])
+
+
+def _apply_steer(targets, bias):
+    # Scale each leg's stride about the STAND pose, not about zero.  The
+    # stride is the deviation from stand; scaling the absolute angle would
+    # also drag the body's neutral crouch up and down and change its ride
+    # height, which reads as a limp rather than a turn.  A negative scale
+    # therefore swings that side's legs backwards through stand, which is
+    # exactly how a body spins in place.
+    for _side, _scale in (("left", bias.left_scale), ("right", bias.right_scale)):
+        for _i in _SIDE_DOF[_side]:
+            targets[_i] = stand_vec[_i] + (targets[_i] - stand_vec[_i]) * _scale
+    return targets
+
+
 def _to_numpy(t):
     # Newton getters hand back torch tensors on cuda:0, and np.array() on one
     # raises "can not convert cuda:0 device type tensor to numpy".
@@ -516,6 +556,12 @@ def _on_step(dt):
             _pump_push(elapsed)
 
         targets = _sample_targets(elapsed).copy()
+
+        # Steering is applied BEFORE the attitude trim, so the stabiliser's
+        # vertical corrections ride on top of the steered stride rather than
+        # being scaled away by it.
+        if _STEER_BIAS is not None:
+            targets = _apply_steer(targets, _STEER_BIAS)
 
         # The root transform is read EVERY step when stabilising, not on the
         # SAMPLE_EVERY cadence -- feedback at the trace's logging rate would be
@@ -577,7 +623,8 @@ def build_driver_code(gait: dict, duration: float, stiffness: float,
                       stabilize: bool = True, kp: float = None,
                       kd: float = None, lib_src: str = LIB_SRC,
                       disturb: list[dict] | None = None,
-                      push_window: float = 0.1) -> str:
+                      push_window: float = 0.1,
+                      twist: dict | None = None) -> str:
     from tritium_lib.control.attitude_stabilizer import DEFAULT_KD, DEFAULT_KP
 
     code = DRIVER_CODE
@@ -591,6 +638,7 @@ def build_driver_code(gait: dict, duration: float, stiffness: float,
     code = code.replace("__LIB_SRC__", repr(lib_src))
     code = code.replace("__DISTURB_JSON__", repr(list(disturb or [])))
     code = code.replace("__PUSH_WINDOW__", repr(float(push_window)))
+    code = code.replace("__TWIST_JSON__", repr(dict(twist) if twist else None))
     code = code.replace("__KP__", repr(float(DEFAULT_KP if kp is None else kp)))
     code = code.replace("__KD__", repr(float(DEFAULT_KD if kd is None else kd)))
     # IsaacEvents moved around between releases; resolve it remotely.
@@ -677,6 +725,23 @@ def score_trace(trace: list[list[float]]) -> dict:
     end_tilt = tilts[-1] if tilts else None
     tumbled = max_tilt is not None and max_tilt > DEFAULT_MAX_TILT_DEG
 
+    # Heading change -- the only metric that can see a TURN.  Displacement and
+    # tilt are both blind to yaw by construction (tilt_from_upright_deg
+    # deliberately excludes it), so a steering run scored on those alone would
+    # grade a perfect circle identically to a straight line of the same arc
+    # length.  Unwrapped, because a turn that crosses +/-180 must not read as
+    # a turn back the other way.
+    def _yaw_deg(qx, qy, qz, qw):
+        siny = 2.0 * (qw * qz + qx * qy)
+        cosy = 1.0 - 2.0 * (qy * qy + qz * qz)
+        return math.degrees(math.atan2(siny, cosy))
+
+    yaws = [_yaw_deg(r[4], r[5], r[6], r[7]) for r in trace if len(r) >= 8]
+    yaw_total = 0.0
+    for a, b in zip(yaws, yaws[1:]):
+        step = (b - a + 180.0) % 360.0 - 180.0
+        yaw_total += step
+
     return {
         "samples": len(trace),
         "duration_s": round(dt, 3),
@@ -692,6 +757,8 @@ def score_trace(trace: list[list[float]]) -> dict:
         "max_tilt_deg": round(max_tilt, 2) if max_tilt is not None else None,
         "end_tilt_deg": round(end_tilt, 2) if end_tilt is not None else None,
         "tumbled": tumbled,
+        "yaw_change_deg": round(yaw_total, 2) if yaws else None,
+        "yaw_rate_dps": round(yaw_total / dt, 3) if yaws else None,
         # Order matters: a tumble outranks distance, because a tumbling body
         # covers ground and would otherwise be reported as a working gait.
         "verdict": (
@@ -700,6 +767,25 @@ def score_trace(trace: list[list[float]]) -> dict:
             else "WALKED" if dist > 0.10
             else "STATIONARY"
         ),
+    }
+
+
+def twist_spec(args) -> dict | None:
+    """Build the steering command from the CLI, or None for straight ahead.
+
+    ``None`` rather than a zero twist on purpose: a zero twist still runs the
+    mixer and rescales every stride by 1.0, and "multiply by one" is exactly
+    the kind of no-op that quietly stops being a no-op after a refactor.  The
+    unsteered arm of an A/B must run the *original* code path untouched, or it
+    is not a control.
+    """
+    if not args.steer:
+        return None
+    return {
+        "linear": float(args.speed),
+        "angular": float(args.steer),
+        "track": float(args.steer_track),
+        "nominal": float(args.speed),
     }
 
 
@@ -819,6 +905,12 @@ def main() -> int:
     ap.add_argument("--damping", type=float, default=4.0)
     ap.add_argument("--sample-every", type=int, default=10,
                     help="record a pose sample every N physics steps")
+    ap.add_argument("--steer", type=float, default=0.0, metavar="RAD_S",
+                    help="commanded yaw rate. Positive turns to PORT (left) "
+                         "per REP-103. Mixed to a left/right stride ratio by "
+                         "tritium_lib.control.differential_stride.")
+    ap.add_argument("--steer-track", type=float, default=0.26, metavar="M",
+                    help="body track width used by the mixer (Go2: 0.26)")
     ap.add_argument("--capture", help="write a viewport PNG here")
     ap.add_argument("--capture-at", type=float, default=None, metavar="SEC",
                     help="sim-time to capture at, default mid-window. Clamped "
@@ -943,6 +1035,17 @@ def main() -> int:
             "median_displacement_m": round(sorted(dists)[len(dists) // 2], 3) if dists else None,
             "verdicts": [r.get("verdict") for r in runs],
         }
+        # Yaw is reported unconditionally, not just when --steer is set: a
+        # straight run's heading drift is the baseline that makes a steered
+        # run's number mean anything, and it is only credible if it is
+        # collected the same way in both arms rather than switched on for the
+        # arm being advertised.
+        yaws = [r["yaw_change_deg"] for r in runs
+                if r.get("yaw_change_deg") is not None]
+        if yaws:
+            summary[label]["median_yaw_change_deg"] = round(
+                sorted(yaws)[len(yaws) // 2], 2)
+            summary[label]["yaw_changes_deg"] = [round(y, 2) for y in yaws]
         if args.disturb_at is not None:
             # Recovery is scored only over trials where the kick actually
             # landed.  Counting a NOT_APPLIED run as a recovery would inflate
@@ -967,6 +1070,7 @@ def main() -> int:
             }
         print(f"{label:20s} walked {walked}/{len(runs)}  upright {upright}/{len(runs)}  "
               f"median_tilt={summary[label]['median_max_tilt_deg']}deg"
+              f"  yaw={summary[label].get('median_yaw_change_deg')}deg"
               + (f"  recovered {summary[label]['disturbance']['recovered']}/"
                  f"{summary[label]['disturbance']['kick_applied']}"
                  if args.disturb_at is not None else ""))
@@ -1020,7 +1124,8 @@ def run_trial(br: "Bridge", gait: dict, args, stabilize: bool,
     info = _ok("driver", br.execute(build_driver_code(
         gait, args.seconds, args.stiffness, args.damping, args.sample_every,
         stabilize=stabilize, kp=args.kp, kd=args.kd,
-        disturb=disturb_spec(args), push_window=args.disturb_window)))
+        disturb=disturb_spec(args), push_window=args.disturb_window,
+        twist=twist_spec(args))))
     if stabilize and len(info.get("legs_wired", [])) != 4:
         # Silently trimming two legs would look like a weak controller rather
         # than a wiring bug, so it is fatal instead.
