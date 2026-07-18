@@ -4,7 +4,7 @@
 # Licensed under AGPL-3.0 — see LICENSE for details.
 """No-GPU end-to-end proof: Isaac camera server -> MJPEG -> detector -> track.
 
-Starts ``isaac_camera_server.py`` in its no-GPU ``synthetic`` mode (the same
+Starts ``connectors/camera_server.py`` in its no-GPU ``synthetic`` mode (the same
 MJPEG a real Isaac render or a real IP camera serves), opens the stream with
 the SAME classical detector the tritium-sc FrameDetectionManager uses, and
 asserts a posed camera detection projects to a world position — the whole
@@ -14,7 +14,7 @@ When Isaac is launched with a free GPU, ``--source isaac`` serves render-quality
 frames through the identical HTTP path and this proof holds verbatim; only the
 pixels get better.
 
-Run:  python3 examples/isaac-camera/smoke_detect.py
+Run:  python3 examples/smoke_detect.py
 Needs tritium_lib on PYTHONPATH (the perception pipeline lives there).
 """
 
@@ -64,7 +64,10 @@ def main() -> int:
     from pathlib import Path
 
     here = Path(__file__).resolve().parent
-    server = here / "isaac_camera_server.py"
+    # The MJPEG camera server moved to the connectors package (was a sibling
+    # ``isaac_camera_server.py`` next to this example).
+    server = here.parent / "isaac_sim_addon" / "connectors" / "camera_server.py"
+    assert server.exists(), f"camera server not found at {server}"
 
     # 1. Start the Isaac camera server (no-GPU synthetic frames).
     proc = subprocess.Popen(

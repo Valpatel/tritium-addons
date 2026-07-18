@@ -102,10 +102,31 @@ class IsaacCameraBridge:
         self.detections_published = 0
         self._detector = None
         if run_perception:
-            from tritium_lib.perception.detector import build_frame_detector
+            self._detector = self._build_local_detector(detector_prefer)
 
-            self._detector = build_frame_detector(prefer=detector_prefer)
-            logger.info("perception backend: %s", getattr(self._detector, "backend_name", "?"))
+    # -- optional local detector (lazy, tritium-free at import) --------------
+    @staticmethod
+    def _build_local_detector(prefer: str = "auto") -> Any:
+        """Lazily + optionally build a local frame detector out of tritium-lib.
+
+        Detection is normally done SC-side in ``camera_feeds``; running it here is
+        opt-in (``run_perception=True``). The tritium-lib module is resolved by
+        string via :func:`importlib.import_module` so this connector carries **no**
+        static ``tritium`` import — it must load Isaac-side without the SC stack
+        (the dependency-hygiene invariant enforced by ``tests/test_no_gpu.py``).
+        Any failure to import/build degrades cleanly to detection disabled; the
+        frame-publishing path is unaffected.
+        """
+        try:
+            import importlib
+
+            detector_mod = importlib.import_module("tritium_lib.perception.detector")
+            detector = detector_mod.build_frame_detector(prefer=prefer)
+            logger.info("perception backend: %s", getattr(detector, "backend_name", "?"))
+            return detector
+        except Exception as exc:  # tritium-lib absent Isaac-side, or backend missing
+            logger.warning("local detector unavailable (%s); detection disabled", exc)
+            return None
 
     # -- lifecycle -----------------------------------------------------------
     def connect(self) -> "IsaacCameraBridge":
