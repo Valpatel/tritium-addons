@@ -269,7 +269,19 @@ class IsaacScanSource(ScanSource):
         self._sim = None
         self._world = None
         self._lidar = None
+        # Warm-up state: `_warmed` flips the first time the sensor returns a
+        # single point, and never flips back.  See get_scan().
+        self._warmed = False
+        self._empty_frames = 0
         self._boot(scene_usd, lidar_config, physics_hz)
+
+    @property
+    def never_returned(self) -> bool:
+        """True while the sensor has not produced one point since boot.
+
+        A consumer MUST NOT read an all-range_max sweep as an empty room
+        until this is False."""
+        return not self._warmed
 
     def _boot(self, scene_usd, lidar_config, physics_hz):
         # Imports are local so plain python3 (selftest/synthetic/tests) never
@@ -337,9 +349,27 @@ class IsaacScanSource(ScanSource):
         frame = self._lidar.get_current_frame() or {}
         ranges = frame.get("range")
         azimuths = frame.get("azimuth")
-        if ranges is None or azimuths is None:
-            # Honest empty sweep (all no-return) until the sensor warms up.
+        if ranges is None or azimuths is None or len(np.asarray(ranges)) == 0:
+            # A sweep of all-range_max is what an empty room looks like AND
+            # what a sensor that never rendered looks like.  That ambiguity
+            # cost a tick: with the Newton kit app holding 18 of 24 GB, the
+            # RTX lidar's render product failed to allocate
+            # (VK_ERROR_OUT_OF_DEVICE_MEMORY) and every sweep came back a
+            # clean 360x30.0 m — /status showed scans climbing and errors
+            # zero, so the sensor "looked healthy and produced nothing".
+            # `never_returned` is the flag that tells the two apart; it rides
+            # out on /scan and /status so a consumer is never asked to guess.
+            self._empty_frames += 1
+            if not self._warmed and self._empty_frames in (30, 300, 3000):
+                log.warning(
+                    "LIDAR HAS NEVER RETURNED A POINT after %d frames — the "
+                    "sensor is not ray-tracing (check GPU memory: the RTX "
+                    "lidar needs a render product, and an out-of-VRAM "
+                    "allocation fails SILENTLY into this branch)",
+                    self._empty_frames,
+                )
             return np.full(self.num_beams, self.range_max, dtype=np.float64)
+        self._warmed = True
         az = np.deg2rad(np.asarray(azimuths, dtype=np.float64))  # RTX gives deg
         return resample_to_beams(ranges, az, self.num_beams, self.angle_min,
                                  self.range_min, self.range_max)
@@ -372,6 +402,11 @@ def build_payload(source: ScanSource, scan: np.ndarray, lidar_id: str,
         "range_min": source.range_min,
         "range_max": source.range_max,
         "ranges": [round(float(r), 4) for r in scan],
+        # Provenance, not decoration: an all-range_max sweep is ambiguous
+        # between "empty room" and "sensor never rendered", and a consumer
+        # cannot tell from the ranges alone.  Sources that cannot fail this
+        # way (synthetic) report False.
+        "never_returned": bool(getattr(source, "never_returned", False)),
     }
 
 
@@ -491,7 +526,7 @@ def _make_handler(state: LidarState):
 # --------------------------------------------------------------------------- #
 
 def _build_source(args) -> ScanSource:
-    if args.source == "isaac":
+    if getattr(args, "source", "synthetic") == "isaac":
         return IsaacScanSource(
             num_beams=args.beams, range_min=args.range_min,
             range_max=args.range_max, mount_prim=args.mount_prim,
@@ -509,6 +544,16 @@ def selftest(args) -> int:
     beam count, angle bounds, every range in band, no NaN/inf, deterministic
     per tick, and the orbiting obstacle actually moves between sweeps."""
     logging.basicConfig(level=logging.INFO, format="%(message)s")
+    # `--selftest` exercises the SYNTHETIC source only — it is the no-GPU
+    # contract check.  Silently ignoring `--source isaac` printed a green
+    # "SELFTEST OK" for a sensor that had never booted Isaac, which is worse
+    # than no check at all: it was read as evidence the live lidar worked.
+    if getattr(args, "source", "synthetic") == "isaac":
+        print("SELFTEST REFUSED: --selftest is the no-GPU synthetic contract "
+              "check and cannot validate --source isaac.  Run the server for "
+              "real and read /scan (watch the never_returned flag).",
+              file=sys.stderr)
+        return 2
     src = SyntheticScanSource(num_beams=args.beams, range_min=args.range_min,
                               range_max=args.range_max)
     scans = []

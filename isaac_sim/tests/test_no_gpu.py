@@ -734,3 +734,42 @@ def _camera_server_parser(mod):
         argparse.ArgumentParser.parse_args = real_parse
     assert "ap" in captured, "main() built no parser"
     return captured["ap"]
+
+
+def test_lidar_selftest_refuses_to_grade_the_isaac_source():
+    """A green SELFTEST OK for a sensor that never booted Isaac is worse than
+    no check: tick 20's `--source isaac --selftest` printed OK while the RTX
+    lidar had not rendered a single point, and that was read as evidence the
+    live sensor worked.  --selftest is the no-GPU synthetic contract check and
+    must say so rather than silently substituting a different source."""
+    from isaac_sim_addon.connectors.lidar_server import main
+
+    assert main(["--selftest", "--source", "isaac"]) == 2
+    assert main(["--selftest", "--source", "synthetic"]) == 0
+
+
+def test_lidar_payload_flags_a_sensor_that_never_returned():
+    """An all-range_max sweep is ambiguous between 'empty room' and 'sensor
+    never ray-traced'.  A live Isaac run produced exactly that — 360 beams of
+    30.0 m, /status healthy, scans climbing — because the RTX lidar's render
+    product failed to allocate on a GPU held by the Newton kit app
+    (VK_ERROR_OUT_OF_DEVICE_MEMORY).  The flag is how a consumer tells the two
+    apart without guessing."""
+    import numpy as np
+
+    from isaac_sim_addon.connectors.lidar_server import (
+        SyntheticScanSource,
+        build_payload,
+    )
+
+    src = SyntheticScanSource(num_beams=36)
+    # A source that cannot fail this way reports False, not absent.
+    payload = build_payload(src, src.get_scan(), "x", 1)
+    assert payload["never_returned"] is False
+
+    class NeverReturned(SyntheticScanSource):
+        never_returned = True
+
+    cold = NeverReturned(num_beams=36)
+    blank = np.full(36, cold.range_max)
+    assert build_payload(cold, blank, "x", 1)["never_returned"] is True
