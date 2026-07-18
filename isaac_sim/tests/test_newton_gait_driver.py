@@ -300,6 +300,159 @@ def test_run_stays_open_loop():
     assert sched.stabilized == 0
 
 
+# --------------------------------------------------- step reflex (injected)
+#
+# The trim is an ankle strategy: it re-weights planted feet, and above ~5 N*s
+# of push the body inverts anyway — the only recovery is to MOVE a foot
+# (capture-point stepping, the lib's StepReflex; live-Newton measurement in
+# flight).  Like the stabilizer the reflex arrives INJECTED, so these tests
+# bind mocks exactly the way the live runner binds the lib, pin the mirrored
+# semantics (dry first measured step, positive-interval-only, opaque
+# measurement, raise-on-misuse, byte-identity when absent) and pin the
+# composition ORDER: reflex placement first, stabilizer height trim second,
+# conversion + clamp last.
+
+def test_reflex_fn_injected_but_never_fed_changes_nothing():
+    """Injection alone must not alter output — only a measured velocity may.
+    Wired alongside the stabilizer, an unfed reflex leaves the whole
+    scheduler byte-identical to a plain one."""
+    dt, n = 0.02, 16
+    plain = drv.GaitScheduler(drv.mock_targets_fn, dt=dt,
+                              limits=drv.DEFAULT_LIMITS_DEG)
+    wired = drv.GaitScheduler(drv.mock_targets_fn, dt=dt,
+                              limits=drv.DEFAULT_LIMITS_DEG,
+                              stabilize_fn=drv.mock_stabilize_fn,
+                              reflex_fn=drv.mock_reflex_fn)
+    assert [wired.step() for _ in range(n)] == [plain.step() for _ in range(n)]
+    assert wired.reflexed == 0 and wired.stabilized == 0
+
+
+def test_velocity_without_reflex_fn_raises_loudly():
+    """A consumer who feeds velocity into a reflex-less scheduler believes
+    push recovery is armed while it is absent — they would learn the truth
+    at the first real shove, so the seam must be loud instead.  An injected
+    stabilizer does NOT arm the reflex; the hooks are independent."""
+    sched = drv.GaitScheduler(drv.mock_targets_fn, dt=0.02)
+    with pytest.raises(ValueError, match="no reflex_fn"):
+        sched.step(velocity=(0.5, 0.0))
+    stab_only = drv.GaitScheduler(drv.mock_targets_fn, dt=0.02,
+                                  stabilize_fn=drv.mock_stabilize_fn)
+    with pytest.raises(ValueError, match="no reflex_fn"):
+        stab_only.step(attitude=(0.0, 0.0), velocity=(0.5, 0.0))
+
+
+def test_reflex_fn_must_be_callable():
+    with pytest.raises(TypeError, match="reflex_fn"):
+        drv.GaitScheduler(drv.mock_targets_fn, reflex_fn="not-callable")
+
+
+def test_first_measured_reflex_step_is_dry_and_dt_spans_measured_steps():
+    """Mirrors the stabilizer hook exactly: the first measured reflex step
+    only records its time (no interval -> no reflex); after a skipped
+    measurement the reflex receives the TRUE interval since the last
+    reflex-measured step."""
+    calls: list[tuple[dict, object, float]] = []
+
+    def spy(targets_rad, velocity, dt):
+        calls.append((dict(targets_rad), velocity, dt))
+        return targets_rad
+
+    vel = (0.5, -0.1)
+    sched = drv.GaitScheduler(lambda t: {"FL_thigh": 0.5}, dt=0.25,
+                              reflex_fn=spy)
+    _, deg1 = sched.step(velocity=vel)          # t=0.00: dry — records time
+    sched.step()                                # t=0.25: no measurement
+    sched.step(velocity=vel)                    # t=0.50: dt spans two steps
+    sched.step(velocity=vel)                    # t=0.75: dt is one step
+    assert deg1["FL_thigh"] == pytest.approx(math.degrees(0.5))
+    assert len(calls) == 2 and sched.reflexed == 2
+    assert calls[0][2] == pytest.approx(0.50)   # since the DRY measured step
+    assert calls[1][2] == pytest.approx(0.25)
+    assert calls[0][1] is vel                   # velocity is opaque passthrough
+    assert calls[0][0] == {"FL_thigh": 0.5}     # raw RADIANS, pre-conversion
+
+
+def test_reflex_fires_above_the_gate_and_not_below():
+    """The lib's layering contract, visible through the scheduler: below the
+    0.05 m capture gate the reflex is a pure pass-through (byte-identical
+    output even though it RAN), above it the stepping leg's placement leaves
+    the open-loop track while the clamps keep the last word."""
+    dt, n = 0.02, 12
+    plain = drv.GaitScheduler(drv.mock_targets_fn, dt=dt,
+                              limits=drv.DEFAULT_LIMITS_DEG)
+    open_run = [plain.step() for _ in range(n)]
+
+    below = drv.GaitScheduler(drv.mock_targets_fn, dt=dt,
+                              limits=drv.DEFAULT_LIMITS_DEG,
+                              reflex_fn=drv.mock_reflex_fn)
+    assert [below.step(velocity=(0.2, 0.0)) for _ in range(n)] == open_run
+    assert below.reflexed == n - 1              # it ran, deciding "no step"
+
+    above = drv.GaitScheduler(drv.mock_targets_fn, dt=dt,
+                              limits=drv.DEFAULT_LIMITS_DEG,
+                              reflex_fn=drv.mock_reflex_fn)
+    shoved_run = [above.step(velocity=(0.5, 0.1)) for _ in range(n)]
+    assert shoved_run[0] == open_run[0]         # dry first step
+    for (_, deg_o), (_, deg_c) in zip(open_run[1:], shoved_run[1:]):
+        assert deg_c["FL_thigh"] != deg_o["FL_thigh"]   # placement moved
+        for joint, val in deg_c.items():        # clamps still respected
+            lim = drv.limit_for(joint, drv.DEFAULT_LIMITS_DEG)
+            assert lim[0] <= val <= lim[1]
+    assert above.reflexed == n - 1
+
+
+def test_reflex_placement_applies_before_the_stabilizer_height_trim():
+    """The PINNED composition order: targets -> reflex_fn -> stabilize_fn ->
+    convert/clamp.  The step strategy (coarse placement, relocates the
+    support polygon) runs first; the ankle strategy (fine height trim on
+    whatever support exists) runs last, because its Jacobian is evaluated at
+    the commanded pose — the stabilizer must SEE the post-reflex targets or
+    a stepped leg's trim is computed stale and clobbered."""
+    order: list[str] = []
+
+    def reflex(targets_rad, velocity, dt):
+        order.append("reflex")
+        targets_rad["FL_thigh"] += 0.10         # coarse placement change
+        return targets_rad
+
+    def stabilize(targets_rad, attitude, dt):
+        order.append("stabilize")
+        assert targets_rad["FL_thigh"] == pytest.approx(0.60), \
+            "stabilizer must receive the REFLEX-adjusted pose"
+        targets_rad["FL_thigh"] += 0.01         # fine trim on top
+        return targets_rad
+
+    sched = drv.GaitScheduler(lambda t: {"FL_thigh": 0.5}, dt=0.25,
+                              stabilize_fn=stabilize, reflex_fn=reflex)
+    sched.step(attitude=(0.0, 0.0), velocity=(9.0, 0.0))    # both dry
+    _, deg = sched.step(attitude=(0.0, 0.0), velocity=(9.0, 0.0))
+    assert order == ["reflex", "stabilize"]
+    assert deg["FL_thigh"] == pytest.approx(math.degrees(0.61))
+
+
+def test_run_stays_reflex_free():
+    """run() samples no velocity, so an injected reflex must never fire."""
+    def explode(targets_rad, velocity, dt):     # pragma: no cover
+        raise AssertionError("reflex_fn fired during run()")
+
+    sched = drv.GaitScheduler(drv.mock_targets_fn, dt=0.05,
+                              reflex_fn=explode)
+    assert len(list(sched.run(0.5))) == 10
+    assert sched.reflexed == 0
+
+
+def test_mock_reflex_fn_is_calm_below_the_gate_and_steps_one_leg_above():
+    """Below the gate the mock returns the targets untouched (no bias that
+    could mask a broken pass-through path above); above it, ONLY the
+    stepping leg's placement joints move — never the calves, never another
+    leg."""
+    targets = {j: 0.1 * i for i, j in enumerate(drv.JOINT_NAMES)}
+    assert drv.mock_reflex_fn(dict(targets), (0.2, 0.0), 0.02) == targets
+    out = drv.mock_reflex_fn(dict(targets), (0.5, 0.1), 0.02)
+    changed = {j for j in drv.JOINT_NAMES if out[j] != targets[j]}
+    assert changed == {"FL_hip", "FL_thigh"}    # the stepping leg only
+
+
 # ------------------------------------ apply_foot_height_trim (the pure math)
 
 def test_foot_trim_magnitude_pinned_at_the_stand_pose():
