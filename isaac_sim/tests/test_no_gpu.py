@@ -178,6 +178,142 @@ def test_camera_server_selftest_covers_depth_and_stereo():
     assert mod.selftest(_Args()) == 0
 
 
+# -- lidar_server: synthetic (no-GPU) source produces valid sweeps ---------
+
+def test_lidar_server_imports_without_isaacsim():
+    """Module import must not require isaacsim (it is lazy inside IsaacScanSource)."""
+    mod = _load("lidar_server")
+    assert hasattr(mod, "SyntheticScanSource") and hasattr(mod, "IsaacScanSource")
+    assert hasattr(mod, "LidarState") and hasattr(mod, "build_payload")
+
+
+def test_lidar_synthetic_sweep_is_valid():
+    """A synthetic sweep honors the LaserScan contract: N beams, every range
+    within [range_min, range_max], no NaN/inf, correct angle bounds."""
+    import math
+    import numpy as np
+    mod = _load("lidar_server")
+    src = mod.SyntheticScanSource(num_beams=360, range_min=0.1, range_max=30.0)
+    scan = src.get_scan()
+    assert scan.shape == (360,)
+    assert np.all(np.isfinite(scan)), "sweep contains NaN/inf"
+    assert np.all(scan >= 0.1) and np.all(scan <= 30.0)
+    assert src.angle_min == -math.pi
+    assert abs(src.angle_increment - 2 * math.pi / 360) < 1e-12
+    assert abs(src.angle_max - (-math.pi + 359 * src.angle_increment)) < 1e-12
+
+
+def test_lidar_synthetic_is_deterministic_and_animated():
+    """Same tick -> identical sweep (replayable); successive ticks differ
+    (the orbiting obstacle moves)."""
+    import numpy as np
+    mod = _load("lidar_server")
+    a = mod.SyntheticScanSource(num_beams=180)
+    b = mod.SyntheticScanSource(num_beams=180)
+    assert np.array_equal(a.scan_at(7), b.scan_at(7)), "sweep not deterministic"
+    s1 = a.get_scan()
+    s2 = a.get_scan()
+    for _ in range(20):
+        s2 = a.get_scan()
+    assert not np.array_equal(s1, s2), "orbiting obstacle should move"
+
+
+def test_lidar_synthetic_sees_the_room_and_obstacles():
+    """The sweep reads the scene, not a constant: the near wall (hy=4 m at
+    +90 deg) is closer than the far corner, and a pillar shadows its bearing."""
+    import math
+    import numpy as np
+    mod = _load("lidar_server")
+    src = mod.SyntheticScanSource(num_beams=360, room_w=10.0, room_h=8.0)
+    scan = src.scan_at(0)
+    ang = mod.beam_angles(360)
+    up = int(np.argmin(np.abs(ang - math.pi / 2)))       # +Y wall: 4.0 m
+    assert abs(scan[up] - 4.0) < 0.05
+    # Static pillar at (2.5, 1.5) r=0.3 -> bearing atan2(1.5,2.5), dist ~2.62.
+    pb = int(np.argmin(np.abs(ang - math.atan2(1.5, 2.5))))
+    assert scan[pb] < 2.8, "pillar should shadow its bearing"
+
+
+def test_lidar_payload_matches_edge_scan_contract():
+    """/scan JSON carries ranges + the geometry keys tritium-edge's
+    parse_scan_json consumes, JSON-serializable, no NaN."""
+    import json as _json
+    import math
+    mod = _load("lidar_server")
+    src = mod.SyntheticScanSource(num_beams=90, range_min=0.2, range_max=25.0)
+    payload = mod.build_payload(src, src.get_scan(), "test-lidar", 3, stamp=123.5)
+    body = _json.dumps(payload)          # must serialize (json rejects NaN/inf)
+    doc = _json.loads(body)
+    assert doc["lidar_id"] == "test-lidar" and doc["seq"] == 3
+    assert doc["stamp"] == 123.5
+    assert len(doc["ranges"]) == 90
+    assert all(0.2 <= r <= 25.0 for r in doc["ranges"])
+    for key in ("angle_min", "angle_max", "angle_increment",
+                "range_min", "range_max"):
+        assert isinstance(doc[key], float)
+    assert abs(doc["angle_min"] + math.pi) < 1e-9
+
+
+def test_lidar_resample_bins_cloud_to_ordered_sweep():
+    """resample_to_beams (the Isaac scan-buffer seam) bins an unordered
+    range/azimuth cloud: closest return wins a bin, empty bins read range_max,
+    output clamped in band — pure numpy, no GPU."""
+    import math
+    import numpy as np
+    mod = _load("lidar_server")
+    out = mod.resample_to_beams(
+        ranges=[5.0, 2.0, 7.0, np.nan, 100.0],
+        azimuths=[0.0, 0.0, math.pi / 2, 1.0, math.pi],
+        num_beams=4, angle_min=-math.pi, range_min=0.1, range_max=30.0)
+    assert out.shape == (4,)
+    assert out[2] == 2.0            # bin at azimuth 0: closest of (5.0, 2.0)
+    assert out[3] == 7.0            # bin at +pi/2
+    assert out[0] == 30.0           # pi wraps onto angle_min's bin, clamped
+    assert out[1] == 30.0           # empty bin -> range_max, never NaN
+    assert np.all(np.isfinite(out))
+
+
+def test_lidar_state_survives_a_failing_source():
+    """Graceful on missing/broken sensor: a raising source counts errors,
+    leaves no fabricated sweep, and the state keeps ticking."""
+    mod = _load("lidar_server")
+
+    class _Broken(mod.ScanSource):
+        name = "broken"
+
+        def get_scan(self):
+            raise RuntimeError("sensor missing")
+
+    state = mod.LidarState(_Broken(num_beams=8), "broken-lidar", hz=10)
+    assert state.tick_once() is False
+    assert state.errors == 1 and state.scans == 0
+    assert state.latest() is None    # -> the /scan route answers 503
+
+
+def test_lidar_state_caches_latest_payload():
+    """A healthy source yields a cached JSON body the handlers can serve."""
+    import json as _json
+    mod = _load("lidar_server")
+    state = mod.LidarState(mod.SyntheticScanSource(num_beams=45), "ok-lidar", hz=10)
+    assert state.tick_once() is True
+    doc = _json.loads(state.latest())
+    assert doc["lidar_id"] == "ok-lidar" and len(doc["ranges"]) == 45
+    assert state.scans == 1 and state.errors == 0
+
+
+def test_lidar_server_selftest_passes():
+    """The server's own no-GPU self-test returns 0."""
+    mod = _load("lidar_server")
+
+    class _Args:
+        beams = 120
+        range_min = 0.1
+        range_max = 30.0
+        selftest_scans = 6
+
+    assert mod.selftest(_Args()) == 0
+
+
 # -- isaac_quadruped_server: integrator + protocol WITHOUT isaacsim --------
 
 def test_quadruped_server_imports_without_isaacsim():
