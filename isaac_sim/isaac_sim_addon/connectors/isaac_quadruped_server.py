@@ -224,6 +224,112 @@ BARREL_LENGTH_M = 0.20                   # pivot -> muzzle tip along aim
 MAGAZINE_SIZE = 30                       # shots per boot (no reload cmd yet)
 FIRE_MAX_RANGE_M = 60.0                  # ray is clipped past this
 
+# The ground the body stands on, as an axis-aligned TERRAIN box the fire ray
+# terminates against.  Both stage flavours ground the world with its walkable
+# surface at z = 0 (add_default_ground_plane here, the /World/GroundSlab box in
+# lidar_server), and until this existed a round aimed below the horizon flew
+# to max range UNDERNEATH the world — the live control tracer was visibly
+# occluded below the slab.  Kept in SharedBody.terrain, SEPARATE to
+# SharedBody.targets, because {cmd: "targets"} replaces that list and the
+# Isaac loop republishes it every step: terrain registered there would be
+# silently deleted within one tick.  Extents are generous rather than exact
+# (the fire ray is clipped at FIRE_MAX_RANGE_M anyway); what matters is the
+# top face at z = 0.0.
+GROUND_TARGET: dict = {
+    "id": "terrain_ground",
+    "min": [-1000.0, -1000.0, -100.0],
+    "max": [1000.0, 1000.0, 0.0],
+}
+
+# Below this, a direction vector is numerically meaningless.  Same threshold
+# as ``tritium_lib.geo.hitscan._MIN_DIRECTION_NORM`` — these helpers mirror
+# that module's ray_sphere/ray_aabb/resolve_shot op for op (connectors stay
+# dependency-clean, so the code is duplicated, not imported; the contract
+# tests in tests/test_fire.py hold the two copies together).
+_MIN_DIRECTION_NORM = 1e-9
+
+
+def _unit(direction: tuple[float, float, float]) -> tuple[float, float, float]:
+    """Normalise ``direction``; reject a degenerate vector rather than aim it.
+
+    Mirror of ``tritium_lib.geo.hitscan._unit``: same threshold, same error,
+    so a shot the lib refuses to fire is refused here too.
+    """
+    dx, dy, dz = direction
+    norm = math.sqrt(dx * dx + dy * dy + dz * dz)
+    if norm < _MIN_DIRECTION_NORM:
+        raise ValueError(f"direction must be non-degenerate, got {direction!r}")
+    return (dx / norm, dy / norm, dz / norm)
+
+
+def ray_sphere_t(origin: tuple[float, float, float],
+                 direction: tuple[float, float, float],
+                 center: tuple[float, float, float],
+                 radius_m: float) -> float | None:
+    """Distance to the sphere's SURFACE, or None for a miss.
+
+    Mirror of ``tritium_lib.geo.hitscan.ray_sphere``, including the two edges
+    the old inline test got wrong: a muzzle INSIDE the sphere is a point-blank
+    hit at range 0 (``tca < 0`` alone would refuse it), and the inner sqrt is
+    clamped so float noise near a graze can never go negative.
+    """
+    if radius_m < 0.0:
+        raise ValueError(f"radius_m must be non-negative, got {radius_m!r}")
+    ax, ay, az = _unit(direction)
+    ox, oy, oz = origin
+    cx, cy, cz = center
+
+    vx, vy, vz = cx - ox, cy - oy, cz - oz
+    tca = vx * ax + vy * ay + vz * az
+    dist2 = vx * vx + vy * vy + vz * vz
+    r2 = radius_m * radius_m
+
+    if tca < 0.0 and dist2 > r2:
+        return None  # centre behind the muzzle, muzzle outside the sphere
+
+    perp2 = dist2 - tca * tca
+    if perp2 > r2:
+        return None  # ray passes wide
+
+    return max(0.0, tca - math.sqrt(max(0.0, r2 - perp2)))
+
+
+def ray_box(origin: tuple[float, float, float],
+            direction: tuple[float, float, float],
+            box_min: tuple[float, float, float],
+            box_max: tuple[float, float, float]) -> float | None:
+    """Distance to the box's near face, or None for a miss.
+
+    Mirror of ``tritium_lib.geo.hitscan.ray_aabb`` — the slab method with the
+    parallel case branched out EXPLICITLY.  The naive ``(lo - o) / d`` with a
+    direction component of exactly zero yields NaN (and 0/0 when the origin
+    sits exactly ON the plane — a real bug mutation testing found in the lib),
+    every comparison against NaN is false, and a miss silently reports as a
+    hit.  Parallel-to-a-slab is instead decided by whether the origin lies
+    between that slab's planes.
+    """
+    ax, ay, az = _unit(direction)
+    t_near = 0.0  # never report geometry behind the muzzle
+    t_far = math.inf
+
+    for o, d, lo, hi in zip(origin, (ax, ay, az), box_min, box_max):
+        if lo > hi:
+            raise ValueError(f"box bounds inverted on one axis: {lo} > {hi}")
+        if abs(d) < _MIN_DIRECTION_NORM:
+            if o < lo or o > hi:
+                return None  # parallel to this slab and outside it
+            continue  # parallel but within: this axis cannot clip the ray
+        t1 = (lo - o) / d
+        t2 = (hi - o) / d
+        if t1 > t2:
+            t1, t2 = t2, t1
+        t_near = max(t_near, t1)
+        t_far = min(t_far, t2)
+        if t_near > t_far:
+            return None
+
+    return t_near
+
 
 def muzzle_pose(body_x: float, body_y: float, body_heading: float,
                 turret_pan: float, turret_tilt: float,
@@ -258,47 +364,59 @@ def ray_hit(origin: tuple[float, float, float],
             aim: tuple[float, float, float],
             targets: list[dict],
             max_range: float = FIRE_MAX_RANGE_M) -> dict | None:
-    """Closest sphere target the ray from ``origin`` along ``aim`` hits.
+    """Closest target the ray from ``origin`` along ``aim`` hits — the FIRST
+    thing the round enters across a MIXED set of spheres and boxes.
 
-    A target is ``{"id": str, "x": m, "y": m, "z": m, "radius": m}`` (z
-    defaults 0, radius defaults 0.5). Classic ray-sphere test: targets
-    behind the muzzle or beyond ``max_range`` never hit; among hits the
-    SMALLEST ray distance wins (you cannot shoot through the front target).
+    Two target shapes, told apart by their keys:
+      sphere: ``{"id": str, "x": m, "y": m, "z": m, "radius": m}`` (z
+              defaults 0, radius defaults 0.5)
+      box:    ``{"id": str, "min": [x, y, z], "max": [x, y, z]}`` — walls,
+              vehicles, and the TERRAIN the round must stop at.
+
+    Mirror of ``tritium_lib.geo.hitscan.resolve_shot``: nearest hit wins (you
+    cannot shoot through the front target — nor through the ground), and the
+    range gate is applied to the winning hit rather than used to pre-filter.
+    The two gates are provably equivalent here — the winner is the global
+    minimum, so no farther candidate can pass a gate the minimum fails — but
+    matching the lib's shape keeps the copies line-comparable.  Malformed
+    targets are skipped, never sink the shot (the lib raises instead; a
+    protocol server must not die on a bad JSON entry).
 
     Returns ``{"target_id", "range", "hit_pos": [x, y, z]}`` or ``None``.
     Pure and deterministic — the same helper serves the no-Isaac path and
     the live-stage path (which feeds it poses read back from the sim).
     """
     ox, oy, oz = origin
-    best: dict | None = None
+    best_id: str | None = None
+    best_t: float | None = None
     for tgt in targets:
         try:
-            cx = float(tgt["x"])
-            cy = float(tgt["y"])
-            cz = float(tgt.get("z", 0.0))
-            radius = float(tgt.get("radius", 0.5))
+            if "min" in tgt and "max" in tgt:
+                lo = tuple(float(v) for v in tgt["min"])
+                hi = tuple(float(v) for v in tgt["max"])
+                if len(lo) != 3 or len(hi) != 3:
+                    continue
+                t_hit = ray_box(origin, aim, lo, hi)
+            else:
+                center = (float(tgt["x"]), float(tgt["y"]),
+                          float(tgt.get("z", 0.0)))
+                t_hit = ray_sphere_t(origin, aim, center,
+                                     float(tgt.get("radius", 0.5)))
         except (KeyError, TypeError, ValueError):
             continue  # malformed target: skip, never sink the shot
-        vx, vy, vz = cx - ox, cy - oy, cz - oz
-        tca = vx * aim[0] + vy * aim[1] + vz * aim[2]
-        if tca < 0.0:
-            continue  # center behind the muzzle
-        d2 = (vx * vx + vy * vy + vz * vz) - tca * tca
-        r2 = radius * radius
-        if d2 > r2:
-            continue  # ray passes wide
-        t_hit = max(0.0, tca - math.sqrt(r2 - d2))
-        if t_hit > max_range:
+        if t_hit is None:
             continue
-        if best is None or t_hit < best["range"]:
-            best = {
-                "target_id": tgt.get("id"),
-                "range": t_hit,
-                "hit_pos": [ox + aim[0] * t_hit,
-                            oy + aim[1] * t_hit,
-                            oz + aim[2] * t_hit],
-            }
-    return best
+        if best_t is None or t_hit < best_t:
+            best_t, best_id = t_hit, tgt.get("id")
+    if best_t is None or best_t > max_range:
+        return None
+    return {
+        "target_id": best_id,
+        "range": best_t,
+        "hit_pos": [ox + aim[0] * best_t,
+                    oy + aim[1] * best_t,
+                    oz + aim[2] * best_t],
+    }
 
 
 class SharedBody:
@@ -317,10 +435,18 @@ class SharedBody:
         # Turret intent (stored + logged; a Go2 asset has no turret to drive)
         self.pan = 0.0
         self.tilt = 0.0
-        # Fire mechanic: sphere targets + remaining ammo. In Isaac mode the
-        # sim thread republishes target poses read from the stage each step;
-        # without Isaac the {cmd: "targets"} request seeds them directly.
+        # Fire mechanic: sphere/box targets + remaining ammo. In Isaac mode
+        # the sim thread republishes target poses read from the stage each
+        # step; without Isaac the {cmd: "targets"} request seeds them directly.
         self.targets: list[dict] = []
+        # Terrain the round terminates against, registered at BOOT and never
+        # touched by {cmd: "targets"} or the per-step Isaac republish — both
+        # rewrite self.targets wholesale, and the ground must survive that.
+        self.terrain: list[dict] = [{
+            "id": GROUND_TARGET["id"],
+            "min": list(GROUND_TARGET["min"]),
+            "max": list(GROUND_TARGET["max"]),
+        }]
         self.ammo = MAGAZINE_SIZE
         # Served state (written by sim thread after each step)
         self.sim_time = 0.0
@@ -342,17 +468,22 @@ def handle_request(obj: object, shared: SharedBody) -> dict:
                    sim_time, physics}
         twist  -> {"ok": true}   (left/right clamped to [-1, 1], stored)
         turret -> {"ok": true}   (pan/tilt stored + logged)
-        targets-> {"ok": true, "count": n}  (sphere target list replaced;
-                  in Isaac mode the sim thread overwrites it every step
-                  with poses read back from the stage)
-        fire   -> {"ok": true, "fired": bool, "hit": bool,
+        targets-> {"ok": true, "count": n}  (target list replaced; entries
+                  are spheres {x, y, z, radius} or boxes {min, max}; in
+                  Isaac mode the sim thread overwrites the list every step
+                  with poses read back from the stage.  The ground terrain
+                  is NOT part of this list and survives every replace.)
+        fire   -> {"ok": true, "fired": bool, "hit": bool, "terrain": bool,
                    "hit_pos": [x, y, z]|null, "target_id": str|null,
                    "range": m|null, "origin": [x, y, z], "aim": [x, y, z],
                    "ammo": n}  (+"reason": "out_of_ammo" when dry)
                   Ray from the turret muzzle (muzzle_pose) against the
-                  current sphere targets (ray_hit); closest target wins.
-                  Superset of the original {"ok": true} — old brains that
-                  only check "ok" keep working.
+                  current targets PLUS the registered terrain (ray_hit);
+                  the nearest hit wins, so a round aimed below the horizon
+                  stops at the ground ("terrain": true) instead of passing
+                  through it to reach something buried beyond.  Superset of
+                  the original {"ok": true} — old brains that only check
+                  "ok" keep working.
     """
     if not isinstance(obj, dict):
         return {"ok": False, "error": "request is not a JSON object"}
@@ -396,6 +527,26 @@ def handle_request(obj: object, shared: SharedBody) -> dict:
         for entry in raw:
             if not isinstance(entry, dict):
                 return {"ok": False, "error": "each target must be an object"}
+            if "min" in entry or "max" in entry:
+                # Box target (a wall, a vehicle, an extra terrain slab).
+                try:
+                    lo = [float(v) for v in entry["min"]]
+                    hi = [float(v) for v in entry["max"]]
+                except (KeyError, TypeError, ValueError):
+                    return {"ok": False,
+                            "error": "box target min/max must be "
+                                     "3-number lists"}
+                if len(lo) != 3 or len(hi) != 3 or any(
+                        a > b for a, b in zip(lo, hi)):
+                    return {"ok": False,
+                            "error": "box target min/max must be 3-number "
+                                     "lists with min <= max on every axis"}
+                cleaned.append({
+                    "id": str(entry.get("id", f"tgt_{len(cleaned)}")),
+                    "min": lo,
+                    "max": hi,
+                })
+                continue
             try:
                 cleaned.append({
                     "id": str(entry.get("id", f"tgt_{len(cleaned)}")),
@@ -416,8 +567,8 @@ def handle_request(obj: object, shared: SharedBody) -> dict:
             if shared.ammo <= 0:
                 print("[ISAAC DOG] fire: out of ammo")
                 return {"ok": True, "fired": False, "hit": False,
-                        "hit_pos": None, "target_id": None, "range": None,
-                        "ammo": 0, "reason": "out_of_ammo"}
+                        "terrain": False, "hit_pos": None, "target_id": None,
+                        "range": None, "ammo": 0, "reason": "out_of_ammo"}
             shared.ammo -= 1
             ammo = shared.ammo
             state = shared.state
@@ -426,9 +577,17 @@ def handle_request(obj: object, shared: SharedBody) -> dict:
             heading = float(state.get("heading", 0.0))
             pan, tilt = shared.pan, shared.tilt
             targets = list(shared.targets)
+            terrain = [dict(t) for t in shared.terrain]
         origin, aim = muzzle_pose(body_x, body_y, heading, pan, tilt)
-        hit = ray_hit(origin, aim, targets)
-        if hit is not None:
+        # One resolver over the MIXED set: the round stops in the first
+        # thing it enters, and the ground is one of those things.
+        hit = ray_hit(origin, aim, targets + terrain)
+        terrain_ids = {t.get("id") for t in terrain}
+        terrain_hit = hit is not None and hit["target_id"] in terrain_ids
+        if terrain_hit:
+            print(f"[ISAAC DOG] fire: TERRAIN {hit['target_id']} "
+                  f"at {hit['range']:.2f} m (ammo {ammo})")
+        elif hit is not None:
             print(f"[ISAAC DOG] fire: HIT {hit['target_id']} "
                   f"at {hit['range']:.2f} m (ammo {ammo})")
         else:
@@ -437,6 +596,7 @@ def handle_request(obj: object, shared: SharedBody) -> dict:
             "ok": True,
             "fired": True,
             "hit": hit is not None,
+            "terrain": terrain_hit,
             "hit_pos": ([round(v, 4) for v in hit["hit_pos"]]
                         if hit else None),
             "target_id": hit["target_id"] if hit else None,
@@ -835,6 +995,8 @@ def run_isaac(args: argparse.Namespace) -> int:
     physics_dt = 1.0 / args.physics_hz
     world = World(physics_dt=physics_dt, rendering_dt=physics_dt,
                   stage_units_in_meters=1.0)
+    # Walkable surface at z = 0 — the plane GROUND_TARGET mirrors, so the
+    # fire ray stops at the same ground the physics stands on.
     world.scene.add_default_ground_plane()
 
     # --- body: go2 (best-effort) or procedural (deliberate default) ---
@@ -1027,6 +1189,25 @@ def _selftest() -> int:
                   [{"id": "b", "x": 0.0, "y": -5.0, "z": 1.0, "radius": 1.0}])
           is None)
 
+    # --- terrain: the round stops at the ground, not 60 m below it ---
+    ground = {"id": GROUND_TARGET["id"],
+              "min": list(GROUND_TARGET["min"]),
+              "max": list(GROUND_TARGET["max"])}
+    down45 = (0.0, math.sqrt(0.5), -math.sqrt(0.5))
+    thit = ray_hit((0.0, 0.0, 1.0), down45,
+                   [{"id": "buried", "x": 0.0, "y": 2.0, "z": -1.0,
+                     "radius": 0.5},
+                    ground])
+    check("round terminates at TERRAIN, not the target behind it",
+          thit is not None and thit["target_id"] == GROUND_TARGET["id"]
+          and abs(thit["hit_pos"][2]) < 1e-9)
+    check("level fire above the slab still flies free",
+          ray_hit((0.0, 0.0, 1.0), (0.0, 1.0, 0.0), [ground]) is None)
+    check("nearest hit wins across mixed sphere+box",
+          ray_hit((0.0, 0.0, 1.0), down45,
+                  [{"id": "near_sphere", "x": 0.0, "y": 0.5, "z": 0.5,
+                    "radius": 0.3}, ground])["target_id"] == "near_sphere")
+
     # --- TCP loopback: protocol + sequential reconnect ---
     shared = SharedBody()
     with shared.lock:
@@ -1090,6 +1271,22 @@ def _selftest() -> int:
           and r.get("hit") is False and r.get("hit_pos") is None
           and r.get("target_id") is None
           and r.get("ammo") == MAGAZINE_SIZE - 2)
+    # Aim below the horizon: the round must STOP at the ground plane
+    # (z = 0), reported as a terrain stop — not fly under the world.
+    ask(f2, s2, {"cmd": "turret", "pan": 0.0, "tilt": -45.0})
+    r = ask(f2, s2, {"cmd": "fire"})
+    check("fire below the horizon terminates at terrain",
+          r.get("ok") is True and r.get("hit") is True
+          and r.get("terrain") is True
+          and r.get("target_id") == GROUND_TARGET["id"]
+          and r.get("hit_pos") is not None
+          and abs(r["hit_pos"][2]) < 1e-3
+          and r.get("ammo") == MAGAZINE_SIZE - 3)
+    # A replace of the target list must NOT delete the ground.
+    ask(f2, s2, {"cmd": "targets", "targets": []})
+    r = ask(f2, s2, {"cmd": "fire"})
+    check("terrain survives a targets replace",
+          r.get("hit") is True and r.get("terrain") is True)
     f2.close()
     s2.close()
 

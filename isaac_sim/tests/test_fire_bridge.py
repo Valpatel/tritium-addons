@@ -8,17 +8,19 @@ import json
 import pytest
 
 from tritium_lib.geo.camera_mount import CameraMount
-from tritium_lib.geo.hitscan import SphereTarget
+from tritium_lib.geo.hitscan import BoxTarget, SphereTarget
 from tritium_lib.geo.isaac_frame import LocalPose
 
 from isaac_sim_addon.clients.fire_bridge import (
     DEFAULT_SPECS,
+    DEFAULT_TERRAIN_PRIMS,
     FireBridge,
     TargetSpec,
     aim_at,
     build_targets_src,
     draw_shot_src,
     grade_trial,
+    is_terrain,
     main,
     parse_scene,
     read_scene_src,
@@ -29,10 +31,12 @@ from isaac_sim_addon.clients.fire_bridge import (
 class FakeStage:
     """A stage that remembers what it was told and answers what it holds."""
 
-    def __init__(self, body=(0.0, 0.0, 0.4), heading=0.0, targets=None):
+    def __init__(self, body=(0.0, 0.0, 0.4), heading=0.0, targets=None,
+                 terrain=None):
         self.body = body
         self.heading = heading
         self.targets = targets if targets is not None else []
+        self.terrain = terrain if terrain is not None else []
         self.calls = []
 
     def __call__(self, path, payload):
@@ -48,9 +52,15 @@ class FakeStage:
                 {
                     "body": {"pos": list(self.body), "heading_deg": self.heading},
                     "targets": self.targets,
+                    "terrain": self.terrain,
                 }
             )
         return _ok("tracer")
+
+
+#: The slab lidar_server authors: 50 x 50 x 1 m, top face at z = 0.
+GROUND = {"path": "/World/GroundSlab",
+          "min": [-25.0, -25.0, -1.0], "max": [25.0, 25.0, 0.0]}
 
 
 def _ok(value):
@@ -309,3 +319,135 @@ def test_bridge_raises_on_a_failed_execute():
 
 def test_print_src_needs_no_bridge_and_no_gpu():
     assert main(["--print-src"]) == 0
+
+
+# --- terrain: the round stops at the ground -------------------------------
+
+
+def test_scene_source_reads_the_terrain_prims():
+    """The snippet must read the slab's world AABB in the SAME snapshot as
+    the body and targets, and still carry exactly one result assignment."""
+    src = read_scene_src()
+    for prim in DEFAULT_TERRAIN_PRIMS:
+        assert prim in src
+    assert "BBoxCache" in src
+    assert src.count("result = ") == 1
+    compile(src, "<generated>", "exec")
+
+
+def test_parse_scene_builds_terrain_boxes():
+    _, targets = parse_scene(
+        {"body": {"pos": [0.0, 0.0, 0.4], "heading_deg": 0.0},
+         "targets": [], "terrain": [GROUND]}
+    )
+    assert len(targets) == 1
+    box = targets[0]
+    assert isinstance(box, BoxTarget)
+    assert box.target_id == "terrain:/World/GroundSlab"
+    assert is_terrain(box.target_id)
+    assert box.max_up_m == 0.0 and box.min_up_m == -1.0
+
+
+def test_parse_scene_without_terrain_still_works():
+    """A stage with no slab (or an old snippet) parses exactly as before."""
+    _, targets = parse_scene(
+        {"body": {"pos": [0.0, 0.0, 0.4], "heading_deg": 0.0},
+         "targets": [_target("a", 0.0, 4.0, 0.5)]}
+    )
+    assert targets == [SphereTarget("a", 0.0, 4.0, 0.5, 0.4)]
+
+
+def test_round_terminates_at_terrain_not_below_it():
+    """THE named live defect: the control tracer drew to max range visibly
+    BELOW the ground slab, because terrain was not in the target list.  A
+    round aimed below the horizon must now stop AT the slab's top face, and
+    the tracer must end at that impact — in the MISS colour, because dirt is
+    not a target."""
+    stage = FakeStage(body=(0.0, 0.0, 0.4), heading=0.0,
+                      targets=[], terrain=[GROUND])
+    bridge = FireBridge(transport=stage)
+    mount = CameraMount(forward_m=0.25, left_m=0.0, up_m=0.55,
+                        pan_deg=0.0, tilt_deg=-45.0)
+    shot = bridge.fire(mount)  # draw=True: the tracer is the point
+
+    assert shot.hit is True
+    assert is_terrain(shot.target_id)
+    impact = shot.impact()
+    assert abs(impact[2]) < 1e-9         # AT the top face, not 60 m under it
+    assert shot.range_m < 2.0            # ~1.14 m of travel, not max range
+    draw_code = stage.calls[-1][1]
+    assert str(list(impact)) in draw_code               # tracer ends at impact
+    assert "(1.0, 0.93, 0.04, 1.0)" in draw_code        # MISS colour, not HIT
+
+
+def test_target_behind_terrain_is_occluded():
+    """A shot aimed at a target buried beyond the ground hits the TERRAIN."""
+    buried = _target("buried", 0.0, 6.0, -2.0)
+    body = LocalPose(east_m=0.0, north_m=0.0, up_m=0.4, heading_deg=0.0)
+    tgt = SphereTarget("buried", 0.0, 6.0, -2.0, 0.4)
+
+    stage = FakeStage(body=(0.0, 0.0, 0.4), heading=0.0,
+                      targets=[buried], terrain=[GROUND])
+    shot = FireBridge(transport=stage).fire(aim_at(body, tgt), draw=False)
+    assert shot.hit is True
+    assert is_terrain(shot.target_id)
+    assert shot.target_id != "buried"
+
+    # The same aim on a stage WITHOUT the slab reaches it — the terrain is
+    # what stopped the round, not a bad solution.
+    open_stage = FakeStage(body=(0.0, 0.0, 0.4), heading=0.0, targets=[buried])
+    shot2 = FireBridge(transport=open_stage).fire(aim_at(body, tgt), draw=False)
+    assert shot2.hit is True and shot2.target_id == "buried"
+
+
+def test_clear_line_of_sight_still_hits_over_solid_ground():
+    stage = FakeStage(body=(0.0, 0.0, 0.4), heading=0.0,
+                      targets=[_target("t", 0.0, 8.0, 1.2)], terrain=[GROUND])
+    body = LocalPose(east_m=0.0, north_m=0.0, up_m=0.4, heading_deg=0.0)
+    tgt = SphereTarget("t", 0.0, 8.0, 1.2, 0.4)
+    shot = FireBridge(transport=stage).fire(aim_at(body, tgt), draw=False)
+    assert shot.hit is True and shot.target_id == "t"
+
+
+def test_a_control_stopped_by_terrain_still_passes():
+    """The whole reason terrain grading exists: with a solid floor most
+    control rounds end in the dirt.  That is a MISS of the target — the
+    trial must pass, and the verdict must say where the round went."""
+    v = grade_trial(_shot(True, "t", 5.0),
+                    _shot(True, "terrain:/World/GroundSlab", 3.0), "t")
+    assert v["pass"] is True
+    assert v["control_missed"] is True
+    assert v["control_stopped_by_terrain"] is True
+    assert v["discriminates"] is True
+
+
+def test_an_aimed_round_that_hits_terrain_fails():
+    """Shooting the ground is not fire control, whatever the ray says."""
+    v = grade_trial(_shot(True, "terrain:/World/GroundSlab", 2.0),
+                    _shot(False, miss=5.0), "t")
+    assert v["hit_intended_target"] is False
+    assert v["discriminates"] is False
+    assert v["pass"] is False
+
+
+def test_run_trial_with_solid_ground_aims_at_spheres_and_passes():
+    stage = FakeStage(body=(0.0, 0.0, 0.4), heading=0.0,
+                      targets=[_target("dummy_near", 0.0, 4.0, 0.5)],
+                      terrain=[GROUND])
+    report = run_trial(FireBridge(transport=stage), DEFAULT_SPECS)
+
+    assert report["aimed"]["target_id"] == "dummy_near"
+    assert report["verdict"]["pass"] is True
+    assert report["terrain"] == [{"id": "terrain:/World/GroundSlab",
+                                  "min": [-25.0, -25.0, -1.0],
+                                  "max": [25.0, 25.0, 0.0]}]
+    # Terrain never appears in the aimable target list.
+    assert all(not is_terrain(t["id"]) for t in report["targets"])
+
+
+def test_run_trial_refuses_a_stage_with_only_terrain():
+    """Terrain is not something to aim at: a stage holding nothing but the
+    slab has no targets, and the trial must say so."""
+    stage = FakeStage(targets=[], terrain=[GROUND])
+    with pytest.raises(RuntimeError, match="no targets"):
+        run_trial(FireBridge(transport=stage), DEFAULT_SPECS)

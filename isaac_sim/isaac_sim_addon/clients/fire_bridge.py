@@ -28,6 +28,17 @@ it at a target and never test the other half, so every run here fires a
 matched MISS arm -- the same body, the same targets, the boresight slewed off
 axis -- and the run is only meaningful if the two arms disagree.
 
+**The round stops at the ground.**  The stage's terrain (the ``GroundSlab``
+box whose top face is the floor the body stands on) is read back as a
+:class:`~tritium_lib.geo.hitscan.BoxTarget` and resolved in the SAME
+``resolve_shot`` call as the spheres, nearest hit wins.  Before this, terrain
+was simply not in the target list, and the live control tracer drew to max
+range visibly BELOW the slab — a round that passes through the ground is a
+solver that will also let a real turret "hit" a target behind a berm.  A
+round that ends in terrain grades as a MISS of whatever it was aimed at
+(:func:`is_terrain` tells the two apart), but its tracer now terminates at
+the impact point on the dirt.
+
 The stage snapshot and the shot are one round trip each, so a walking body
 does not move between reading its pose and firing from it.
 """
@@ -42,7 +53,13 @@ from dataclasses import dataclass
 from typing import Any
 
 from tritium_lib.geo.camera_mount import CameraMount
-from tritium_lib.geo.hitscan import ShotResult, SphereTarget, muzzle_from_body, resolve_shot
+from tritium_lib.geo.hitscan import (
+    BoxTarget,
+    ShotResult,
+    SphereTarget,
+    muzzle_from_body,
+    resolve_shot,
+)
 from tritium_lib.geo.isaac_frame import LocalPose
 
 from .nav_bridge import ssh_transport, unwrap_result
@@ -50,6 +67,21 @@ from .nav_bridge import ssh_transport, unwrap_result
 DEFAULT_PORT = 8212  # the Newton kit; 8211 is the PhysX one
 DEFAULT_BODY_PRIM = "/World/Tritium/go2/base"
 DEFAULT_TARGET_ROOT = "/World/FireTargets"
+
+# Prim paths read back as TERRAIN the round terminates against.  Same names
+# nav_bridge refuses to treat as obstacles: the slab lidar_server authors and
+# the plain ground some scenes carry.  Terrain is never aimed at, and a round
+# that ends in it grades as a MISS of its intended target.
+DEFAULT_TERRAIN_PRIMS = ("/World/GroundSlab", "/World/Ground")
+
+# target_id prefix marking terrain in a ShotResult, so grading and drawing
+# can tell "stopped in the dirt" apart from "hit the thing it was aimed at".
+TERRAIN_ID_PREFIX = "terrain:"
+
+
+def is_terrain(target_id: str | None) -> bool:
+    """Does this ``ShotResult.target_id`` name terrain rather than a target?"""
+    return bool(target_id) and str(target_id).startswith(TERRAIN_ID_PREFIX)
 
 # Matches TURRET_MOUNT_OFFSET / BARREL_LENGTH_M in isaac_quadruped_server so
 # the two firing paths speak about the same weapon.
@@ -129,7 +161,9 @@ result = {{"authored": authored}}
 
 
 def read_scene_src(
-    body_prim: str = DEFAULT_BODY_PRIM, root: str = DEFAULT_TARGET_ROOT
+    body_prim: str = DEFAULT_BODY_PRIM,
+    root: str = DEFAULT_TARGET_ROOT,
+    terrain_prims: Sequence[str] = DEFAULT_TERRAIN_PRIMS,
 ) -> str:
     """Source that reads the body pose and every target's ACTUAL world pose.
 
@@ -140,6 +174,12 @@ def read_scene_src(
     The radius is read through the world transform's scale rather than off the
     radius attribute alone, because a scaled Xform ancestor changes how big
     the sphere actually is without touching that attribute.
+
+    Terrain comes back as the world-space AABBs of ``terrain_prims``
+    (BBoxCache with the default purpose — the same bound Isaac's own
+    selection outline draws), so the fire ray terminates at the ground the
+    stage actually has rather than at a z = 0 someone assumed.  Absent prims
+    are skipped: a stage with no slab simply has no terrain to stop a round.
     """
     return f'''
 import omni.usd, math
@@ -178,9 +218,29 @@ if troot and troot.IsValid():
         scale = max(Gf.Vec3d(m[i][0], m[i][1], m[i][2]).GetLength() for i in range(3))
         targets.append({{"id": child.GetName(), "pos": list(pos), "radius": r * float(scale)}})
 
+# Terrain: world AABB of each named prim, in the SAME snapshot as the body
+# and targets, so the ground the round stops at is the ground of this instant.
+terrain = []
+bbox_cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), [UsdGeom.Tokens.default_])
+for tp in {json.dumps(list(terrain_prims))}:
+    prim = stage.GetPrimAtPath(tp)
+    if not prim or not prim.IsValid():
+        continue
+    try:
+        rng = bbox_cache.ComputeWorldBound(prim).ComputeAlignedRange()
+    except Exception:
+        continue
+    if rng.IsEmpty():
+        continue
+    mn, mx = rng.GetMin(), rng.GetMax()
+    terrain.append({{"path": tp,
+                     "min": [float(mn[i]) for i in range(3)],
+                     "max": [float(mx[i]) for i in range(3)]}})
+
 result = {{
     "body": {{"pos": list(bpos), "heading_deg": heading}},
     "targets": targets,
+    "terrain": terrain,
 }}
 '''
 
@@ -215,8 +275,17 @@ result = "tracer %s" % ("HIT" if {hit!r} else "MISS")
 # --- the client ----------------------------------------------------------
 
 
-def parse_scene(payload: Mapping[str, Any]) -> tuple[LocalPose, list[SphereTarget]]:
-    """Stage snapshot -> the body's pose and the targets, in lib terms."""
+def parse_scene(
+    payload: Mapping[str, Any],
+) -> tuple[LocalPose, list[SphereTarget | BoxTarget]]:
+    """Stage snapshot -> the body's pose and the targets, in lib terms.
+
+    Terrain AABBs become :class:`BoxTarget` entries whose ids carry
+    :data:`TERRAIN_ID_PREFIX`, in the SAME list as the spheres —
+    ``resolve_shot`` takes the mixed set and the nearest hit wins, which is
+    exactly how a round comes to stop at the ground instead of reaching a
+    target buried behind it.
+    """
     body = payload["body"]
     east, north, up = (float(v) for v in body["pos"])
     pose = LocalPose(
@@ -225,7 +294,7 @@ def parse_scene(payload: Mapping[str, Any]) -> tuple[LocalPose, list[SphereTarge
         up_m=up,
         heading_deg=float(body["heading_deg"]) % 360.0,
     )
-    targets = [
+    targets: list[SphereTarget | BoxTarget] = [
         SphereTarget(
             target_id=str(t["id"]),
             east_m=float(t["pos"][0]),
@@ -235,6 +304,19 @@ def parse_scene(payload: Mapping[str, Any]) -> tuple[LocalPose, list[SphereTarge
         )
         for t in payload.get("targets", [])
     ]
+    for t in payload.get("terrain", []):
+        lo, hi = t["min"], t["max"]
+        targets.append(
+            BoxTarget(
+                target_id=f"{TERRAIN_ID_PREFIX}{t.get('path', 'ground')}",
+                min_east_m=float(lo[0]),
+                min_north_m=float(lo[1]),
+                min_up_m=float(lo[2]),
+                max_east_m=float(hi[0]),
+                max_north_m=float(hi[1]),
+                max_up_m=float(hi[2]),
+            )
+        )
     return pose, targets
 
 
@@ -285,6 +367,7 @@ class FireBridge:
         port: MCP bridge port (8212 Newton, 8211 PhysX).
         body_prim: the body the weapon is mounted on.
         target_root: scope owned by this client; swept every run.
+        terrain_prims: prims whose world AABBs terminate the round (ground).
         transport: injection seam for tests -- ``(path, payload) -> dict``.
     """
 
@@ -295,6 +378,7 @@ class FireBridge:
         *,
         body_prim: str = DEFAULT_BODY_PRIM,
         target_root: str = DEFAULT_TARGET_ROOT,
+        terrain_prims: Sequence[str] = DEFAULT_TERRAIN_PRIMS,
         mount: CameraMount = DEFAULT_MOUNT,
         barrel_m: float = DEFAULT_BARREL_M,
         max_range_m: float = DEFAULT_MAX_RANGE_M,
@@ -302,6 +386,7 @@ class FireBridge:
     ) -> None:
         self.body_prim = body_prim
         self.target_root = target_root
+        self.terrain_prims = tuple(terrain_prims)
         self.mount = mount
         self.barrel_m = barrel_m
         self.max_range_m = max_range_m
@@ -323,11 +408,22 @@ class FireBridge:
     def author_targets(self, specs: Sequence[TargetSpec]) -> list[str]:
         return list(self._execute(build_targets_src(specs, self.target_root))["authored"])
 
-    def read_scene(self) -> tuple[LocalPose, list[SphereTarget]]:
-        return parse_scene(self._execute(read_scene_src(self.body_prim, self.target_root)))
+    def read_scene(self) -> tuple[LocalPose, list[SphereTarget | BoxTarget]]:
+        return parse_scene(
+            self._execute(
+                read_scene_src(self.body_prim, self.target_root, self.terrain_prims)
+            )
+        )
 
     def fire(self, mount: CameraMount, draw: bool = True) -> ShotResult:
-        """Read the stage, fire one round through it, draw the tracer."""
+        """Read the stage, fire one round through it, draw the tracer.
+
+        The tracer ends where the ROUND ended: at the target it hit, at the
+        terrain that stopped it, or at max range in clear air.  A terrain
+        stop draws in the MISS colour — the round did not hit what it was
+        aimed at — but it terminates AT the ground impact, which is the fix
+        for the live run whose control tracer continued below the slab.
+        """
         body, targets = self.read_scene()
         muzzle = muzzle_from_body(body, mount, self.barrel_m)
         shot = resolve_shot(muzzle, list(targets), self.max_range_m)
@@ -338,7 +434,9 @@ class FireBridge:
             if end is None:
                 aim = muzzle.direction()
                 end = tuple(origin[i] + aim[i] * self.max_range_m for i in range(3))
-            self._execute(draw_shot_src(origin, end, shot.hit))
+            self._execute(
+                draw_shot_src(origin, end, shot.hit and not is_terrain(shot.target_id))
+            )
         return shot
 
     def look_from(
@@ -407,11 +505,14 @@ def run_trial(
     """
     bridge.author_targets(specs)
     body, targets = bridge.read_scene()
-    if not targets:
+    # Terrain rides in the same list for the RESOLVER, but only spheres are
+    # things to aim at -- a trial that "aims" at the ground proves nothing.
+    spheres = [t for t in targets if isinstance(t, SphereTarget)]
+    if not spheres:
         raise RuntimeError("no targets on the stage after authoring")
 
     primary = min(
-        targets,
+        spheres,
         key=lambda t: (t.east_m - body.east_m) ** 2 + (t.north_m - body.north_m) ** 2,
     )
     aimed_mount = aim_at(body, primary, bridge.mount)
@@ -442,7 +543,16 @@ def run_trial(
         },
         "targets": [
             {"id": t.target_id, "pos": [t.east_m, t.north_m, t.up_m], "radius": t.radius_m}
+            for t in spheres
+        ],
+        "terrain": [
+            {
+                "id": t.target_id,
+                "min": [t.min_east_m, t.min_north_m, t.min_up_m],
+                "max": [t.max_east_m, t.max_north_m, t.max_up_m],
+            }
             for t in targets
+            if isinstance(t, BoxTarget)
         ],
         "aimed": aimed.to_dict(),
         "control": control.to_dict(),
@@ -457,12 +567,22 @@ def grade_trial(aimed: ShotResult, control: ShotResult, expected_id: str) -> dic
     target it was aimed at (hitting SOMETHING is not aiming), and the control
     round must miss -- otherwise the ray is not discriminating and the hit
     carries no information.
+
+    A round that stopped in TERRAIN hit the ground, not a target: for grading
+    it counts as a miss (the expected fate of most control rounds now that the
+    ground is solid), and the verdict records the terrain stop separately so
+    the tracer geometry stays auditable.
     """
     hit_expected = bool(aimed.hit and aimed.target_id == expected_id)
-    discriminates = bool(aimed.hit and not control.hit)
+    aimed_hit_target = bool(aimed.hit and not is_terrain(aimed.target_id))
+    control_hit_target = bool(control.hit and not is_terrain(control.target_id))
+    discriminates = bool(aimed_hit_target and not control_hit_target)
     return {
         "hit_intended_target": hit_expected,
-        "control_missed": not control.hit,
+        "control_missed": not control_hit_target,
+        "control_stopped_by_terrain": bool(
+            control.hit and is_terrain(control.target_id)
+        ),
         "discriminates": discriminates,
         "pass": hit_expected and discriminates,
         "aimed_range_m": aimed.range_m,

@@ -3,11 +3,19 @@
 # Licensed under AGPL-3.0 — see LICENSE for details.
 """Fire mechanic (capability 6) — pure math + protocol, NO Isaac, NO GPU.
 
-The turret muzzle pose, aim vector, and ray-sphere hit test are pure
-functions in ``isaac_quadruped_server.py``; the {cmd: "fire"} handler runs
-entirely over SharedBody. Everything here executes under plain python3 —
+The turret muzzle pose, aim vector, and ray-sphere/ray-box hit tests are
+pure functions in ``isaac_quadruped_server.py``; the {cmd: "fire"} handler
+runs entirely over SharedBody. Everything here executes under plain python3 —
 the guarded Isaac path (spawning /World/Targets spheres and republishing
 their stage poses) feeds the SAME ray_hit tested here.
+
+TERRAIN: the ground is a registered box target, so a round aimed below the
+horizon terminates at z = 0 instead of flying to max range underneath the
+world (the live control tracer was visibly occluded below the slab before
+this).  The helpers mirror ``tritium_lib.geo.hitscan`` op for op — the
+contract tests at the bottom hold the two copies together bit-exactly, and
+skip only where tritium_lib is absent (which is precisely the Isaac-python
+case the duplication exists for).
 """
 
 from __future__ import annotations
@@ -15,6 +23,8 @@ from __future__ import annotations
 import importlib.util
 import math
 from pathlib import Path
+
+import pytest
 
 _CONN = Path(__file__).resolve().parents[1] / "isaac_sim_addon" / "connectors"
 
@@ -252,3 +262,310 @@ def test_fire_path_never_imports_isaac(monkeypatch):
     shared = _armed_shared(mod)
     r = mod.handle_request({"cmd": "fire"}, shared)
     assert r["hit"] is True
+
+
+# -- ray_box: the slab method, with its notorious edges --------------------
+
+_GROUND_LO = (-1000.0, -1000.0, -100.0)
+_GROUND_HI = (1000.0, 1000.0, 0.0)
+
+
+def test_ray_box_hits_the_near_face():
+    mod = _srv()
+    t = mod.ray_box((0.0, 0.0, 1.0), (0.0, 1.0, 0.0),
+                    (-1.0, 5.0, 0.0), (1.0, 7.0, 2.0))
+    assert t is not None and abs(t - 5.0) < 1e-12  # near face, not the centre
+
+
+def test_ray_box_misses_a_box_behind_the_muzzle():
+    mod = _srv()
+    assert mod.ray_box((0.0, 10.0, 1.0), (0.0, 1.0, 0.0),
+                       (-1.0, 5.0, 0.0), (1.0, 7.0, 2.0)) is None
+
+
+def test_ray_box_down_into_the_ground_stops_at_the_top_face():
+    mod = _srv()
+    down45 = (0.0, math.sqrt(0.5), -math.sqrt(0.5))
+    t = mod.ray_box((0.0, 0.0, 1.0), down45, _GROUND_LO, _GROUND_HI)
+    assert t is not None and abs(t - math.sqrt(2.0)) < 1e-9
+
+
+def test_ray_box_parallel_above_the_slab_misses():
+    """Level fire above the ground: aim z is EXACTLY 0.0 (sin(0)), so the
+    naive slab method divides by zero here. The explicit parallel branch
+    decides by position: origin above the top face -> miss."""
+    mod = _srv()
+    assert mod.ray_box((0.0, 0.0, 0.55), (0.0, 1.0, 0.0),
+                       _GROUND_LO, _GROUND_HI) is None
+
+
+def test_ray_box_origin_exactly_on_the_plane_is_not_nan():
+    """The exact-boundary 0/0 case mutation testing found: origin ON the top
+    face, ray parallel to it. Naive: (0 - 0) / 0 = NaN, every comparison
+    false, verdict garbage. The branch decides by position: on the plane is
+    within the slab, so the other axes decide -- a grazing contact at 0."""
+    mod = _srv()
+    t = mod.ray_box((0.0, 0.0, 0.0), (0.0, 1.0, 0.0), _GROUND_LO, _GROUND_HI)
+    assert t == 0.0
+    assert not math.isnan(t)
+
+
+def test_ray_box_origin_inside_reports_point_blank_zero():
+    mod = _srv()
+    t = mod.ray_box((0.0, 0.0, -0.5), (0.0, 1.0, 0.0), _GROUND_LO, _GROUND_HI)
+    assert t == 0.0  # inside the box: contact, never a negative range
+
+
+def test_ray_box_parallel_below_the_slab_misses():
+    mod = _srv()
+    assert mod.ray_box((0.0, 0.0, -200.0), (0.0, 1.0, 0.0),
+                       _GROUND_LO, _GROUND_HI) is None
+
+
+def test_ray_box_rejects_inverted_bounds_and_degenerate_aim():
+    mod = _srv()
+    with pytest.raises(ValueError):
+        mod.ray_box((0.0, 0.0, 0.0), (0.0, 1.0, 0.0),
+                    (1.0, 1.0, 1.0), (-1.0, -1.0, -1.0))
+    with pytest.raises(ValueError):
+        mod.ray_box((0.0, 0.0, 0.0), (0.0, 0.0, 0.0),
+                    (-1.0, -1.0, -1.0), (1.0, 1.0, 1.0))
+
+
+def test_ray_sphere_point_blank_inside_is_a_contact_hit():
+    """Muzzle INSIDE the target: contact shot at range 0 (lib semantics).
+    The old inline gate (tca < 0 -> skip) wrongly refused it when the centre
+    sat behind the muzzle."""
+    mod = _srv()
+    assert mod.ray_sphere_t((0.0, 0.0, 1.0), (0.0, 1.0, 0.0),
+                            (0.0, -0.2, 1.0), 1.0) == 0.0
+
+
+# -- mixed sphere + box resolution: nearest hit wins -----------------------
+
+def test_ray_hit_nearest_across_mixed_sphere_and_box():
+    mod = _srv()
+    targets = [
+        {"id": "sphere", "x": 0.0, "y": 10.0, "z": 1.0, "radius": 1.0},
+        {"id": "box", "min": [-1.0, 4.0, 0.0], "max": [1.0, 5.0, 2.0]},
+    ]
+    hit = mod.ray_hit((0.0, 0.0, 1.0), (0.0, 1.0, 0.0), targets)
+    assert hit is not None and hit["target_id"] == "box"
+    assert abs(hit["range"] - 4.0) < 1e-9
+    # List order must not matter: nearest wins, not first-listed.
+    hit = mod.ray_hit((0.0, 0.0, 1.0), (0.0, 1.0, 0.0), list(reversed(targets)))
+    assert hit is not None and hit["target_id"] == "box"
+
+
+def test_ray_hit_sphere_wins_when_it_is_the_nearer_one():
+    mod = _srv()
+    hit = mod.ray_hit((0.0, 0.0, 1.0), (0.0, 1.0, 0.0), [
+        {"id": "s", "x": 0.0, "y": 2.0, "z": 1.0, "radius": 0.5},
+        {"id": "b", "min": [-1.0, 4.0, 0.0], "max": [1.0, 5.0, 2.0]},
+    ])
+    assert hit is not None and hit["target_id"] == "s"
+    assert abs(hit["range"] - 1.5) < 1e-9
+
+
+def test_ray_hit_malformed_box_is_skipped_not_fatal():
+    mod = _srv()
+    hit = mod.ray_hit((0.0, 0.0, 1.0), (0.0, 1.0, 0.0), [
+        {"id": "junk_box", "min": [0.0, 5.0], "max": [4.0, 6.0, 2.0]},
+        {"id": "inverted", "min": [1.0, 9.0, 2.0], "max": [-1.0, 8.0, 0.0]},
+        {"id": "ok", "x": 0.0, "y": 5.0, "z": 1.0, "radius": 0.5},
+    ])
+    assert hit is not None and hit["target_id"] == "ok"
+
+
+# -- terrain: the round stops at the ground --------------------------------
+
+def test_fire_stops_at_terrain_before_a_target_behind_it():
+    """A shot at a target buried BEYOND the ground plane hits the TERRAIN."""
+    mod = _srv()
+    shared = mod.SharedBody()
+    with shared.lock:
+        shared.state = dict(shared.state, x=0.0, y=0.0, heading=0.0)
+    mod.handle_request({"cmd": "targets", "targets": [
+        {"id": "buried", "x": 0.0, "y": 3.0, "z": -2.0, "radius": 0.6}]},
+        shared)
+    mod.handle_request({"cmd": "turret", "pan": 0.0, "tilt": -45.0}, shared)
+    r = mod.handle_request({"cmd": "fire"}, shared)
+    assert r["hit"] is True and r["terrain"] is True
+    assert r["target_id"] == mod.GROUND_TARGET["id"]
+    assert abs(r["hit_pos"][2]) < 1e-3          # stopped AT the ground plane
+    # The same ray WITHOUT the ground reaches the buried plate — terrain is
+    # what stopped the round, not a bad aim.
+    with shared.lock:
+        spheres_only = list(shared.targets)
+    direct = mod.ray_hit(tuple(r["origin"]), tuple(r["aim"]), spheres_only)
+    assert direct is not None and direct["target_id"] == "buried"
+
+
+def test_fire_with_clear_line_of_sight_still_hits_over_the_ground():
+    """The ground being solid must not eat a legitimate shot above it."""
+    mod = _srv()
+    shared = _armed_shared(mod)                # plate 20 m north, level fire
+    r = mod.handle_request({"cmd": "fire"}, shared)
+    assert r["hit"] is True and r["target_id"] == "plate"
+    assert r["terrain"] is False
+
+
+def test_targets_replace_never_deletes_the_ground():
+    """{cmd: "targets"} rewrites the target list wholesale — the terrain
+    must survive it (in Isaac mode the per-step republish does the same
+    rewrite 60 times a second)."""
+    mod = _srv()
+    shared = mod.SharedBody()
+    mod.handle_request({"cmd": "targets", "targets": []}, shared)
+    mod.handle_request({"cmd": "turret", "pan": 0.0, "tilt": -30.0}, shared)
+    r = mod.handle_request({"cmd": "fire"}, shared)
+    assert r["hit"] is True and r["terrain"] is True
+
+
+def test_targets_cmd_accepts_box_entries():
+    mod = _srv()
+    shared = mod.SharedBody()
+    r = mod.handle_request({"cmd": "targets", "targets": [
+        {"id": "wall", "min": [0.0, 5.0, 0.0], "max": [4.0, 6.0, 2.0]},
+        {"id": "s", "x": 1.0, "y": 2.0}]}, shared)
+    assert r == {"ok": True, "count": 2}
+    with shared.lock:
+        assert shared.targets[0] == {"id": "wall", "min": [0.0, 5.0, 0.0],
+                                     "max": [4.0, 6.0, 2.0]}
+    r = mod.handle_request({"cmd": "targets", "targets": [
+        {"id": "bad", "min": [0.0, 5.0], "max": [4.0, 6.0, 2.0]}]}, shared)
+    assert r["ok"] is False
+    r = mod.handle_request({"cmd": "targets", "targets": [
+        {"id": "bad", "min": [5.0, 5.0, 5.0], "max": [0.0, 0.0, 0.0]}]},
+        shared)
+    assert r["ok"] is False
+
+
+# -- CONTRACT: the connector's math must equal tritium_lib.geo.hitscan -----
+#
+# The helpers are duplicated on purpose — connectors run in Isaac's python
+# and stay tritium-free (see test_no_gpu.test_connectors_do_not_import_tritium)
+# — so these are the tests that stop the two copies drifting. They compare
+# EXACTLY (==, not approx): the implementations mirror each other op for op,
+# so any inequality is a semantic divergence, not float noise. Skipped where
+# tritium_lib is absent, which is precisely the Isaac-python case.
+
+def test_ray_box_matches_lib_ray_aabb_exactly():
+    lib = pytest.importorskip("tritium_lib.geo.hitscan")
+    mod = _srv()
+    cases = [
+        # square hit on a near face
+        ((0.0, 0.0, 1.0), (0.0, 1.0, 0.0), (-1.0, 5.0, -1.0), (1.0, 9.0, 1.0)),
+        # down into the ground
+        ((0.0, 0.0, 1.0), (0.0, math.sqrt(0.5), -math.sqrt(0.5)),
+         _GROUND_LO, _GROUND_HI),
+        # level above the slab: parallel outside
+        ((0.0, 0.0, 0.55), (0.0, 1.0, 0.0), _GROUND_LO, _GROUND_HI),
+        # origin exactly ON the top plane: the 0/0 boundary
+        ((0.0, 0.0, 0.0), (0.0, 1.0, 0.0), _GROUND_LO, _GROUND_HI),
+        # inside the slab
+        ((0.0, 0.0, -0.5), (0.0, 1.0, 0.0), _GROUND_LO, _GROUND_HI),
+        # box behind the muzzle
+        ((0.0, 10.0, 1.0), (0.0, 1.0, 0.0), (-1.0, 5.0, 0.0), (1.0, 7.0, 2.0)),
+        # non-unit direction (both must normalise identically)
+        ((0.0, 0.0, 1.0), (0.3, 2.0, -0.4), _GROUND_LO, _GROUND_HI),
+        # oblique diagonal
+        ((5.0, 5.0, 5.0), (-1.0, -1.0, -1.0), (-1.0, -1.0, -1.0), (1.0, 1.0, 1.0)),
+        # grazing along an edge
+        ((-1.0, 0.0, 2.0), (0.0, 1.0, 0.0), (-1.0, 5.0, 0.0), (1.0, 7.0, 2.0)),
+    ]
+    for origin, direction, lo, hi in cases:
+        assert mod.ray_box(origin, direction, lo, hi) == \
+            lib.ray_aabb(origin, direction, lo, hi), (origin, direction, lo, hi)
+
+
+def test_ray_box_error_semantics_match_lib():
+    lib = pytest.importorskip("tritium_lib.geo.hitscan")
+    mod = _srv()
+    for fn in (mod.ray_box, lib.ray_aabb):
+        with pytest.raises(ValueError):
+            fn((0.0, 0.0, 0.0), (0.0, 0.0, 0.0),
+               (-1.0, -1.0, -1.0), (1.0, 1.0, 1.0))     # degenerate direction
+        with pytest.raises(ValueError):
+            fn((0.0, 0.0, 0.0), (0.0, 1.0, 0.0),
+               (1.0, 1.0, 1.0), (-1.0, -1.0, -1.0))     # inverted bounds
+
+
+def test_ray_sphere_matches_lib_exactly():
+    lib = pytest.importorskip("tritium_lib.geo.hitscan")
+    mod = _srv()
+    cases = [
+        ((0.0, 0.0, 1.0), (0.0, 1.0, 0.0), (0.0, 10.0, 1.0), 1.0),   # hit
+        ((0.0, 0.0, 1.0), (0.0, 1.0, 0.0), (5.0, 10.0, 1.0), 1.0),   # wide
+        ((0.0, 0.0, 1.0), (0.0, 1.0, 0.0), (0.0, -5.0, 1.0), 1.0),   # behind
+        ((0.0, 0.0, 1.0), (0.0, 1.0, 0.0), (0.0, 0.2, 1.0), 1.0),    # inside
+        ((0.0, 0.0, 1.0), (0.0, 1.0, 0.0), (0.0, -0.2, 1.0), 1.0),   # inside,
+        # centre behind -- the case the old tca<0 gate got wrong
+        ((0.0, 0.0, 1.0), (0.5, 2.0, 0.1), (1.0, 8.0, 1.4), 0.9),    # oblique
+        ((0.0, 0.0, 1.0), (0.0, 1.0, 0.0), (0.5, 10.0, 1.0), 0.5),   # graze
+    ]
+    for origin, d, c, r in cases:
+        assert mod.ray_sphere_t(origin, d, c, r) == \
+            lib.ray_sphere(origin, d, c, r), (origin, d, c, r)
+
+
+def test_ray_hit_matches_lib_resolve_shot_across_mixed_targets():
+    """The full resolver: same winner, same range, same impact — including
+    the range gate, which the two apply differently in code but provably
+    identically in outcome (the winner is the global minimum, so no farther
+    candidate can pass a gate the minimum fails)."""
+    lib = pytest.importorskip("tritium_lib.geo.hitscan")
+    mod = _srv()
+
+    spheres = [
+        ("s_near", (1.4, 3.0, 0.4), 0.5),
+        ("s_far", (2.6, 8.5, 0.3), 0.6),
+        ("s_wide", (-8.0, 2.0, 0.5), 0.4),
+    ]
+    boxes = [
+        ("wall", (-0.5, 5.0, -1.0), (4.0, 5.4, 2.0)),
+        ("terrain_ground", _GROUND_LO, _GROUND_HI),
+    ]
+    dict_targets = (
+        [{"id": i, "x": c[0], "y": c[1], "z": c[2], "radius": r}
+         for i, c, r in spheres]
+        + [{"id": i, "min": list(lo), "max": list(hi)} for i, lo, hi in boxes]
+    )
+    lib_targets = (
+        [lib.SphereTarget(i, c[0], c[1], c[2], r) for i, c, r in spheres]
+        + [lib.BoxTarget(i, *lo, *hi) for i, lo, hi in boxes]
+    )
+
+    muzzles = [
+        # sphere winner, wall winner, terrain winner, clear-air miss, upward
+        lib.Muzzle(0.45, -1.2, 0.55, 14.0, -9.0),
+        lib.Muzzle(0.0, 0.0, 0.55, 20.0, 0.0),
+        lib.Muzzle(0.0, 0.0, 0.55, 180.0, -30.0),
+        lib.Muzzle(0.0, 0.0, 0.55, 270.0, 10.0),
+        lib.Muzzle(0.0, 0.0, 0.55, 0.0, 45.0),
+    ]
+    for muzzle in muzzles:
+        origin, aim = muzzle.origin(), muzzle.direction()
+        got = mod.ray_hit(origin, aim, dict_targets, max_range=60.0)
+        want = lib.resolve_shot(muzzle, lib_targets, 60.0)
+        assert (got is not None) == want.hit, muzzle
+        if want.hit:
+            assert got["target_id"] == want.target_id, muzzle
+            assert got["range"] == want.range_m, muzzle
+            assert tuple(got["hit_pos"]) == want.impact(), muzzle
+
+
+def test_ray_hit_range_gate_matches_lib_at_the_boundary():
+    """A hit at EXACTLY max_range counts, in both implementations."""
+    lib = pytest.importorskip("tritium_lib.geo.hitscan")
+    mod = _srv()
+    muzzle = lib.Muzzle(0.0, 0.0, 1.0, 0.0, 0.0)
+    tgt = {"id": "edge", "x": 0.0, "y": 51.0, "z": 1.0, "radius": 1.0}
+    lib_tgt = lib.SphereTarget("edge", 0.0, 51.0, 1.0, 1.0)
+    origin, aim = muzzle.origin(), muzzle.direction()
+    # Surface at exactly 50 m.
+    assert mod.ray_hit(origin, aim, [tgt], max_range=50.0) is not None
+    assert lib.resolve_shot(muzzle, [lib_tgt], 50.0).hit is True
+    # One metre short of reaching it: both refuse.
+    assert mod.ray_hit(origin, aim, [tgt], max_range=49.0) is None
+    assert lib.resolve_shot(muzzle, [lib_tgt], 49.0).hit is False
