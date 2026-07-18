@@ -277,36 +277,81 @@ class IsaacPoseBridge:
 # SC ingest
 # ---------------------------------------------------------------------------
 
-# THE MISSING SEAM (measured 2026-07-18, not speculated).
+# THE SEAM, NOW OPEN (2026-07-18).
 #
-# There is currently NO Command Center route that accepts an externally-driven
-# body pose.  This was checked against the running SC source, not assumed:
+# This block used to document a measured DEAD END: no Command Center route
+# accepted an externally-driven body pose.  ``GET /api/targets`` was read-only,
+# ``POST /api/robots`` spawned virtual robots that integrate their OWN motion,
+# and ``POST /api/sighting`` dispatched only ble / yolo / wifi / mesh, returning
+# **501 Not Implemented** for anything else -- a deliberate closed door.  So the
+# bridge stopped at a converted payload rather than POST to a route that 404s.
 #
-#   * ``GET  /api/targets``            read-only; no matching POST/PUT.
-#   * ``POST /api/sighting``           dispatches on ``source`` and supports
-#                                      only ble / yolo / wifi / mesh.  Any
-#                                      other source -- including ``isaac_sim``
-#                                      -- returns **501 Not Implemented** by
-#                                      design (targets_unified.py), so this is
-#                                      a deliberate closed door, not an
-#                                      oversight we could sneak through.
-#   * ``POST /api/robots``             spawns VIRTUAL robots that integrate
-#                                      their own motion via dispatch/patrol.
-#                                      There is no "set pose from external
-#                                      ground truth" entry point.
-#
-# So the last mile of capability 2 is blocked on an SC-side ingest seam, NOT on
-# anything Isaac-side.  Everything above this line is verified working against
-# a live Isaac; deliberately nothing below it pretends to complete the loop.
-#
-# Rather than ship a call to a route that 404s (which would look like progress
-# and silently do nothing), this bridge stops at a correct, converted,
-# TrackedTarget-shaped payload.  ``--emit`` prints exactly what an ingest route
-# should receive, so the SC seam can be written against a real sample.
-#
-# NEXT BUILD: a source-agnostic pose ingest -- most naturally by teaching
-# ``POST /api/sighting`` a ``robot_pose`` source that routes into
-# ``TargetTracker`` the way ble/yolo/wifi/mesh already do.
+# That door is now open.  ``POST /api/sighting {"source": "robot_pose", ...}``
+# routes into ``TargetTracker.update_from_robot_pose`` -- the first ingest that
+# models a BODY reporting its own pose rather than a sensor observing something
+# else, so the heading arrives directly instead of being inferred from motion.
+# ``--sc`` streams live Isaac poses straight onto the operator's tactical map.
+
+DEFAULT_SC_URL = "http://127.0.0.1:8000"
+
+# ``source`` for the SC dispatch is the MODALITY (which ingest path handles it),
+# not the provenance.  Provenance is carried alongside in ``origin`` so a fused
+# picture can still tell a simulated contact from a radio one.
+SIGHTING_SOURCE = "robot_pose"
+
+
+def target_to_sighting(
+    target: Mapping[str, Any],
+    *,
+    asset_type: str = "quadruped",
+    name: str | None = None,
+    ground_truth: bool = True,
+) -> dict[str, Any]:
+    """Shape a converted pose as a ``POST /api/sighting`` body.
+
+    ``ground_truth`` defaults True because an Isaac stage pose IS exact -- it
+    is read from the simulator's own transform, not estimated.  The tracker
+    uses that to skip the spoof/teleport integrity gate, which would otherwise
+    raise a permanent false alarm on the one track known to be correct.
+    """
+    tid = str(target["target_id"])
+    return {
+        "source": SIGHTING_SOURCE,
+        "origin": target.get("source", "isaac_sim"),
+        "target_id": tid,
+        "name": name or tid,
+        "asset_type": asset_type,
+        "alliance": target.get("alliance", "friendly"),
+        "position": {"x": float(target["x"]), "y": float(target["y"])},
+        "heading": float(target["heading"]),
+        "ground_truth": ground_truth,
+        "timestamp": target.get("timestamp"),
+    }
+
+
+def post_sighting(
+    sighting: Mapping[str, Any],
+    *,
+    sc_url: str = DEFAULT_SC_URL,
+    timeout: float = 5.0,
+    opener=None,
+) -> dict[str, Any]:
+    """POST one sighting to the Command Center.
+
+    ``opener`` is the injection seam for tests -- ``(url, data, timeout)`` ->
+    response bytes -- so the whole convert->post path runs with no network.
+    """
+    url = sc_url.rstrip("/") + "/api/sighting"
+    data = json.dumps(dict(sighting)).encode("utf-8")
+    if opener is not None:
+        raw = opener(url, data, timeout)
+    else:
+        req = urllib.request.Request(
+            url, data=data, headers={"Content-Type": "application/json"}
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+            raw = resp.read()
+    return json.loads(raw.decode("utf-8"))
 
 
 # ---------------------------------------------------------------------------
@@ -381,6 +426,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     ap.add_argument("--emit", action="store_true",
                     help="print the full TrackedTarget JSON per tick (the payload an "
                          "SC ingest seam should accept -- see THE MISSING SEAM above)")
+    ap.add_argument("--sc", nargs="?", const=DEFAULT_SC_URL, default=None,
+                    metavar="URL",
+                    help="POST each pose to the Command Center's "
+                         "/api/sighting robot_pose ingest so the body appears "
+                         f"on the tactical map (default {DEFAULT_SC_URL})")
+    ap.add_argument("--asset-type", default="quadruped",
+                    help="asset_type reported to SC (quadruped/rover/aerial)")
     ap.add_argument("--target-id", default=DEFAULT_TARGET_ID)
     ap.add_argument("--hz", type=float, default=4.0, help="pose poll rate")
     ap.add_argument("--duration", type=float, default=0.0, help="seconds to stream (0 = forever)")
@@ -418,12 +470,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     while True:
         try:
             target = bridge.read_target(args.target_id)
+            posted = ""
+            if args.sc:
+                sighting = target_to_sighting(target, asset_type=args.asset_type)
+                try:
+                    reply = post_sighting(sighting, sc_url=args.sc)
+                    posted = f" -> sc:{reply.get('status', '?')}"
+                except (OSError, ValueError) as exc:
+                    posted = f" -> sc:ERR {type(exc).__name__}"
             if args.emit:
                 print(json.dumps(target), flush=True)
             else:
                 print(f"[{target['timestamp']:.1f}] x={target['x']:8.2f} "
                       f"y={target['y']:8.2f} z={target['z']:6.2f} "
-                      f"hdg={target['heading']:6.1f}", flush=True)
+                      f"hdg={target['heading']:6.1f}{posted}", flush=True)
         except (ConnectionError, LookupError, OSError) as exc:
             print(f"[pose] {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
         if args.duration and (time.time() - started) >= args.duration:

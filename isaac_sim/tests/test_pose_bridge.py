@@ -16,6 +16,7 @@ at (0, 0) on the operator's map is worse than a body missing from it.
 
 from __future__ import annotations
 
+import json
 import math
 import sys
 from pathlib import Path
@@ -26,6 +27,7 @@ sys.path.insert(
     0, str(Path(__file__).resolve().parents[1] / "isaac_sim_addon" / "clients")
 )
 
+import pose_bridge  # noqa: E402
 from pose_bridge import (  # noqa: E402
     IsaacPoseBridge,
     StagePose,
@@ -214,3 +216,59 @@ def test_does_not_post_to_a_nonexistent_sc_route():
         / "isaac_sim_addon" / "clients" / "pose_bridge.py"
     ).read_text()
     assert "/api/targets/update" not in src
+
+
+# ---------------------------------------------------------------------------
+# SC ingest — the seam that was missing until 2026-07-18
+# ---------------------------------------------------------------------------
+
+def test_target_to_sighting_shapes_the_robot_pose_ingest():
+    """Dispatch source is the MODALITY; provenance rides along in ``origin``."""
+    bridge = _bridge(_stage_reply((10.0, 20.0, 0.4), _yaw_quat(0)))
+    sighting = pose_bridge.target_to_sighting(bridge.read_target("go2_01"))
+
+    assert sighting["source"] == "robot_pose"      # what SC dispatches on
+    assert sighting["origin"] == "isaac_sim"       # what actually produced it
+    assert sighting["target_id"] == "go2_01"
+    assert sighting["position"] == {"x": 10.0, "y": 20.0}
+    assert sighting["heading"] == 90.0             # Isaac yaw 0 == east
+    assert sighting["ground_truth"] is True        # a stage pose IS exact
+    assert sighting["asset_type"] == "quadruped"
+
+
+def test_post_sighting_hits_the_sighting_route_with_json():
+    seen = {}
+
+    def opener(url, data, timeout):
+        seen["url"] = url
+        seen["body"] = json.loads(data.decode("utf-8"))
+        return b'{"status": "accepted", "source": "robot_pose"}'
+
+    reply = pose_bridge.post_sighting(
+        {"source": "robot_pose", "target_id": "go2_01"},
+        sc_url="http://sc.example:8000/",
+        opener=opener,
+    )
+
+    assert seen["url"] == "http://sc.example:8000/api/sighting"
+    assert seen["body"]["source"] == "robot_pose"
+    assert reply["status"] == "accepted"
+
+
+def test_full_stage_to_sc_path_runs_offline():
+    """Read a fake stage, convert, shape, post — no Isaac, no GPU, no network."""
+    posted = []
+
+    def opener(url, data, timeout):
+        posted.append(json.loads(data.decode("utf-8")))
+        return b'{"status": "accepted"}'
+
+    bridge = _bridge(_stage_reply((-3.5, 21.0, 0.45), _yaw_quat(180.0)))
+    pose_bridge.post_sighting(
+        pose_bridge.target_to_sighting(bridge.read_target("go2_01")),
+        opener=opener,
+    )
+
+    assert len(posted) == 1
+    assert posted[0]["position"] == {"x": -3.5, "y": 21.0}
+    assert posted[0]["heading"] == 270.0  # Isaac yaw 180 (west) == heading 270
