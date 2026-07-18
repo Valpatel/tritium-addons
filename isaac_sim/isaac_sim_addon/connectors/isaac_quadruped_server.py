@@ -212,6 +212,95 @@ class GaitIntegrator:
         return 0.0 if self.gait == "stand" else GAIT_DEFAULTS[self.gait]["stride_hz"]
 
 
+# ----- Fire contract (pure math — no Isaac, unit-tested in tests/) -------
+#
+# Turret frames: pan is degrees CLOCKWISE from the body's forward direction
+# (compass-style, matching heading: body facing north + pan 90 = aim east),
+# tilt is degrees above the horizon. The muzzle sits on a turret pivot
+# mounted forward/up on the torso; the barrel extends along the aim vector.
+
+TURRET_MOUNT_OFFSET = (0.25, 0.0, 0.55)  # (forward, left, up) m in body frame
+BARREL_LENGTH_M = 0.20                   # pivot -> muzzle tip along aim
+MAGAZINE_SIZE = 30                       # shots per boot (no reload cmd yet)
+FIRE_MAX_RANGE_M = 60.0                  # ray is clipped past this
+
+
+def muzzle_pose(body_x: float, body_y: float, body_heading: float,
+                turret_pan: float, turret_tilt: float,
+                mount_offset: tuple[float, float, float] = TURRET_MOUNT_OFFSET,
+                barrel_len: float = BARREL_LENGTH_M,
+                ) -> tuple[tuple[float, float, float],
+                           tuple[float, float, float]]:
+    """World-frame muzzle origin + unit aim vector from body pose + turret.
+
+    Tritium frame: x=east, y=north, z=up, heading 0 = north, clockwise.
+    The mount offset rotates with the BODY heading (it is bolted to the
+    torso); the barrel rotates with body heading + pan and pitches by tilt.
+    """
+    h = math.radians(body_heading % 360.0)
+    fx, fy = math.sin(h), math.cos(h)        # body forward in world
+    lx, ly = -math.cos(h), math.sin(h)       # body left in world
+    fwd, left, up = mount_offset
+    pivot = (body_x + fwd * fx + left * lx,
+             body_y + fwd * fy + left * ly,
+             up)
+    azim = math.radians((body_heading + turret_pan) % 360.0)
+    tilt = math.radians(turret_tilt)
+    ct = math.cos(tilt)
+    aim = (math.sin(azim) * ct, math.cos(azim) * ct, math.sin(tilt))
+    origin = (pivot[0] + aim[0] * barrel_len,
+              pivot[1] + aim[1] * barrel_len,
+              pivot[2] + aim[2] * barrel_len)
+    return origin, aim
+
+
+def ray_hit(origin: tuple[float, float, float],
+            aim: tuple[float, float, float],
+            targets: list[dict],
+            max_range: float = FIRE_MAX_RANGE_M) -> dict | None:
+    """Closest sphere target the ray from ``origin`` along ``aim`` hits.
+
+    A target is ``{"id": str, "x": m, "y": m, "z": m, "radius": m}`` (z
+    defaults 0, radius defaults 0.5). Classic ray-sphere test: targets
+    behind the muzzle or beyond ``max_range`` never hit; among hits the
+    SMALLEST ray distance wins (you cannot shoot through the front target).
+
+    Returns ``{"target_id", "range", "hit_pos": [x, y, z]}`` or ``None``.
+    Pure and deterministic — the same helper serves the no-Isaac path and
+    the live-stage path (which feeds it poses read back from the sim).
+    """
+    ox, oy, oz = origin
+    best: dict | None = None
+    for tgt in targets:
+        try:
+            cx = float(tgt["x"])
+            cy = float(tgt["y"])
+            cz = float(tgt.get("z", 0.0))
+            radius = float(tgt.get("radius", 0.5))
+        except (KeyError, TypeError, ValueError):
+            continue  # malformed target: skip, never sink the shot
+        vx, vy, vz = cx - ox, cy - oy, cz - oz
+        tca = vx * aim[0] + vy * aim[1] + vz * aim[2]
+        if tca < 0.0:
+            continue  # center behind the muzzle
+        d2 = (vx * vx + vy * vy + vz * vz) - tca * tca
+        r2 = radius * radius
+        if d2 > r2:
+            continue  # ray passes wide
+        t_hit = max(0.0, tca - math.sqrt(r2 - d2))
+        if t_hit > max_range:
+            continue
+        if best is None or t_hit < best["range"]:
+            best = {
+                "target_id": tgt.get("id"),
+                "range": t_hit,
+                "hit_pos": [ox + aim[0] * t_hit,
+                            oy + aim[1] * t_hit,
+                            oz + aim[2] * t_hit],
+            }
+    return best
+
+
 class SharedBody:
     """Lock-protected seam between the TCP server threads and the sim thread.
 
@@ -228,6 +317,11 @@ class SharedBody:
         # Turret intent (stored + logged; a Go2 asset has no turret to drive)
         self.pan = 0.0
         self.tilt = 0.0
+        # Fire mechanic: sphere targets + remaining ammo. In Isaac mode the
+        # sim thread republishes target poses read from the stage each step;
+        # without Isaac the {cmd: "targets"} request seeds them directly.
+        self.targets: list[dict] = []
+        self.ammo = MAGAZINE_SIZE
         # Served state (written by sim thread after each step)
         self.sim_time = 0.0
         self.state: dict = {
@@ -248,7 +342,17 @@ def handle_request(obj: object, shared: SharedBody) -> dict:
                    sim_time, physics}
         twist  -> {"ok": true}   (left/right clamped to [-1, 1], stored)
         turret -> {"ok": true}   (pan/tilt stored + logged)
-        fire   -> {"ok": true}   (logged)
+        targets-> {"ok": true, "count": n}  (sphere target list replaced;
+                  in Isaac mode the sim thread overwrites it every step
+                  with poses read back from the stage)
+        fire   -> {"ok": true, "fired": bool, "hit": bool,
+                   "hit_pos": [x, y, z]|null, "target_id": str|null,
+                   "range": m|null, "origin": [x, y, z], "aim": [x, y, z],
+                   "ammo": n}  (+"reason": "out_of_ammo" when dry)
+                  Ray from the turret muzzle (muzzle_pose) against the
+                  current sphere targets (ray_hit); closest target wins.
+                  Superset of the original {"ok": true} — old brains that
+                  only check "ok" keep working.
     """
     if not isinstance(obj, dict):
         return {"ok": False, "error": "request is not a JSON object"}
@@ -284,9 +388,63 @@ def handle_request(obj: object, shared: SharedBody) -> dict:
             shared.tilt = tilt
         print(f"[ISAAC DOG] turret pan={pan:.1f} tilt={tilt:.1f}")
         return {"ok": True}
+    if cmd == "targets":
+        raw = obj.get("targets")
+        if not isinstance(raw, list):
+            return {"ok": False, "error": "targets must be a list"}
+        cleaned: list[dict] = []
+        for entry in raw:
+            if not isinstance(entry, dict):
+                return {"ok": False, "error": "each target must be an object"}
+            try:
+                cleaned.append({
+                    "id": str(entry.get("id", f"tgt_{len(cleaned)}")),
+                    "x": float(entry["x"]),
+                    "y": float(entry["y"]),
+                    "z": float(entry.get("z", 0.0)),
+                    "radius": float(entry.get("radius", 0.5)),
+                })
+            except (KeyError, TypeError, ValueError):
+                return {"ok": False,
+                        "error": "target x/y (and optional z/radius) "
+                                 "must be numbers"}
+        with shared.lock:
+            shared.targets = cleaned
+        return {"ok": True, "count": len(cleaned)}
     if cmd == "fire":
-        print("[ISAAC DOG] fire")
-        return {"ok": True}
+        with shared.lock:
+            if shared.ammo <= 0:
+                print("[ISAAC DOG] fire: out of ammo")
+                return {"ok": True, "fired": False, "hit": False,
+                        "hit_pos": None, "target_id": None, "range": None,
+                        "ammo": 0, "reason": "out_of_ammo"}
+            shared.ammo -= 1
+            ammo = shared.ammo
+            state = shared.state
+            body_x = float(state.get("x", 0.0))
+            body_y = float(state.get("y", 0.0))
+            heading = float(state.get("heading", 0.0))
+            pan, tilt = shared.pan, shared.tilt
+            targets = list(shared.targets)
+        origin, aim = muzzle_pose(body_x, body_y, heading, pan, tilt)
+        hit = ray_hit(origin, aim, targets)
+        if hit is not None:
+            print(f"[ISAAC DOG] fire: HIT {hit['target_id']} "
+                  f"at {hit['range']:.2f} m (ammo {ammo})")
+        else:
+            print(f"[ISAAC DOG] fire: miss (ammo {ammo})")
+        return {
+            "ok": True,
+            "fired": True,
+            "hit": hit is not None,
+            "hit_pos": ([round(v, 4) for v in hit["hit_pos"]]
+                        if hit else None),
+            "target_id": hit["target_id"] if hit else None,
+            "range": round(hit["range"], 3) if hit else None,
+            "origin": [round(v, 4) for v in origin],
+            "aim": [round(v, 6) for v in aim],
+            "ammo": ammo,
+        }
     return {"ok": False, "error": f"unknown cmd: {cmd!r}"}
 
 
@@ -561,6 +719,82 @@ def _build_procedural_dog() -> dict:
     return {"hips": hips, "hip_offsets": hip_offsets}
 
 
+# Practice-range targets spawned under /World/Targets in Isaac mode. Real
+# rigid spheres — they sit on the ground under actual physics (works under
+# Newton or PhysX; no engine-specific raycast API is assumed). The fire ray
+# is evaluated by the SAME pure ray_hit() the no-Isaac path uses, fed the
+# poses read BACK from the stage each step — so a target that physics moved
+# is hit where it actually is.
+_RANGE_TARGET_SPECS = (
+    {"id": "tgt_north", "pos": (0.0, 8.0, 0.4), "radius": 0.4},
+    {"id": "tgt_east", "pos": (8.0, 0.0, 0.4), "radius": 0.4},
+    {"id": "tgt_west", "pos": (-8.0, 3.0, 0.4), "radius": 0.4},
+)
+
+
+def _build_range_targets() -> dict[str, object]:
+    """GUARDED (isaacsim only): spawn the practice-range target spheres.
+
+    Returns {target_id: prim} for the main loop to read poses back from.
+    Dynamic (real rigid bodies) preferred; visual spheres as fallback so a
+    physics-API mismatch never sinks the server.
+    """
+    import numpy as np
+    from isaacsim.core.utils.prims import define_prim
+
+    define_prim("/World/Targets", "Xform")
+    prims: dict[str, object] = {}
+    for spec in _RANGE_TARGET_SPECS:
+        path = f"/World/Targets/{spec['id']}"
+        try:
+            from isaacsim.core.api.objects import DynamicSphere
+            prims[spec["id"]] = DynamicSphere(
+                prim_path=path,
+                name=spec["id"],
+                position=np.array(spec["pos"]),
+                radius=spec["radius"],
+                color=np.array([0.99, 0.93, 0.04]),  # tritium yellow
+            )
+        except Exception as e:
+            print(f"[ISAAC DOG] dynamic target failed ({spec['id']}): {e}; "
+                  f"using visual sphere")
+            from isaacsim.core.api.objects import VisualSphere
+            prims[spec["id"]] = VisualSphere(
+                prim_path=path,
+                name=spec["id"],
+                position=np.array(spec["pos"]),
+                radius=spec["radius"],
+                color=np.array([0.99, 0.93, 0.04]),
+            )
+    print(f"[ISAAC DOG] spawned {len(prims)} range targets under /World/Targets")
+    return prims
+
+
+def _sync_stage_targets(range_targets: dict[str, object],
+                        shared: SharedBody) -> None:
+    """GUARDED: republish live stage target poses for the fire ray.
+
+    Runs on the sim thread each step; overwrites shared.targets with the
+    poses physics actually produced. Radius comes from the spawn spec.
+    """
+    radius_by_id = {s["id"]: s["radius"] for s in _RANGE_TARGET_SPECS}
+    published: list[dict] = []
+    for tid, prim in range_targets.items():
+        try:
+            pos, _ = prim.get_world_pose()
+        except Exception:
+            continue  # prim mid-teardown: skip this tick
+        published.append({
+            "id": tid,
+            "x": float(pos[0]),
+            "y": float(pos[1]),
+            "z": float(pos[2]),
+            "radius": radius_by_id.get(tid, 0.4),
+        })
+    with shared.lock:
+        shared.targets = published
+
+
 def run_isaac(args: argparse.Namespace) -> int:
     """Boot Isaac headless, build the scene, and serve the body until stopped.
 
@@ -614,6 +848,12 @@ def run_isaac(args: argparse.Namespace) -> int:
                   "falling back to procedural")
     if asset_used == "procedural":
         dog_parts = _build_procedural_dog()
+
+    try:
+        range_targets = _build_range_targets()
+    except Exception as e:
+        print(f"[ISAAC DOG] range targets unavailable (non-fatal): {e}")
+        range_targets = {}
 
     world.reset()
     for _ in range(5):  # confirm the stage steps before claiming READY
@@ -711,6 +951,11 @@ def run_isaac(args: argparse.Namespace) -> int:
                 shared.state = state
                 shared.sim_time = float(world.current_time)
 
+            # 4b. Republish live target poses so {cmd: "fire"} rays hit the
+            #     spheres where physics actually put them.
+            if range_targets:
+                _sync_stage_targets(range_targets, shared)
+
             # 5. Real-time pacing: hold wall clock at physics_hz so a live
             #    brain client sees honest dynamics.
             next_tick += physics_dt
@@ -767,6 +1012,21 @@ def _selftest() -> int:
           footfalls("walk", 0.1) == ["FR", "RL", "RR"])
     check("stand all planted", footfalls("stand", 0.0) == list(_LEGS))
 
+    # --- fire mechanic: pure muzzle math + ray-sphere hit (no Isaac) ---
+    _, aim = muzzle_pose(0.0, 0.0, 0.0, 90.0, 0.0)
+    check("facing north, pan 90 aims east",
+          abs(aim[0] - 1.0) < 1e-9 and abs(aim[1]) < 1e-9 and abs(aim[2]) < 1e-9)
+    hit = ray_hit((0.0, 0.0, 1.0), (0.0, 1.0, 0.0),
+                  [{"id": "far", "x": 0.0, "y": 20.0, "z": 1.0, "radius": 1.0},
+                   {"id": "near", "x": 0.0, "y": 10.0, "z": 1.0, "radius": 1.0}])
+    check("ray picks the NEAREST target in path",
+          hit is not None and hit["target_id"] == "near"
+          and abs(hit["range"] - 9.0) < 1e-9)
+    check("ray misses targets behind the muzzle",
+          ray_hit((0.0, 0.0, 1.0), (0.0, 1.0, 0.0),
+                  [{"id": "b", "x": 0.0, "y": -5.0, "z": 1.0, "radius": 1.0}])
+          is None)
+
     # --- TCP loopback: protocol + sequential reconnect ---
     shared = SharedBody()
     with shared.lock:
@@ -809,10 +1069,27 @@ def _selftest() -> int:
     f2 = s2.makefile("r", encoding="utf-8")
     r = ask(f2, s2, {"cmd": "turret", "pan": 45.0, "tilt": -10.0})
     check("turret accepted on second connection", r.get("ok") is True)
-    r = ask(f2, s2, {"cmd": "fire"})
-    check("fire accepted", r.get("ok") is True)
     with shared.lock:
         check("turret stored", shared.pan == 45.0 and shared.tilt == -10.0)
+    # Fire: aim straight ahead (body at 2.5/7.5 heading 0 = north) at a
+    # plate 20 m downrange at muzzle height -> structured hit result.
+    ask(f2, s2, {"cmd": "turret", "pan": 0.0, "tilt": 0.0})
+    r = ask(f2, s2, {"cmd": "targets", "targets": [
+        {"id": "plate", "x": 2.5, "y": 27.5, "z": 0.55, "radius": 0.5}]})
+    check("targets accepted", r.get("ok") is True and r.get("count") == 1)
+    r = ask(f2, s2, {"cmd": "fire"})
+    check("fire hits the downrange plate",
+          r.get("ok") is True and r.get("fired") is True
+          and r.get("hit") is True and r.get("target_id") == "plate"
+          and r.get("hit_pos") is not None
+          and r.get("ammo") == MAGAZINE_SIZE - 1)
+    ask(f2, s2, {"cmd": "turret", "pan": 90.0, "tilt": 0.0})
+    r = ask(f2, s2, {"cmd": "fire"})
+    check("fire aimed away misses (fired, no hit)",
+          r.get("ok") is True and r.get("fired") is True
+          and r.get("hit") is False and r.get("hit_pos") is None
+          and r.get("target_id") is None
+          and r.get("ammo") == MAGAZINE_SIZE - 2)
     f2.close()
     s2.close()
 
