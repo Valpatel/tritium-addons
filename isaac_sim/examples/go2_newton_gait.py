@@ -581,9 +581,15 @@ if _TWIST:
 # drive.  This block only knows how to read a pose out of Newton.
 _ROUTE = __ROUTE_JSON__
 _FOLLOWER = None
+_YAW_LOOP = None
 _ROUTE_PTS = []
 if _ROUTE:
     from tritium_lib.control import PurePursuitFollower, TwistCommand, differential_stride
+    # Imported unconditionally, NOT inside the yaw_closed_loop branch below:
+    # the step callback measures the achieved yaw rate in BOTH arms (the
+    # open-loop arm records it for diagnosis without acting on it), so a
+    # conditional import here is a NameError that kills the control arm too.
+    from tritium_lib.control import yaw_rate_from_headings
     from tritium_lib.geo.isaac_frame import quat_to_yaw_deg
     _ROUTE_PTS = [(float(p[0]), float(p[1])) for p in _ROUTE["waypoints"]]
     _FOLLOWER = PurePursuitFollower(
@@ -600,6 +606,19 @@ if _ROUTE:
         nominal_mps=float(_ROUTE["nominal"]))
     state["follow"] = []
     state["arrived_at"] = None
+
+    # Inner rate loop.  The follower says WHERE to point; this says HOW HARD,
+    # by watching the yaw rate the body actually delivered and correcting the
+    # demand by the shortfall.  Without it the Go2 delivers ~12% of what is
+    # asked and the route ends short rather than wrong.
+    _YAW_LOOP = None
+    if _ROUTE.get("yaw_closed_loop"):
+        from tritium_lib.control import YawRateLoop
+        _YAW_LOOP = YawRateLoop(
+            kp=float(_ROUTE["yaw_kp"]), ki=float(_ROUTE["yaw_ki"]),
+            max_output_rps=float(_ROUTE["yaw_max"]))
+    state["yaw_prev"] = None
+    state["yaw_t_prev"] = None
 
 # Left legs are FL/RL, right are FR/RR -- read off LegPlacement.y > 0 rather
 # than hardcoded, so a body with a different naming scheme stays correct.
@@ -675,17 +694,40 @@ def _on_step(dt):
             # stabiliser below does -- get it wrong and the body chases a
             # heading rotated out from under it.
             qx, qy, qz, qw = (float(v) for v in root[0][3:7])
+            _hdg = math.radians(quat_to_yaw_deg((qw, qx, qy, qz)))
             _fs = _FOLLOWER.update(
-                (float(root[0][0]), float(root[0][1]),
-                 math.radians(quat_to_yaw_deg((qw, qx, qy, qz)))),
-                _ROUTE_PTS)
+                (float(root[0][0]), float(root[0][1]), _hdg), _ROUTE_PTS)
+
+            # Measure the yaw rate the body ACHIEVED over the last step,
+            # before deciding what to ask for next.  Measured from the root
+            # transform, never from the command -- a loop closed on its own
+            # output is not a loop.
+            _yaw_dt = 0.0
+            _yaw_meas = 0.0
+            if state["yaw_prev"] is not None:
+                _yaw_dt = elapsed - state["yaw_t_prev"]
+                _yaw_meas = yaw_rate_from_headings(
+                    state["yaw_prev"], _hdg, _yaw_dt)
+            state["yaw_prev"] = _hdg
+            state["yaw_t_prev"] = elapsed
+
             if _fs.arrived:
                 if state["arrived_at"] is None:
                     state["arrived_at"] = round(float(elapsed), 3)
                 _bias = _STOP_BIAS
+                if _YAW_LOOP is not None:
+                    # Standing still with a charged integrator would spin the
+                    # body on the spot at the goal.
+                    _YAW_LOOP.reset()
             else:
+                _twist = _fs.twist
+                _yaw_cmd = _twist.angular_rps
+                if _YAW_LOOP is not None:
+                    _corr = _YAW_LOOP.update(_yaw_cmd, _yaw_meas, _yaw_dt)
+                    _twist = TwistCommand(linear_mps=_twist.linear_mps,
+                                          angular_rps=_corr.compensated_rps)
                 _bias = differential_stride(
-                    _fs.twist, track_width_m=float(_ROUTE["track"]),
+                    _twist, track_width_m=float(_ROUTE["track"]),
                     nominal_mps=float(_ROUTE["nominal"]))
             if state["steps"] % SAMPLE_EVERY == 0:
                 # Recorded for diagnosis only.  The VERDICT is scored offline
@@ -697,7 +739,14 @@ def _on_step(dt):
                      round(float(_fs.cross_track_m), 4),
                      round(float(_fs.distance_to_goal_m), 4),
                      round(float(_fs.twist.angular_rps), 4),
-                     int(_fs.target_index)])
+                     int(_fs.target_index),
+                     # What the body actually turned at, and what the rate
+                     # loop asked for as a result.  The ratio between the
+                     # first and the fourth column IS the plant gain this
+                     # whole loop exists to cancel.
+                     round(float(_yaw_meas), 4),
+                     round(float(_bias.left_scale), 4),
+                     round(float(_bias.right_scale), 4)])
 
         # Steering is applied BEFORE the attitude trim, so the stabiliser's
         # vertical corrections ride on top of the steered stride rather than
@@ -996,6 +1045,13 @@ def route_spec(args, waypoints) -> dict | None:
         "slow_radius": float(args.slow_radius),
         "track": float(args.steer_track),
         "nominal": float(args.speed),
+        # The inner rate loop is OFF by default and that is deliberate: the
+        # open-loop arm has to stay reachable unchanged, or the A/B that
+        # justifies this loop has no control to compare against.
+        "yaw_closed_loop": bool(args.closed_loop_yaw),
+        "yaw_kp": float(args.yaw_kp),
+        "yaw_ki": float(args.yaw_ki),
+        "yaw_max": float(args.yaw_max),
         # The scorer stands off by the BODY RADIUS, not by the planner's
         # clearance.  These are two different quantities and conflating them
         # breaks the referee in both directions:
@@ -1149,6 +1205,23 @@ def main() -> int:
                     help="pure-pursuit lookahead distance")
     ap.add_argument("--max-angular", type=float, default=0.8, metavar="RAD_S",
                     help="yaw-rate clamp for the follower")
+    ap.add_argument("--dump-follow", metavar="PATH.json",
+                    help="write the per-step follower trace for offline "
+                         "diagnosis (commanded vs MEASURED yaw rate). Never "
+                         "an input to any verdict")
+    ap.add_argument("--closed-loop-yaw", action="store_true",
+                    help="close an inner PI loop on MEASURED yaw rate "
+                         "(tritium_lib.control.YawRateLoop). Off by default "
+                         "so the open-loop arm stays available as a control")
+    ap.add_argument("--yaw-kp", type=float, default=1.0, metavar="K")
+    ap.add_argument("--yaw-ki", type=float, default=6.0, metavar="K",
+                    help="integral gain — this is the term that actually "
+                         "cancels a constant plant-gain shortfall")
+    ap.add_argument("--yaw-max", type=float, default=4.0, metavar="RAD_S",
+                    help="demand ceiling for the rate loop. Set ABOVE "
+                         "--max-angular: the point is to ask for more than "
+                         "the follower wanted so that what ARRIVES is what "
+                         "the follower wanted")
     ap.add_argument("--goal-tolerance", type=float, default=0.35, metavar="M")
     ap.add_argument("--slow-radius", type=float, default=0.0, metavar="M",
                     help="ease off the throttle within this range of the goal")
@@ -1266,6 +1339,14 @@ def main() -> int:
                 capture = args.capture.replace(".png", f"-{suffix}.png")
             score = run_trial(br, gait, args, stabilize, capture,
                               route=route, obstacles=obstacles)
+            if args.dump_follow and score.get("follow_trace"):
+                path = args.dump_follow.replace(
+                    ".json", f"-{'closed' if stabilize else 'open'}"
+                    f"-t{trial}.json")
+                with open(path, "w") as fh:
+                    json.dump(score["follow_trace"], fh)
+                print(f"[gait] wrote {path}")
+            score.pop("follow_trace", None)  # too big for the summary line
             runs.append(score)
             line = (f"[gait] {label} trial {trial}/{args.trials}: "
                     f"{score.get('verdict')} "
@@ -1422,6 +1503,12 @@ def score_route(collected: dict, route: dict, obstacles) -> dict:
     if follow:
         # Self-reported, and labelled as such.
         out["follower_final_cross_track_m"] = follow[-1][1]
+        # The whole trace, carried out for offline diagnosis via
+        # --dump-follow.  It is NOT part of any verdict -- the referee in
+        # tritium_lib.control.route_trace takes ground-truth poses only.
+        # Columns: t, cross_track, dist_to_goal, cmd_yaw, target_idx,
+        #          measured_yaw, left_scale, right_scale.
+        out["follow_trace"] = follow
     return out
 
 

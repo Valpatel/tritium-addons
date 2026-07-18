@@ -72,6 +72,12 @@ class _Args:
     # that swaps the two pass every test in this file.
     plan_clearance = 0.30
     body_radius = 0.16
+    # Default OFF: the open-loop arm must stay the default path so the A/B
+    # keeps a control.
+    closed_loop_yaw = False
+    yaw_kp = 1.0
+    yaw_ki = 6.0
+    yaw_max = 4.0
 
 
 # --------------------------------------------------------------- parse_points
@@ -553,3 +559,67 @@ def test_a_straight_line_to_the_same_goal_is_scored_collided():
         driver.route_spec(args, path), obstacles)
     assert scored["route_verdict"] == "COLLIDED"
     assert scored["route_min_clearance_m"] < 0.0
+
+
+# ------------------------------------------------------- inner yaw-rate loop
+def test_route_spec_defaults_the_yaw_loop_off():
+    """The open-loop arm is the control, so it must be what you get by
+    default.  A loop that switches itself on silently destroys the only
+    baseline the live A/B can be measured against."""
+    spec = driver.route_spec(_Args(), [(0.0, 0.0), (3.0, 1.5)])
+    assert spec["yaw_closed_loop"] is False
+
+
+def test_route_spec_carries_the_yaw_gains_when_enabled():
+    args = _Args()
+    args.closed_loop_yaw = True
+    args.yaw_kp, args.yaw_ki, args.yaw_max = 2.0, 9.0, 5.0
+    spec = driver.route_spec(args, [(0.0, 0.0), (3.0, 1.5)])
+    assert spec["yaw_closed_loop"] is True
+    assert spec["yaw_kp"] == 2.0
+    assert spec["yaw_ki"] == 9.0
+    assert spec["yaw_max"] == 5.0
+
+
+def test_yaw_settings_survive_repr_into_the_remote_source():
+    """The spec is injected into the in-sim script by repr(), so a value that
+    does not round-trip arrives as a syntax error inside Isaac rather than a
+    failure here."""
+    args = _Args()
+    args.closed_loop_yaw = True
+    spec = driver.route_spec(args, [(0.0, 0.0), (3.0, 1.5)])
+    revived = eval(repr(spec))  # noqa: S307 — exactly what the driver does
+    assert revived["yaw_closed_loop"] is True
+    assert revived["yaw_ki"] == spec["yaw_ki"]
+
+
+def test_yaw_rate_helper_is_imported_even_when_the_loop_is_off():
+    """The step callback measures achieved yaw rate in BOTH arms.
+
+    Regression: the helper was first imported inside the
+    ``if _ROUTE.get("yaw_closed_loop")`` guard while the callback referenced
+    it unconditionally, so running the OPEN-loop control arm raised
+    ``NameError`` on every physics step.  The driver reported ``NO_TRACE``
+    rather than a bogus success, but the whole A/B was unrunnable.  A
+    ``compile()`` check cannot see this — the name only fails at call time.
+    """
+    import ast
+
+    code = driver.build_driver_code(GAIT, 6.0, 1000.0, 50.0, 5, route=ROUTE)
+    tree = ast.parse(code)
+
+    guarded = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        if "yaw_closed_loop" not in ast.get_source_segment(code, node.test):
+            continue
+        for inner in ast.walk(node):
+            if isinstance(inner, ast.ImportFrom):
+                guarded.extend(a.name for a in inner.names)
+
+    assert "yaw_rate_from_headings" not in guarded, (
+        "yaw_rate_from_headings is imported under the yaw_closed_loop guard, "
+        "but the step callback uses it in both arms"
+    )
+    assert "yaw_rate_from_headings" in code
