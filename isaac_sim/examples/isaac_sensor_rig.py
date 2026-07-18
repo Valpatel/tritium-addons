@@ -106,6 +106,11 @@ DEFAULT_CONFIG: dict = {
     "python": None,           # None -> sys.executable
     # Where the connector scripts live (overridable for tests).
     "connectors_dir": None,   # None -> CONNECTORS_DIR
+    # Command Center to register the rig's camera channels with once every
+    # server is healthy ("" -> bring the rig up but leave the operator's map
+    # alone).  Consumed by the runnable shell, not by build_rig_plan.
+    "register_sc": "",
+    "attach_to": "",          # tracked target the camera rides on ("" -> ask /status)
 }
 
 
@@ -236,6 +241,85 @@ def _check_ready(role: str, host: str, cfg: dict) -> tuple[bool, str]:
 # Runnable shell: spawn the plan, poll health, summarize, tear down cleanly.
 # --------------------------------------------------------------------------- #
 
+def _rig_sensors(cfg: dict, ready_roles: dict, host: str):
+    """Ready rig roles -> the ``RigSensor`` list the lib seam plans against.
+
+    ONE camera process serves up to three pixel channels, so a single ready
+    ``camera`` role fans out into rgb / depth16 / right depending on what the
+    rig was asked to bring up.  LiDAR and body are included as sensors even
+    though they carry no pixels — the seam is what decides they get no feed,
+    not this function, so the decision stays tested in one place.
+    """
+    from tritium_lib.fleet.sensor_rig import RigSensor
+
+    sensors = []
+    if "camera" in ready_roles:
+        roles = ["camera"]
+        if cfg.get("depth"):
+            roles.append("depth")
+        if cfg.get("stereo"):
+            roles.append("stereo_right")
+        for role in roles:
+            sensors.append(RigSensor(
+                role=role, host=host, port=cfg["camera_port"], ready=True,
+                attach_to=cfg.get("attach_to", "") or "",
+            ))
+    if "lidar" in ready_roles:
+        sensors.append(RigSensor(role="lidar", host=host,
+                                 port=cfg["lidar_port"], ready=True))
+    if "body" in ready_roles:
+        sensors.append(RigSensor(role="body", host=host,
+                                 port=cfg["body_port"], ready=True))
+    return sensors
+
+
+def _register_with_sc(cfg: dict, ready_roles: dict, host: str, sc_url: str) -> bool:
+    """POST the rig's sensors to the Command Center; report honestly.
+
+    Returns True only when the rig genuinely reached the operator.  The
+    outcome scoring is :func:`tritium_lib.fleet.sensor_rig.summarize_bringup`,
+    which refuses to call an empty or partly-failed bring-up healthy.
+    """
+    try:
+        from tritium_lib.fleet.sensor_rig import (
+            registration_plan, summarize_bringup,
+        )
+    except ImportError as exc:  # pragma: no cover - environment guard
+        print(f"--register-sc needs tritium_lib importable: {exc}", file=sys.stderr)
+        return False
+
+    calls = registration_plan(_rig_sensors(cfg, ready_roles, host))
+    if not calls:
+        print("REGISTER: no pixel sensors in this rig — nothing to register")
+        return False
+
+    outcomes: list[tuple[str, str]] = []
+    for call in calls:
+        source_id = call.payload["source_id"]
+        url = sc_url.rstrip("/") + call.path
+        body = json.dumps(call.payload).encode()
+        req = urllib.request.Request(
+            url, data=body, method=call.method,
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10.0) as resp:
+                doc = json.loads(resp.read().decode() or "{}")
+                already = bool(doc.get("already_registered"))
+                outcomes.append(
+                    (source_id, "already_registered" if already else "registered"))
+                print(f"  {'~' if already else '+'} {source_id:<16} "
+                      f"{call.role:<13} attached={doc.get('attached_to')} "
+                      f"mount_discovered={doc.get('mount_discovered')}")
+        except Exception as exc:
+            outcomes.append((source_id, "failed"))
+            print(f"  ! {source_id:<16} {call.role:<13} {exc}")
+
+    report = summarize_bringup(outcomes)
+    print(f"\n{report}")
+    return report.ok
+
+
 def _run_rig(plan: list[list[str]], cfg: dict, timeout_s: float) -> int:
     host = _poll_host(cfg["host"])
     procs: list[tuple[str, subprocess.Popen]] = []
@@ -294,6 +378,17 @@ def _run_rig(plan: list[list[str]], cfg: dict, timeout_s: float) -> int:
         _teardown()
         return 1
 
+    if cfg.get("register_sc"):
+        print(f"\nregistering the rig with the Command Center at "
+              f"{cfg['register_sc']}")
+        if not _register_with_sc(cfg, ready, host, cfg["register_sc"]):
+            # A rig the operator cannot see is not a rig that came up.  Failing
+            # here rather than idling is the point: the alternative is a green
+            # console next to a tactical map with nothing on it.
+            print("RIG FAILED: sensors did not reach the operator — tearing down")
+            _teardown()
+            return 1
+
     print("\nrig up — Ctrl-C to stop")
     try:
         while not stop["requested"]:
@@ -334,9 +429,28 @@ def main(argv=None) -> int:
                          "(Isaac's python.sh for --source isaac)")
     ap.add_argument("--timeout", type=float, default=30.0,
                     help="seconds to wait for every server to become ready")
+    ap.add_argument("--register-sc", default="", metavar="URL",
+                    help="after the rig is ready, register its camera "
+                         "channels with this Command Center "
+                         "(e.g. http://localhost:8000) so the operator sees "
+                         "the robot's own eyes with nothing typed")
+    ap.add_argument("--attach-to", default="",
+                    help="tracked target id the camera rides on; omit to let "
+                         "the camera server's /status advertisement decide")
     ap.add_argument("--print-plan", action="store_true",
                     help="print the subprocess argv lists and exit (no processes)")
     args = ap.parse_args(argv)
+
+    # A rig is normally launched with its output redirected to a log.  Python
+    # block-buffers a non-tty stdout, so the readiness summary and the
+    # registration result -- the two things an operator actually reads -- would
+    # sit unflushed in the buffer for the entire life of a long-running rig.
+    # Found by running it: the child servers' stderr appeared in the log and
+    # the launcher's own stdout did not.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError):  # pragma: no cover - exotic streams
+        pass
 
     cfg = {
         "camera": args.camera, "depth": args.depth, "stereo": args.stereo,
@@ -347,6 +461,7 @@ def main(argv=None) -> int:
         "camera_id": args.camera_id, "lidar_id": args.lidar_id,
         "mount_prim": args.mount_prim, "scene": args.scene,
         "body_asset": args.body_asset, "python": args.python,
+        "register_sc": args.register_sc, "attach_to": args.attach_to,
     }
     if not (cfg["camera"] or cfg["lidar"] or cfg["body"]):
         # No sensors named -> the standard full sensor rig (body stays opt-in:

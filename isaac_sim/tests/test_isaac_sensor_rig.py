@@ -39,16 +39,56 @@ def _flag_value(argv: list[str], flag: str) -> str:
 
 # ------------------------------------------------------------ import hygiene
 
+def _module_level_imports(path) -> set[str]:
+    """Top-level module names imported when the file is merely LOADED.
+
+    Deliberately AST-based rather than a substring scan: an import nested
+    inside a function does not run at load time, so it cannot break the
+    "launcher loads anywhere" invariant.  A grep cannot tell the two apart.
+    """
+    import ast
+
+    names: set[str] = set()
+    for node in ast.parse(path.read_text()).body:  # top level only
+        if isinstance(node, ast.Import):
+            names.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            names.add(node.module.split(".")[0])
+    return names
+
+
 def test_module_imports_without_isaacsim_or_tritium():
-    """The launcher is pure glue: loading it (done above, under plain python
-    with no isaacsim installed) must not touch isaacsim or tritium — enforced
-    both by the successful load and by a source scan."""
-    src = RIG_PATH.read_text()
-    assert "import tritium" not in src and "from tritium" not in src, (
-        "isaac_sensor_rig.py imports tritium — the rig must stay tritium-free")
-    assert "import isaacsim" not in src and "from isaacsim" not in src, (
-        "isaac_sensor_rig.py imports isaacsim — only the CHILD servers may")
+    """The launcher is pure glue: LOADING it must not need isaacsim or tritium.
+
+    `--register-sc` does import ``tritium_lib.fleet.sensor_rig``, but lazily,
+    inside the function that needs it — so a rig brought up on a box with no
+    tritium installed still runs, and only the opt-in registration step
+    requires the library.  That is exactly the distinction this test now
+    encodes (it previously scanned the source text and could not).
+    """
+    top = _module_level_imports(RIG_PATH)
+    assert not any(n.startswith("tritium") for n in top), (
+        f"isaac_sensor_rig.py imports tritium at module level: {sorted(top)}")
+    assert not any(n.startswith("isaacsim") or n == "pxr" for n in top), (
+        f"isaac_sensor_rig.py imports isaacsim at module level: {sorted(top)}")
     assert callable(rig.build_rig_plan) and callable(rig.main)
+
+
+def test_registration_import_is_lazy_not_module_level():
+    """The tritium import must live inside a function, or the guarantee above
+    is accidental rather than designed."""
+    import ast
+
+    tree = ast.parse(RIG_PATH.read_text())
+    lazy = [
+        node
+        for fn in ast.walk(tree)
+        if isinstance(fn, ast.FunctionDef)
+        for node in ast.walk(fn)
+        if isinstance(node, ast.ImportFrom)
+        and (node.module or "").startswith("tritium")
+    ]
+    assert lazy, "expected a lazy in-function tritium import for --register-sc"
 
 
 # ------------------------------------------------------- build_rig_plan: pure
