@@ -47,6 +47,25 @@ does not move between reading its pose and firing from it.
 draws the tracer and impact, the kill feed logs it, and Amy narrates it.
 Reporting is fire-and-forget: a run with no SC loses nothing but the
 audience.
+
+**SC can refuse the round, and the refusal is honored.**  The shooter has a
+finite magazine on the SC side, and an empty one answers the POST with
+**409** -- the round never fired, so SC logs nothing, draws nothing, and
+announces nothing.  Before this, the connector swallowed that answer and
+drew the tracer anyway, so the Isaac viewport showed rounds the operator's
+map denied ever happened.  Now a 409 is a *dry trigger pull*: no tracer is
+drawn (a line downrange claims a round traveled -- the exact lie being
+removed), a magenta muzzle marker shows the click, the run report records
+the arm as refused with SC's reason, and the trial does not grade it as a
+fired round.  A 409 with ``reason: reloading`` also carries the magazine's
+countdown, and the next trigger pull waits it out -- bounded by
+:data:`ShotPoster.MAX_RELOAD_WAIT_S`, never an open-ended block.
+
+"SC refused this shot" and "SC is unreachable" are DIFFERENT states and are
+counted separately: a refusal is a healthy conversation (it resets the
+failure streak and never opens the poster's circuit breaker), while a
+connection error or timeout still counts toward the breaker exactly as
+before.
 """
 
 from __future__ import annotations
@@ -56,6 +75,7 @@ import json
 import os
 import sys
 import time
+import urllib.error
 import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -281,6 +301,34 @@ result = "tracer %s" % ("HIT" if {hit!r} else "MISS")
 '''
 
 
+def draw_dry_trigger_src(origin: tuple[float, float, float]) -> str:
+    """Source that marks a REFUSED round: a click, not a shot.
+
+    SC answered the engagement POST with 409 -- the magazine is empty or
+    mid-reload, the round never left the barrel, and SC's map shows nothing.
+    Parity means the Isaac viewport must tell the same story.  Suppressing
+    all drawing would do that, but a blank frame is indistinguishable from a
+    draw that was forgotten or a transport hiccup when someone reviews the
+    capture.  So the dry pull gets its own picture: a single magenta point
+    AT THE MUZZLE and nothing downrange.  No line -- a line claims a round
+    traveled, which is the exact lie this exists to remove.  Magenta
+    (#ff2a6d) is the house alert colour and neither the HIT green nor the
+    MISS yellow, so a refused pull can never be misread as either verdict.
+
+    The debug-draw layer is cleared first, same as :func:`draw_shot_src`:
+    the newest trigger event owns the picture, and a stale tracer left on
+    screen behind a dry click would read as THIS pull's round.
+    """
+    return f'''
+from isaacsim.util.debug_draw import _debug_draw
+draw = _debug_draw.acquire_debug_draw_interface()
+draw.clear_lines()
+draw.clear_points()
+draw.draw_points([{list(origin)}], [(1.0, 0.16, 0.43, 1.0)], [26.0])
+result = "dry trigger (round refused)"
+'''
+
+
 # --- reporting a round to the Command Center ------------------------------
 
 DEFAULT_SC_URL = "http://localhost:8000"
@@ -300,6 +348,53 @@ def default_shooter_id(body_prim: str) -> str:
     return f"isaac_{parts[-1] if parts else 'body'}"
 
 
+@dataclass(frozen=True)
+class PostResult:
+    """What SC said about one reported round.
+
+    Three states, and the difference is the whole point:
+
+    * ``accepted`` -- 2xx; the operator's map has the round.
+    * ``refused`` -- 409; SC heard the trigger pull and REFUSED the round
+      (``reason`` is SC's word: ``out_of_ammo`` / ``reloading``, or
+      ``unknown`` when the body would not parse).  A valid answer from a
+      healthy endpoint, never a transport failure.
+    * neither -- the POST did not complete (connection error, timeout,
+      non-2xx-non-409, or the circuit breaker is already open); ``reason``
+      says which.  Only THIS state feeds the breaker.
+
+    Truthiness is ``accepted``: ``if poster.post(shot):`` still reads as
+    "did the operator get the round".
+    """
+
+    accepted: bool
+    refused: bool = False
+    reason: str | None = None
+    reload_remaining_s: float = 0.0
+
+    def __bool__(self) -> bool:
+        return self.accepted
+
+
+def _parse_refusal(body: bytes) -> tuple[str, float]:
+    """A 409 body -> (reason, reload_remaining_s), never raising.
+
+    The router's shape is ``{"status": "rejected", "reason": ...,
+    "ammo": {"weapon_status": {"reload_remaining_s": ...}}}``.  A malformed
+    or empty body degrades to ``("unknown", 0.0)`` -- the refusal itself is
+    already certain from the status code, so a bad body loses only the
+    detail, never the classification.
+    """
+    try:
+        payload = json.loads(body.decode("utf-8"))
+        reason = str(payload.get("reason") or "unknown")
+        status = (payload.get("ammo") or {}).get("weapon_status") or {}
+        remaining = max(0.0, float(status.get("reload_remaining_s") or 0.0))
+        return reason, remaining
+    except Exception:  # noqa: BLE001 -- a bad body must cost nothing
+        return "unknown", 0.0
+
+
 class ShotPoster:
     """Reports each resolved round to SC's ``POST /api/engagement/shot``.
 
@@ -312,20 +407,35 @@ class ShotPoster:
     client graded.
 
     **Fire-and-forget, by contract.**  A live sim run must never fail, hang,
-    or slow down because SC is absent, so every failure -- connection
-    refused, timeout, non-2xx -- is COUNTED, logged once, and swallowed.
-    After :data:`MAX_CONSECUTIVE_FAILURES` consecutive failures the poster
-    opens its circuit and stops attempting for the rest of the run: against
-    the default localhost URL an absent SC refuses instantly, but a
-    black-holed remote URL would otherwise tax every shot with a full
-    timeout.
+    or slow down because SC is absent, so every transport failure --
+    connection refused, timeout, unexpected non-2xx -- is COUNTED, logged
+    once, and swallowed.  After :data:`MAX_CONSECUTIVE_FAILURES` consecutive
+    failures the poster opens its circuit and stops attempting for the rest
+    of the run: against the default localhost URL an absent SC refuses
+    instantly, but a black-holed remote URL would otherwise tax every shot
+    with a full timeout.
+
+    **A 409 is an ANSWER, not a failure.**  SC refusing a round (empty
+    magazine, mid-reload) proves the endpoint is alive and speaking the
+    contract, so a refusal is counted in ``refused`` -- separately from
+    ``failures`` -- resets the failure streak, and can NEVER open the
+    circuit breaker.  The breaker exists for endpoints that cannot be
+    reached, not for endpoints that say no.  A ``reloading`` refusal also
+    carries the magazine countdown, remembered so :meth:`wait_for_reload`
+    can hold the next trigger pull until the weapon is ready -- capped at
+    :data:`MAX_RELOAD_WAIT_S` (the lib's default magazine reload is 3 s, so
+    the cap covers any real loadout while an absurd countdown from a
+    confused server can only cost one bounded pause, never a hang).
 
     ``opener`` is the injection seam for tests: ``(url, body_bytes) ->
-    http status``.  The default is stdlib ``urllib.request`` -- this addon
-    never imports tritium.
+    status`` or ``(status, response_body_bytes)``.  The response body is
+    consulted only on a 409, so an opener that returns a bare status keeps
+    working.  The default is stdlib ``urllib.request`` -- this addon never
+    imports tritium.
     """
 
     MAX_CONSECUTIVE_FAILURES = 3
+    MAX_RELOAD_WAIT_S = 8.0
 
     def __init__(
         self,
@@ -334,17 +444,24 @@ class ShotPoster:
         *,
         shooter_type: str | None = None,
         timeout_s: float = 1.0,
-        opener: Callable[[str, bytes], int] | None = None,
+        opener: Callable[[str, bytes], Any] | None = None,
+        clock: Callable[[], float] | None = None,
+        sleeper: Callable[[float], None] | None = None,
     ) -> None:
         self.url = base_url.rstrip("/") + ENGAGEMENT_PATH
         self.shooter_id = shooter_id
         self.shooter_type = shooter_type
         self.timeout_s = timeout_s
         self._opener = opener if opener is not None else self._http_post
+        self._clock = clock if clock is not None else time.monotonic
+        self._sleep = sleeper if sleeper is not None else time.sleep
         self.posted = 0
+        self.refused = 0
         self.failures = 0
         self._consecutive = 0
+        self._reload_until = 0.0
         self._warned = False
+        self._refusal_warned = False
 
     def build_payload(self, shot: ShotResult) -> dict:
         """The exact body ``/api/engagement/shot`` accepts.
@@ -361,41 +478,119 @@ class ShotPoster:
         payload["timestamp"] = time.time()
         return payload
 
-    def _http_post(self, url: str, body: bytes) -> int:
+    def _http_post(self, url: str, body: bytes) -> tuple[int, bytes]:
         req = urllib.request.Request(
             url,
             data=body,
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
-            return int(resp.status)
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
+                return int(resp.status), resp.read()
+        except urllib.error.HTTPError as exc:
+            # urllib raises on every non-2xx, which is how a 409 refusal
+            # used to masquerade as a transport failure and feed the
+            # breaker.  An HTTP status IS an answer from a reachable
+            # server: hand it back as data and let post() classify it.
+            try:
+                detail = exc.read()
+            except Exception:  # noqa: BLE001 -- the code alone still counts
+                detail = b""
+            return int(exc.code), detail
 
-    def post(self, shot: ShotResult) -> bool:
-        """Report one round.  True on a 2xx; never raises, never blocks long.
+    @staticmethod
+    def _coerce_reply(reply: Any) -> tuple[int, bytes]:
+        """Opener return -> (status, body).  A bare status means no body."""
+        if isinstance(reply, tuple):
+            status, body = reply
+            if isinstance(body, str):
+                body = body.encode("utf-8")
+            return int(status), bytes(body or b"")
+        return int(reply), b""
 
-        A 409 from SC is a dry trigger pull (the shooter's magazine ran
-        empty), which lands in the same failure count -- the trial's own
-        verdict is already graded locally and does not depend on it.
+    def post(self, shot: ShotResult) -> PostResult:
+        """Report one round.  Never raises, never blocks past the timeout.
+
+        Three honest outcomes, kept apart on purpose (see :class:`PostResult`):
+        accepted (2xx), refused (409 -- SC heard the pull and said no; counts
+        in ``refused``, resets the failure streak, never feeds the breaker),
+        and failed (transport error or unexpected status; counts in
+        ``failures`` and toward the breaker, exactly as before).
         """
         if self._consecutive >= self.MAX_CONSECUTIVE_FAILURES:
-            return False
+            return PostResult(accepted=False, reason="circuit_open")
         body = json.dumps(self.build_payload(shot)).encode("utf-8")
         try:
-            status = self._opener(self.url, body)
+            status, resp_body = self._coerce_reply(self._opener(self.url, body))
         except Exception as exc:  # noqa: BLE001 -- graceful is the contract
             return self._fail(f"{type(exc).__name__}: {exc}")
-        if not 200 <= int(status) < 300:
+        if status == 409:
+            return self._refuse(resp_body)
+        if not 200 <= status < 300:
             return self._fail(f"HTTP {status}")
         self.posted += 1
         self._consecutive = 0
-        return True
+        return PostResult(accepted=True)
+
+    def reload_wait_s(self) -> float:
+        """Seconds left of the reload window SC last reported, else 0."""
+        return max(0.0, self._reload_until - self._clock())
+
+    def wait_for_reload(self) -> float:
+        """Hold the trigger until the reported reload elapses.  BOUNDED.
+
+        Returns the seconds actually waited: the remaining window, capped at
+        :data:`MAX_RELOAD_WAIT_S` so a nonsense countdown can cost one pause
+        and never a hang.  No window, no wait, no syscall -- the common path
+        (loaded magazine, or no SC at all) pays nothing.  This is the honest
+        alternative to hammering the endpoint with rounds SC already said it
+        will refuse.
+        """
+        wait = min(self.reload_wait_s(), self.MAX_RELOAD_WAIT_S)
+        if wait > 0.0:
+            self._sleep(wait)
+        return wait
 
     def stats(self) -> dict:
-        """For the run report: where the rounds went, and how many arrived."""
-        return {"url": self.url, "posted": self.posted, "failures": self.failures}
+        """For the run report: where the rounds went, and how many arrived.
 
-    def _fail(self, why: str) -> bool:
+        ``refused`` (SC said no) and ``failures`` (SC never answered) are
+        separate numbers because they are separate facts: one describes the
+        magazine, the other describes the wire.
+        """
+        return {
+            "url": self.url,
+            "posted": self.posted,
+            "refused": self.refused,
+            "failures": self.failures,
+        }
+
+    def _refuse(self, resp_body: bytes) -> PostResult:
+        """A 409: SC heard the trigger pull and refused the round."""
+        reason, remaining = _parse_refusal(resp_body)
+        self.refused += 1
+        # A refusal is a healthy conversation: the endpoint is reachable and
+        # speaking the contract, so the transport-failure streak resets and
+        # the breaker stays closed.
+        self._consecutive = 0
+        if reason == "reloading" and remaining > 0.0:
+            self._reload_until = self._clock() + remaining
+        if not self._refusal_warned:
+            self._refusal_warned = True
+            print(
+                f"[fire_bridge] SC refused the round ({reason}) -- "
+                "dry trigger, round not fired",
+                file=sys.stderr,
+            )
+        return PostResult(
+            accepted=False,
+            refused=True,
+            reason=reason,
+            reload_remaining_s=remaining,
+        )
+
+    def _fail(self, why: str) -> PostResult:
         self.failures += 1
         self._consecutive += 1
         if not self._warned:
@@ -405,7 +600,7 @@ class ShotPoster:
                 "continuing without the operator map",
                 file=sys.stderr,
             )
-        return False
+        return PostResult(accepted=False, reason=why)
 
 
 def poster_from_args(args: argparse.Namespace) -> ShotPoster | None:
@@ -555,6 +750,11 @@ class FireBridge:
         else:
             raise ValueError("give either a transport or an ssh host")
         self.errors = 0
+        #: What SC said about the LAST round posted (None when no poster, or
+        #: before the first shot).  run_trial reads this right after each
+        #: fire() to record refused arms without changing fire()'s return
+        #: type -- the ShotResult stays the local resolution either way.
+        self.last_post: PostResult | None = None
 
     def _execute(self, code: str) -> Any:
         reply = self._transport("/execute", {"code": code})
@@ -581,7 +781,20 @@ class FireBridge:
         stop draws in the MISS colour — the round did not hit what it was
         aimed at — but it terminates AT the ground impact, which is the fix
         for the live run whose control tracer continued below the slab.
+
+        If SC last reported the magazine mid-reload, the trigger waits the
+        (bounded) remainder BEFORE the stage is read — a shot resolved
+        against a snapshot and then held through a reload would fire from a
+        pose the body has since walked away from.  If SC then answers the
+        POST with 409 the round is REFUSED: no tracer — the dry-trigger
+        muzzle marker draws instead (see :func:`draw_dry_trigger_src`) — and
+        the returned ShotResult is only what WOULD have happened, which
+        ``bridge.last_post`` lets the caller tell apart from a fired round.
         """
+        if self.poster is not None:
+            # Honest backoff, not hammering: SC said the magazine needs this
+            # long, so the trigger holds — capped, never an unbounded block.
+            self.poster.wait_for_reload()
         body, targets = self.read_scene()
         muzzle = muzzle_from_body(body, mount, self.barrel_m)
         shot = resolve_shot(muzzle, list(targets), self.max_range_m)
@@ -589,18 +802,28 @@ class FireBridge:
         # The round is resolved: tell the Command Center BEFORE drawing, so
         # the operator's record does not depend on the tracer round trip.
         # post() never raises and never blocks past its short timeout.
-        if self.poster is not None:
-            self.poster.post(shot)
+        self.last_post = self.poster.post(shot) if self.poster is not None else None
+        refused = self.last_post is not None and self.last_post.refused
 
         if draw:
             origin = muzzle.origin()
-            end = shot.impact()
-            if end is None:
-                aim = muzzle.direction()
-                end = tuple(origin[i] + aim[i] * self.max_range_m for i in range(3))
-            self._execute(
-                draw_shot_src(origin, end, shot.hit and not is_terrain(shot.target_id))
-            )
+            if refused:
+                # SC refused the round, so no round may appear to travel:
+                # the operator's map shows nothing, and the viewport shows a
+                # click — parity in both directions.
+                self._execute(draw_dry_trigger_src(origin))
+            else:
+                end = shot.impact()
+                if end is None:
+                    aim = muzzle.direction()
+                    end = tuple(
+                        origin[i] + aim[i] * self.max_range_m for i in range(3)
+                    )
+                self._execute(
+                    draw_shot_src(
+                        origin, end, shot.hit and not is_terrain(shot.target_id)
+                    )
+                )
         return shot
 
     def look_from(
@@ -666,6 +889,15 @@ def run_trial(
     The aimed arm alone cannot distinguish working fire control from a
     function that returns True, which is why the verdict below requires the
     two arms to disagree rather than requiring the first to hit.
+
+    An arm SC refused (409 — magazine empty or reloading) never fired, so it
+    is not graded as a fired round: the report names it in ``refused`` with
+    SC's reason, its ``aimed``/``control`` record stays as the audit trail of
+    what WOULD have happened, and the verdict is a fail with
+    ``reason: sc_refused_round`` — a trial one of whose arms never left the
+    barrel demonstrated nothing about fire control.  Transport failures are
+    NOT refusals: with SC absent or unreachable both arms fire on local
+    authority and grade exactly as before.
     """
     bridge.author_targets(specs)
     body, targets = bridge.read_scene()
@@ -681,6 +913,7 @@ def run_trial(
     )
     aimed_mount = aim_at(body, primary, bridge.mount)
     aimed = bridge.fire(aimed_mount)
+    aimed_post = bridge.last_post
     if on_shot is not None:
         on_shot("aimed", aimed)
 
@@ -695,10 +928,28 @@ def run_trial(
     # tracer would otherwise clear the aimed one, and the frame that matters
     # by default is the hit.
     control = bridge.fire(off_mount, draw=on_shot is not None)
+    control_post = bridge.last_post
     if on_shot is not None:
         on_shot("control", control)
 
+    refused = {
+        arm: (post.reason or "unknown")
+        for arm, post in (("aimed", aimed_post), ("control", control_post))
+        if post is not None and post.refused
+    }
+    if refused:
+        # A refused arm never fired; grading its local resolution as a
+        # round would be exactly the parity lie the 409 exists to prevent.
+        verdict = {
+            "pass": False,
+            "reason": "sc_refused_round",
+            "rounds_refused": sorted(refused),
+        }
+    else:
+        verdict = grade_trial(aimed, control, primary.target_id)
+
     return {
+        **({"refused": refused} if refused else {}),
         "body": {
             "east_m": body.east_m,
             "north_m": body.north_m,
@@ -720,7 +971,7 @@ def run_trial(
         ],
         "aimed": aimed.to_dict(),
         "control": control.to_dict(),
-        "verdict": grade_trial(aimed, control, primary.target_id),
+        "verdict": verdict,
     }
 
 

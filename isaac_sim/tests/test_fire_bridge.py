@@ -18,6 +18,7 @@ from isaac_sim_addon.clients.fire_bridge import (
     TargetSpec,
     aim_at,
     build_targets_src,
+    draw_dry_trigger_src,
     draw_shot_src,
     grade_trial,
     is_terrain,
@@ -129,8 +130,20 @@ def test_every_generated_snippet_compiles():
         build_targets_src(DEFAULT_SPECS),
         read_scene_src(),
         draw_shot_src((0, 0, 0), (1, 2, 3), True),
+        draw_dry_trigger_src((0.0, 0.0, 0.95)),
     ):
         compile(src, "<generated>", "exec")
+
+
+def test_dry_trigger_marker_is_transient_and_stays_at_the_muzzle():
+    """A refused round left nothing downrange: the marker is debug-draw (no
+    authored prim to pollute the next obstacle read), a point at the muzzle,
+    and no line at all."""
+    src = draw_dry_trigger_src((1.5, -2.0, 0.95))
+    assert "debug_draw" in src
+    assert "Define" not in src
+    assert "draw_lines" not in src
+    assert "[1.5, -2.0, 0.95]" in src
 
 
 # --- reading the stage back ----------------------------------------------
