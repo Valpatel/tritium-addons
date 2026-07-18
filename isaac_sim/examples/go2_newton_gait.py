@@ -763,6 +763,43 @@ def score_disturbance(collected: dict, args) -> dict:
     payload["verdict"] = "RECOVERED" if rec.recovered else "NOT_RECOVERED"
     payload["kicks"] = kicks
     payload["body_mass_kg"] = collected.get("body_mass")
+
+    # A kick RECORD is not a kick.  The solver can accept the force and the
+    # body still gain almost nothing along the axis it was pushed on -- which
+    # is what happens when the body is busy falling.  The first live 3 N-s
+    # A/B logged dv=[-0.089, 0.0121, 0.1921] for a +Y push: the right
+    # MAGNITUDE, almost none of it on Y.  That trial's 178-degree tumble was
+    # a spontaneous fall being charged to the controller.
+    #
+    # So the trial is only admitted if the body moved along the COMMANDED
+    # direction.  Note this cuts both ways and is not a thumb on the scale:
+    # the same run had a closed-loop trial measure dv_y = -0.087 and score
+    # RECOVERED, and that favourable trial is excluded too.
+    from tritium_lib.control import kick_landed
+
+    mass = collected.get("body_mass")
+    verdicts = []
+    for k in kicks:
+        try:
+            v = kick_landed(commanded=k["impulse_ns"],
+                            measured_dv=k["measured_dv_mps"],
+                            body_mass=float(mass))
+        except (ValueError, KeyError, TypeError) as exc:
+            return {"disturbance": dict(payload, verdict="UNSCORABLE",
+                                        reason=f"kick check: {exc}"),
+                    "disturb_ok": False}
+        verdicts.append(v)
+        k["landed"] = v.as_dict()
+
+    if not all(v.landed for v in verdicts):
+        worst = min(verdicts, key=lambda v: v.fraction)
+        payload["verdict"] = "NOT_APPLIED"
+        payload["reason"] = (
+            f"push did not land on its commanded axis: projected "
+            f"{worst.projected_dv:.4f} m/s vs expected {worst.expected_dv:.4f} "
+            f"({worst.fraction:.0%} of J/m)")
+        return {"disturbance": payload, "disturb_ok": False}
+
     return {"disturbance": payload, "disturb_ok": True}
 
 
@@ -782,7 +819,11 @@ def main() -> int:
     ap.add_argument("--damping", type=float, default=4.0)
     ap.add_argument("--sample-every", type=int, default=10,
                     help="record a pose sample every N physics steps")
-    ap.add_argument("--capture", help="write a mid-window viewport PNG here")
+    ap.add_argument("--capture", help="write a viewport PNG here")
+    ap.add_argument("--capture-at", type=float, default=None, metavar="SEC",
+                    help="sim-time to capture at, default mid-window. Clamped "
+                         "to the scored window: a frame taken after the driver "
+                         "stops is evidence about a moment nobody measured.")
     ap.add_argument("--keep-running", action="store_true",
                     help="leave the step callback installed after scoring")
     ap.add_argument("--trials", type=int, default=1, metavar="N",
@@ -987,10 +1028,20 @@ def run_trial(br: "Bridge", gait: dict, args, stabilize: bool,
             f"attitude trim wired to {info.get('legs_wired')} — expected all 4 "
             f"legs; solver DOF names are {info.get('joint_names')}")
 
-    # Capture from the MIDDLE of the scored window.  An end-of-run frame is
-    # evidence about a moment nobody measured: the driver stops commanding at
-    # DURATION and the robot topples immediately after.
-    mid_deadline = time.time() + args.seconds * 0.5
+    # Capture from INSIDE the scored window.  An end-of-run frame is evidence
+    # about a moment nobody measured: the driver stops commanding at DURATION
+    # and the robot topples immediately after, so a frame taken then shows a
+    # collapse the score never saw.
+    #
+    # The default is mid-window, but it must be movable, and the 3 N-s A/B is
+    # why: the open-loop arm reaches 179.97 degrees, yet its mid-window frame
+    # at t=4s shows the body still upright, because that arm's tumble
+    # develops later.  A fixed 50% capture therefore produced two frames that
+    # looked alike for two arms whose traces could not be more different.
+    # Anywhere in [0, seconds] is still a measured moment; past it is not.
+    at = args.seconds * 0.5 if args.capture_at is None else args.capture_at
+    at = max(0.0, min(float(at), args.seconds))
+    mid_deadline = time.time() + at
     if capture:
         br.camera_look_at(ROBOT_PATH, distance=3.0)
     time.sleep(max(0.0, mid_deadline - time.time()))
@@ -1015,7 +1066,7 @@ def run_trial(br: "Bridge", gait: dict, args, stabilize: bool,
         if b64:
             with open(capture, "wb") as fh:
                 fh.write(base64.b64decode(b64))
-            print(f"[gait] wrote {capture} (mid-window)")
+            print(f"[gait] wrote {capture} (t={at:.2f}s of {args.seconds:.2f}s)")
     return score
 
 
