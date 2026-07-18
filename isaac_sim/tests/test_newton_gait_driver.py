@@ -304,8 +304,11 @@ def test_run_stays_open_loop():
 #
 # The trim is an ankle strategy: it re-weights planted feet, and above ~5 N*s
 # of push the body inverts anyway — the only recovery is to MOVE a foot
-# (capture-point stepping, the lib's StepReflex; live-Newton measurement in
-# flight).  Like the stabilizer the reflex arrives INJECTED, so these tests
+# (capture-point stepping, the lib's StepReflex — which gates on deviation
+# from a REQUIRED ``nominal_vel_xy`` after live Newton disproved absolute
+# gating: 6/6 upright fell to 0/6 undisturbed; the deviation gate itself is
+# not yet live-validated).  Like the stabilizer the reflex arrives INJECTED,
+# so these tests
 # bind mocks exactly the way the live runner binds the lib, pin the mirrored
 # semantics (dry first measured step, positive-interval-only, opaque
 # measurement, raise-on-misuse, byte-identity when absent) and pin the
@@ -374,7 +377,8 @@ def test_first_measured_reflex_step_is_dry_and_dt_spans_measured_steps():
 
 def test_reflex_fires_above_the_gate_and_not_below():
     """The lib's layering contract, visible through the scheduler: below the
-    0.05 m capture gate the reflex is a pure pass-through (byte-identical
+    MOCK's own 0.05 m absolute-capture gate (NOT the lib's — the lib gates
+    on deviation from nominal) the reflex is a pure pass-through (byte-identical
     output even though it RAN), above it the stepping leg's placement leaves
     the open-loop track while the clamps keep the last word."""
     dt, n = 0.02, 12

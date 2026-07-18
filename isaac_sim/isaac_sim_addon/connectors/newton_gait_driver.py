@@ -52,10 +52,16 @@ Gated step reflex — push recovery arrives INJECTED the same way
 The closed attitude loop is an *ankle strategy*: it re-weights feet that are
 already planted, and a push above ~5 N*s still inverts the body — the only
 recovery is to MOVE a foot under the fall.  ``tritium_lib.control`` ships
-``StepReflex`` (capture-point stepping, gated at 0.05 m of capture-point
-excursion so an undisturbed walk never crosses it); a live campaign is
-measuring it against real Newton physics.  Like the trajectory and the
-stabilizer, it arrives INJECTED so this module stays lib-free:
+``StepReflex`` — capture-point stepping gated on the DEVIATION of the
+measured velocity from the gait's commanded ``nominal_vel_xy`` (default
+``DEFAULT_DEVIATION_THRESHOLD_M`` = 0.04 m).  The original ABSOLUTE-velocity
+gate (0.05 m, sold as "an undisturbed walk never crosses it") was
+live-DISPROVEN on Newton: a healthy 1.2 m/s trot's capture point peaks at
+0.101-0.131 m, so that gate fired continuously and took an undisturbed gait
+from 6/6 upright to 0/6 (median tilt 179.97 deg); re-gating at 0.35 m opened
+the gate 0 ticks and restored 6/6.  The deviation gate is the design response
+to that measurement and is NOT yet live-validated.  Like the trajectory and
+the stabilizer, the reflex arrives INJECTED so this module stays lib-free:
 
     ``GaitScheduler(..., reflex_fn=...)`` where
     ``reflex_fn(targets_rad, velocity, dt) -> dict[joint, radians]``
@@ -66,8 +72,10 @@ targets, the opaque velocity, and the seconds since the previous measured
 reflex step to the injected reflex, then feeds its output to the stabilizer
 — placement first, height trim second, conversion/clamp last; see
 :class:`GaitScheduler` for why that order is pinned.  Below the lib's gate
-the reflex is a pure pass-through, so an undisturbed run is byte-identical
-with or without it.
+the reflex is a pure pass-through.  Deviation gating is DESIGNED to keep an
+undisturbed run below the gate (byte-identical with or without the reflex),
+but that property is not yet live-validated — the old absolute gate
+measurably had the opposite property.
 
 Pieces
 ------
@@ -383,7 +391,11 @@ class GaitScheduler:
     ``ReachLimits`` and ``LegPlacement`` come out of ``tritium_lib.control``;
     the runner owns the IK that turns a ``StepDecision`` landing point into
     swing-leg joint targets, applied at the next swing slot its gait
-    allows::
+    allows.  ``nominal_vel_xy`` is REQUIRED and keyword-only — the runner
+    states the velocity its gait is currently commanding, because gating on
+    the ABSOLUTE velocity measured 0/6 upright on an undisturbed Newton
+    trot; passing ``(0, 0)`` while the gait walks silently re-creates that
+    failure::
 
         reflex = StepReflex(com_height_m=0.30)
         legs = [LegPlacement(n, x, y)
@@ -391,7 +403,10 @@ class GaitScheduler:
         reach = ReachLimits(max_dx=0.10, max_dy=0.06)
 
         def reflex_fn(targets_rad, vel_xy, dt):
-            decision = reflex.decide(vel_xy, legs, reach_limits=reach)
+            decision = reflex.decide(
+                vel_xy, legs,
+                nominal_vel_xy=gait_cmd_vel_xy,  # what the gait commands NOW
+                reach_limits=reach)
             if decision.step is None:
                 return targets_rad        # below the gate: pass-through
             return swing_leg_ik(targets_rad, decision.step)  # runner's IK
@@ -617,8 +632,10 @@ def mock_stabilize_fn(targets_rad: dict[str, float], attitude: object,
     return apply_foot_height_trim(targets_rad, offsets)
 
 
-# Mock reflex geometry — a Go2-class ride height and the lib's default gate,
-# duplicated as literals for the hygiene gate (no tritium_lib on the box).
+# Mock reflex geometry — a Go2-class ride height and this mock's OWN fixed
+# gate, literals for the hygiene gate (no tritium_lib on the box).  0.05 m is
+# NOT the lib's gate: the lib gates on deviation from ``nominal_vel_xy`` at
+# DEFAULT_DEVIATION_THRESHOLD_M = 0.04 (absolute gating was live-disproven).
 MOCK_REFLEX_COM_HEIGHT_M = 0.30
 MOCK_REFLEX_GATE_M = 0.05
 _GRAVITY_MPS2 = 9.80665
@@ -632,15 +649,20 @@ def mock_reflex_fn(targets_rad: dict[str, float], velocity: object,
     :class:`GaitScheduler` docstring); this mock exists so tests and
     ``--selftest`` can prove the scheduler-side contract lib-free.  It takes
     ``velocity`` as a plain ``(vx, vy)`` pair (m/s, body frame), computes the
-    lib's capture point ``v * sqrt(z0 / g)`` for a Go2-class ride height, and
-    applies the lib's gate at the same 0.05 m: at or below it the targets
-    pass through UNTOUCHED — the layering contract that keeps an undisturbed
-    run byte-identical.  Above it, a cartoon step: the leg whose home
-    placement sits closest to the capture point (first wins a tie, like the
-    lib) swings toward it — thigh by the forward excursion, hip by the
-    lateral, 1 rad per metre.  A cartoon selection AND a cartoon law: the
-    real reflex clamps to reach and reports its residual; this only proves
-    the seam."""
+    capture point ``v * sqrt(z0 / g)`` of the ABSOLUTE velocity for a
+    Go2-class ride height, and gates it at a fixed 0.05 m of its own: at or
+    below the gate the targets pass through UNTOUCHED — the pass-through
+    layering contract this seam exists to prove.  Absolute-velocity gating
+    is exactly the scheme live-DISPROVEN in the lib (an undisturbed 1.2 m/s
+    trot's capture point peaks at 0.101-0.131 m, so 6/6 upright fell to
+    0/6); the production ``StepReflex`` instead gates on the deviation from
+    a REQUIRED ``nominal_vel_xy``.  Fine for a mock: tests pick velocities
+    relative to THIS gate to exercise both sides of the seam.  Above it, a
+    cartoon step: the leg whose home placement sits closest to the capture
+    point (first wins a tie, like the lib) swings toward it — thigh by the
+    forward excursion, hip by the lateral, 1 rad per metre.  A cartoon
+    selection AND a cartoon law: the real reflex clamps to reach and reports
+    its residual; this only proves the seam."""
     vx, vy = (float(v) for v in velocity)  # type: ignore[misc]
     tc = math.sqrt(MOCK_REFLEX_COM_HEIGHT_M / _GRAVITY_MPS2)
     cx, cy = vx * tc, vy * tc
