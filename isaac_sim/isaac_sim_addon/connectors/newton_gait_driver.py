@@ -499,10 +499,9 @@ class GaitScheduler:
             if self.reflex_fn is None:
                 raise ValueError(
                     "step() got a velocity but no reflex_fn was injected — "
-                    "the push recovery you think is armed is absent (above "
-                    "the trim's ~5 N*s ceiling the body inverts with no "
-                    "step to catch it); construct "
-                    "GaitScheduler(..., reflex_fn=...)"
+                    "the push recovery you think is armed is absent (a push "
+                    "beyond what the trim absorbs needs a step to catch it); "
+                    "construct GaitScheduler(..., reflex_fn=...)"
                 )
             t_prev = self._vel_t_prev
             step_dt = (t - t_prev) if t_prev is not None else 0.0

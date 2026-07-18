@@ -1416,7 +1416,13 @@ def main() -> int:
                     help="body FOOTPRINT half-width used to judge collision; "
                          "the Go2 is ~0.31 m wide. Not the same as "
                          "--plan-clearance, which is only a preference")
-    ap.add_argument("--capture", help="write a viewport PNG here")
+    ap.add_argument("--capture",
+                    help="write a viewport PNG here (trial 1 of each arm). "
+                         "WARNING: a mid-run capture stalls the app-update "
+                         "loop driving the control callback — measured 0/8 "
+                         "upright capture-on vs 8/8 capture-free, same "
+                         "command and push — so a captured trial's score is "
+                         "perturbed; take rates from capture-free trials.")
     ap.add_argument("--capture-distance", type=float, default=3.0, metavar="M",
                     help="camera standoff for --capture. The 3 m default "
                          "frames the BODY; framing a whole ROUTE needs enough "
@@ -1807,6 +1813,13 @@ def run_trial(br: "Bridge", gait: dict, args, stabilize: bool,
     # develops later.  A fixed 50% capture therefore produced two frames that
     # looked alike for two arms whose traces could not be more different.
     # Anywhere in [0, seconds] is still a measured moment; past it is not.
+    #
+    # CORRECTION (2026-07): the capture is not a neutral observer — the
+    # viewport render stalls the app-update loop that drives the control
+    # callback, and the same command and push measured 0/8 upright capture-on
+    # vs 8/8 capture-free (the retired "~5 N*s inverts it" ceiling was this
+    # artifact).  A captured trial frames the run AND perturbs it: keep the
+    # frame as evidence of the scene, take rates from capture-free trials.
     at = args.seconds * 0.5 if args.capture_at is None else args.capture_at
     at = max(0.0, min(float(at), args.seconds))
     mid_deadline = time.time() + at
