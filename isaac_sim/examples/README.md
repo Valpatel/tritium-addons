@@ -24,6 +24,24 @@ no isaacsim). Full run recipe, JSON protocol, and Jetson mapping:
 
 - `go2_newton_stand.usd` — a Newton-physics Go2 stand scene; a real actuated
   quadruped stands under physics (load it in Isaac to verify the render host).
+- `newton_stand_and_walk.py` — the committed **stand + attempted trot**
+  scaffold for the Newton lane: spawns the Go2 under `/World/Tritium/go2`,
+  registers it with the solver (spawn while stopped + `World.reset()`), stands
+  it via USD drive `targetPosition` (hip 0 / thigh +50° / calf −100°), then
+  applies a low-speed tritium-lib trot through the addon `GaitScheduler`
+  every control step, scoring the run with the same non-gameable
+  `score_trace` metrics as `go2_newton_gait.py`. The pure core
+  `build_walk_plan(duration_s, dt, gait, speed, targets_fn)` is unit-tested
+  headless (`../tests/test_newton_stand_and_walk.py`). No-GPU:
+  `newton_stand_and_walk.py --selftest` / `--emit-plan plan.json [--mock]`.
+  Live (own kit — stop the bridged 8212 kit first):
+
+  ```bash
+  ~/Code/isaac-sim/IsaacSim/_build/linux-x86_64/release/python.sh \
+      tritium-addons/isaac_sim/examples/newton_stand_and_walk.py \
+      --live --headless --seconds 8 --speed 0.35 \
+      --capture /tmp/go2_walk.png --record /tmp/go2_walk.json
+  ```
 - `spot_policy_walk.py` — a **velocity-commanded** RL walk driven by
   `[vx, vy, yaw_rate]`, which *is* the brain/body twist seam: the same command
   the navigator/autonomy stack emits to a real machine drives this SIL body.
