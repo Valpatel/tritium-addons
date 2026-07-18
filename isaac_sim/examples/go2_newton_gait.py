@@ -875,7 +875,10 @@ def main() -> int:
                          f" dv_measured={dv}"
                          f" peak={dist_info.get('peak_deg')}"
                          f" settle={dist_info.get('settle_time')}")
-            print(line)
+            # flush=True is load-bearing: stdout is block-buffered when
+            # this runs over ssh or into a pipe, so a --trials run killed
+            # by a timeout loses EVERY result it had already produced.
+            print(line, flush=True)
         results[stabilize] = runs
 
     print("\n" + "=" * 62)
