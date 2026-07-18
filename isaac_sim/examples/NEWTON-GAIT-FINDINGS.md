@@ -545,6 +545,17 @@ first ~2 s of start-up transient (peak tilt 22–25°) is excluded from the
 post-kick score by construction — `score_recovery` measures peak *after* the
 disturbance and reports the pre-kick worst separately as `baseline_deg`.
 
+> **Correction (2026-07-18, later live campaign):** the push scores above were
+> measured with the harness's mid-run `--capture` enabled, and the viewport
+> render stalls the app-update loop that drives the control callback — the
+> same command and push scored **0/8 upright capture-on vs 8/8 capture-free**.
+> Measured capture-free, a 5 N·s lateral push survives **6/10** — near the
+> 50% point, not a reliable inverter — so "above 5 N·s overwhelms the
+> controller" overstates it. Session drift is a second confound: two identical
+> capture-free commands scored 0/3 and 8/8 in the same session, so only
+> trial-by-trial interleaved A/B is meaningful here. The table is preserved
+> above as honestly recorded at the time.
+
 ## 2026-07-18, tick 16 — the body turns, and n=1 lied about how much
 
 Steering did not exist anywhere in the stack before this tick.
@@ -674,6 +685,12 @@ the reusable path does not have the controller at all.**
    cleanly (peak 8.1° vs open-loop's 179.9°), J=5 N·s tumbles both arms. The
    controller trims foot height; it has no stepping reflex, so a disturbance
    large enough to need a *recovery step* has no mechanism to produce one.
+   *(Correction, 2026-07-18: the ~5 N·s figure was a `--capture` artifact —
+   capture-on 0/8 vs capture-free 8/8 upright on the same command; measured
+   capture-free, a 5 N·s push survives 6/10. See the correction note under
+   the tick-13 push-calibration table. The structural point stands: this
+   stack has no stepping reflex, and a push beyond the trim's ceiling has no
+   recovery mechanism.)*
 3. **Flat ground only.** Every number here is a 50 × 50 × 1 m slab. Slopes,
    steps and debris are unmeasured.
 4. **Yaw drift is unregulated** — heading wanders (session medians +7.6°,

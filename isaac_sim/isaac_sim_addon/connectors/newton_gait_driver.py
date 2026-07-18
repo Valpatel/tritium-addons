@@ -50,8 +50,15 @@ the injection inherits the 71% number, not the 100% one.  See
 Gated step reflex — push recovery arrives INJECTED the same way
 ---------------------------------------------------------------
 The closed attitude loop is an *ankle strategy*: it re-weights feet that are
-already planted, and a push above ~5 N*s still inverts the body — the only
-recovery is to MOVE a foot under the fall.  ``tritium_lib.control`` ships
+already planted; a push beyond what the trim can absorb inverts the body, and
+the only recovery is to MOVE a foot under the fall.  (The earlier "~5 N*s
+reliably inverts it" figure was a measurement artifact: the harness's mid-run
+``--capture`` viewport render stalls the app-update loop that drives the
+control callback — same command and push measured capture-on 0/8 upright vs
+capture-free 8/8.  Measured capture-free, a 5 N*s lateral push survives 6/10
+— near the 50% point, NOT a reliable inverter.  Session drift compounds this:
+two identical capture-free commands scored 0/3 and 8/8 in one session, so
+only trial-by-trial interleaved A/B counts here.)  ``tritium_lib.control`` ships
 ``StepReflex`` — capture-point stepping gated on the DEVIATION of the
 measured velocity from the gait's commanded ``nominal_vel_xy`` (default
 ``DEFAULT_DEVIATION_THRESHOLD_M`` = 0.04 m).  The original ABSOLUTE-velocity
@@ -347,7 +354,10 @@ class GaitScheduler:
     ``reflex_fn(targets_rad, velocity, dt) -> dict[joint_name, radians]``
     adjusts foot PLACEMENT — where a swing foot lands — from a measured body
     velocity: the capture-point stepping layer that recovers pushes the
-    attitude trim cannot (the trim-only stack inverts above ~5 N*s).  The
+    attitude trim cannot.  (The trim-only stack's old "inverts above ~5 N*s"
+    ceiling was a capture artifact — measured capture-free it survives a
+    5 N*s push 6/10, near the 50% point; see the module docstring.  A large
+    enough push still needs a step.)  The
     hook mirrors ``stabilize_fn`` exactly:
 
       * the placement change lands on RADIAN targets BEFORE the rad->deg

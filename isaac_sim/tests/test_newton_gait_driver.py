@@ -302,8 +302,11 @@ def test_run_stays_open_loop():
 
 # --------------------------------------------------- step reflex (injected)
 #
-# The trim is an ankle strategy: it re-weights planted feet, and above ~5 N*s
-# of push the body inverts anyway — the only recovery is to MOVE a foot
+# The trim is an ankle strategy: it re-weights planted feet; a push beyond
+# what it can absorb inverts the body anyway — the old "~5 N*s inverts it"
+# figure was a capture artifact (mid-run --capture stalls the control
+# callback: capture-on 0/8 vs capture-free 8/8 upright; capture-free, a
+# 5 N*s push survives 6/10) — and the only recovery is to MOVE a foot
 # (capture-point stepping, the lib's StepReflex — which gates on deviation
 # from a REQUIRED ``nominal_vel_xy`` after live Newton disproved absolute
 # gating: 6/6 upright fell to 0/6 undisturbed; the deviation gate itself is
