@@ -544,3 +544,57 @@ it does not challenge it. Note the run is 8 s with the kick at t=3 s, so the
 first ~2 s of start-up transient (peak tilt 22–25°) is excluded from the
 post-kick score by construction — `score_recovery` measures peak *after* the
 disturbance and reports the pre-kick worst separately as `baseline_deg`.
+
+## 2026-07-18, tick 16 — the body turns, and n=1 lied about how much
+
+Steering did not exist anywhere in the stack before this tick.
+`QuadrupedGaitCycle` takes no yaw, `GaitScheduler` adds only a clock, and the
+gait table's only left/right asymmetry is a mirrored hip sway that is
+symmetric by construction. The trot that has walked since tick 10 could walk
+in exactly one direction.
+
+`--steer RAD_S` mixes a yaw command into the stride through
+`tritium_lib.control.differential_stride`. The mixing law is not
+reimplemented here — it is the function the headless tests drive. This file
+knows only which DOF sits on which side, read off `LegPlacement.y` rather
+than hardcoded.
+
+**Scale the stride about the STAND pose, not about zero.** Scaling the
+absolute joint angle drags the body's neutral crouch with it and changes ride
+height, which shows up in the capture as a limp rather than a turn. Scaling
+the deviation from stand means a negative scale swings that side backwards
+*through* stand, which is what lets a body spin in place.
+
+**The metric was the blocker, again.** The first run was unreadable:
+`score_trace` reported displacement and tilt, and both are blind to yaw by
+construction (`tilt_from_upright_deg` excludes it deliberately). A perfect
+circle and a straight line of the same arc length scored identically. Added
+`yaw_change_deg` / `yaw_rate_dps`, unwrapped so a turn across ±180° does not
+read as a turn back, and reported in every arm rather than only the steered
+one — a straight arm's drift is the baseline that makes the steered number
+mean anything, and it is only credible if collected the same way in both.
+
+**n=1 is not evidence in this lane, demonstrated the hard way.** A first
+single-trial sweep measured port `+67.79°`, straight `-22.68°`, starboard
+`-42.38°` — clean, monotonic, 110° of separation. At 3 trials per arm:
+
+| arm | commanded | yaw changes (deg) | median |
+|---|---|---|---|
+| port | +0.6 rad/s | +6.77, +32.27, +31.56 | +31.56 |
+| straight | 0.0 | -11.66, +18.19, +5.73 | +5.73 |
+| starboard | -0.6 rad/s | -59.60, -27.65, -44.05 | -44.05 |
+
+Port halved and straight changed sign. What survives: median ordering is
+monotonic, all six steered trials carry their commanded sign, and **port and
+starboard are fully disjoint** (34° of daylight between port's worst and
+starboard's best). What does not: **port overlaps straight** — one port trial
+turned less than one unsteered trial — so a single positive-command trial is
+not distinguishable from this trot's own drift.
+
+Two open items this exposes. The unsteered gait **does not walk straight**
+(drift spans -11.7° to +18.2°), so every steering number here is a
+displacement from a noisy baseline. And the mixer delivers ~32° against a
+commanded 0.6 rad/s over 8 s ≈ 275°, i.e. **~12% of commanded yaw** — open
+loop, with no yaw feedback closing the gap. Closing that loop is the obvious
+next lever, and it is also what route-following will need, since pure pursuit
+assumes a body that roughly achieves the yaw rate it is asked for.
