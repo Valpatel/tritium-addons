@@ -555,6 +555,17 @@ disturbance and reports the pre-kick worst separately as `baseline_deg`.
 > capture-free commands scored 0/3 and 8/8 in the same session, so only
 > trial-by-trial interleaved A/B is meaningful here. The table is preserved
 > above as honestly recorded at the time.
+>
+> **Harness fix (2026-07-18):** the confound is now structurally impossible,
+> not warned about. `--capture` takes its frame from a dedicated **UNSCORED
+> evidence run** per arm (verdict `UNSCORED[...]`, stamped
+> `capture_perturbed`, barred from every rate by `split_scoreable()`);
+> scored trials never render mid-window and their bridge traffic is
+> independent of every capture flag. Every trial also reports
+> `max_cb_gap_s` — the widest sim-time hole between consecutive control
+> callbacks — so a stalled control loop is a measured number on the trial
+> line instead of an inference from an 0/8-vs-8/8 anomaly later. Pinned by
+> `tests/test_gait_capture_quarantine.py`.
 
 ## 2026-07-18, tick 16 — the body turns, and n=1 lied about how much
 

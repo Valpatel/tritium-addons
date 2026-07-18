@@ -480,6 +480,15 @@ def _apply_trim(targets, offsets):
 
 state = {"trace": [], "steps": 0, "t0": None, "err": None,
          "t_prev": None, "stabilized": 0, "max_cmd_seen": 0.0,
+         # Stall tripwire.  This callback rides the APP-UPDATE stream, so
+         # anything synchronous on the kit main thread -- a viewport render,
+         # a bridge RPC -- freezes it while Newton keeps integrating
+         # underneath.  The largest sim-time gap between consecutive
+         # callbacks makes such a stall VISIBLE in the collected numbers: a
+         # healthy run sits near the frame period (~17 ms), while the mid-run
+         # capture that minted the retired "~5 N*s inverts it" ceiling shows
+         # up as a multi-hundred-ms hole in the control loop.
+         "t_last_cb": None, "max_cb_gap_s": 0.0,
          # Disturbance bookkeeping.  `kicks` records what actually landed and
          # when -- a run that reports an empty list did NOT run the experiment
          # it claims to, and scoring it would compare two undisturbed arms.
@@ -736,6 +745,16 @@ def _on_step(dt):
         if elapsed > DURATION:
             return
 
+        # Record the largest sim-time hole between consecutive callbacks.
+        # Only in-window gaps count: after DURATION the subscription idles
+        # until cleanup, and the collect RPC itself would register as a
+        # (harmless) stall.
+        if state["t_last_cb"] is not None:
+            _gap = elapsed - state["t_last_cb"]
+            if _gap > state["max_cb_gap_s"]:
+                state["max_cb_gap_s"] = _gap
+        state["t_last_cb"] = elapsed
+
         # Kick BEFORE this step's targets are commanded, so the controller
         # first sees the disturbance on the very next step rather than
         # half a stride later.
@@ -975,6 +994,9 @@ st = g["state"]
 result = {"steps": st["steps"], "err": st["err"], "trace": st["trace"],
           "joint_names": g["joint_names"], "kicks": st["kicks"],
           "body_mass": st["body_mass"],
+          "stabilized": st.get("stabilized"),
+          "max_cmd_seen": st.get("max_cmd_seen"),
+          "max_cb_gap_s": st.get("max_cb_gap_s"),
           "follow": st.get("follow", []), "arrived_at": st.get("arrived_at"),
           "live": st.get("live", []), "live_sock_err": st.get("live_sock_err")}
 """
@@ -1098,6 +1120,89 @@ def score_trace(trace: list[list[float]]) -> dict:
             else "STATIONARY"
         ),
     }
+
+
+def split_scoreable(runs: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Partition trials into (scoreable, capture-perturbed).
+
+    A trial that captured mid-window did not measure the gait.  The viewport
+    render runs synchronously on the kit main thread -- the same thread that
+    pumps the app-update stream driving the control callback -- so for the
+    duration of the render the controller is frozen while Newton keeps
+    integrating underneath (measured: same command and push, 0/8 upright
+    capture-on vs 8/8 capture-free).  Every rate this tool reports goes
+    through this filter, so the exclusion is enforced by structure rather
+    than by an operator having read a help string -- the failure mode that
+    let the false "~5 N*s inverts the body" ceiling reach three documents.
+    """
+    scoreable = [r for r in runs if not r.get("capture_perturbed")]
+    perturbed = [r for r in runs if r.get("capture_perturbed")]
+    return scoreable, perturbed
+
+
+def arm_summary(runs: list[dict], disturb_at: float | None = None) -> dict:
+    """Aggregate one arm's trials into its reported rates.
+
+    Rates are computed over the scoreable trials ONLY (``split_scoreable``);
+    a capture-perturbed trial that reaches this function is excluded and
+    reported under ``capture_excluded`` instead of silently disappearing --
+    or worse, silently counting.  If nothing scoreable remains, the summary
+    says so (``trials: 0``, rates ``None``) rather than inventing a rate
+    from perturbed runs.
+    """
+    runs, perturbed = split_scoreable(runs)
+    walked = sum(1 for r in runs if r.get("verdict") == "WALKED")
+    upright = sum(1 for r in runs if not r.get("tumbled"))
+    tilts = [r["max_tilt_deg"] for r in runs if r.get("max_tilt_deg") is not None]
+    dists = [r["displacement_m"] for r in runs if r.get("displacement_m") is not None]
+    summary = {
+        "trials": len(runs),
+        "walked": walked,
+        "walked_rate": round(walked / len(runs), 3) if runs else None,
+        "upright": upright,
+        "upright_rate": round(upright / len(runs), 3) if runs else None,
+        "median_max_tilt_deg": round(sorted(tilts)[len(tilts) // 2], 2) if tilts else None,
+        "worst_max_tilt_deg": round(max(tilts), 2) if tilts else None,
+        "median_displacement_m": round(sorted(dists)[len(dists) // 2], 3) if dists else None,
+        "verdicts": [r.get("verdict") for r in runs],
+    }
+    if perturbed:
+        summary["capture_excluded"] = len(perturbed)
+        summary["capture_excluded_verdicts"] = [r.get("verdict") for r in perturbed]
+    # Yaw is reported unconditionally, not just when --steer is set: a
+    # straight run's heading drift is the baseline that makes a steered
+    # run's number mean anything, and it is only credible if it is
+    # collected the same way in both arms rather than switched on for the
+    # arm being advertised.
+    yaws = [r["yaw_change_deg"] for r in runs
+            if r.get("yaw_change_deg") is not None]
+    if yaws:
+        summary["median_yaw_change_deg"] = round(
+            sorted(yaws)[len(yaws) // 2], 2)
+        summary["yaw_changes_deg"] = [round(y, 2) for y in yaws]
+    if disturb_at is not None:
+        # Recovery is scored only over trials where the kick actually
+        # landed.  Counting a NOT_APPLIED run as a recovery would inflate
+        # exactly the number this experiment exists to measure.
+        applied = [r for r in runs if r.get("disturb_ok")]
+        recovered = sum(1 for r in applied
+                        if r["disturbance"].get("verdict") == "RECOVERED")
+        peaks = [r["disturbance"]["peak_deg"] for r in applied]
+        settles = [r["disturbance"]["settle_time"] for r in applied
+                   if r["disturbance"].get("settle_time") is not None]
+        summary["disturbance"] = {
+            "kick_applied": len(applied),
+            "kick_missing": len(runs) - len(applied),
+            "recovered": recovered,
+            "recovered_rate": (round(recovered / len(applied), 3)
+                               if applied else None),
+            "median_peak_tilt_deg": (round(sorted(peaks)[len(peaks) // 2], 2)
+                                     if peaks else None),
+            "worst_peak_tilt_deg": round(max(peaks), 2) if peaks else None,
+            "median_settle_s": (round(sorted(settles)[len(settles) // 2], 3)
+                                if settles else None),
+        }
+    return summary
 
 
 def twist_spec(args) -> dict | None:
@@ -1417,12 +1522,15 @@ def main() -> int:
                          "the Go2 is ~0.31 m wide. Not the same as "
                          "--plan-clearance, which is only a preference")
     ap.add_argument("--capture",
-                    help="write a viewport PNG here (trial 1 of each arm). "
-                         "WARNING: a mid-run capture stalls the app-update "
-                         "loop driving the control callback — measured 0/8 "
-                         "upright capture-on vs 8/8 capture-free, same "
-                         "command and push — so a captured trial's score is "
-                         "perturbed; take rates from capture-free trials.")
+                    help="write a viewport PNG here, taken from a DEDICATED "
+                         "UNSCORED evidence run per arm (-closed/-open "
+                         "suffix), never from a scored trial. A mid-run "
+                         "render stalls the app-update loop driving the "
+                         "control callback (measured 0/8 upright capture-on "
+                         "vs 8/8 capture-free, same command and push), so "
+                         "the harness quarantines captures structurally: "
+                         "every rate comes from capture-free trials only, "
+                         "and a captured run's verdict reads UNSCORED[...].")
     ap.add_argument("--capture-distance", type=float, default=3.0, metavar="M",
                     help="camera standoff for --capture. The 3 m default "
                          "frames the BODY; framing a whole ROUTE needs enough "
@@ -1521,13 +1629,30 @@ def main() -> int:
     results: dict[bool, list[dict]] = {}
     for stabilize in arms:
         label = "closed-loop" if stabilize else "open-loop (control)"
+        if args.capture:
+            # The frame comes from a DEDICATED, UNSCORED evidence run --
+            # never from a scored trial.  A mid-run capture stalls the
+            # app-update loop that drives the control callback (measured:
+            # same command and push, 0/8 upright capture-on vs 8/8
+            # capture-free), so a captured run frames the scene but its
+            # numbers measure the stall.  Splitting the run keeps the
+            # evidence AND keeps every scored trial byte-for-byte the
+            # capture-free code path: a scored trial's outcome cannot
+            # depend on whether a capture happened, because no scored
+            # trial ever captures.
+            suffix = "closed" if stabilize else "open"
+            evidence = run_trial(
+                br, gait, args, stabilize,
+                args.capture.replace(".png", f"-{suffix}.png"),
+                route=route, obstacles=obstacles)
+            print(f"[gait] {label} evidence run: {evidence.get('verdict')} "
+                  f"dist={evidence.get('displacement_m')} "
+                  f"max_tilt={evidence.get('max_tilt_deg')} "
+                  f"cb_gap={evidence.get('max_cb_gap_s')} "
+                  "— frame only, excluded from every rate", flush=True)
         runs = []
         for trial in range(1, args.trials + 1):
-            capture = None
-            if args.capture and trial == 1:
-                suffix = "closed" if stabilize else "open"
-                capture = args.capture.replace(".png", f"-{suffix}.png")
-            score = run_trial(br, gait, args, stabilize, capture,
+            score = run_trial(br, gait, args, stabilize, None,
                               route=route, obstacles=obstacles)
             if args.dump_follow and score.get("follow_trace"):
                 path = args.dump_follow.replace(
@@ -1552,7 +1677,12 @@ def main() -> int:
             line = (f"[gait] {label} trial {trial}/{args.trials}: "
                     f"{score.get('verdict')} "
                     f"dist={score.get('displacement_m')} "
-                    f"max_tilt={score.get('max_tilt_deg')}")
+                    f"max_tilt={score.get('max_tilt_deg')} "
+                    # The stall tripwire, printed on every scored line: a
+                    # value far above the ~17 ms frame period means SOMETHING
+                    # froze the control callback mid-window and this trial
+                    # deserves suspicion whatever its verdict says.
+                    f"cb_gap={score.get('max_cb_gap_s')}")
             if route:
                 line += (f" | route={score.get('route_verdict')}"
                          f" gap={score.get('route_final_gap_m')}"
@@ -1576,64 +1706,25 @@ def main() -> int:
         results[stabilize] = runs
 
     print("\n" + "=" * 62)
-    print("HONEST GAIT RATE — every trial counted, none discarded")
+    print("HONEST GAIT RATE — every capture-free trial counted, none discarded")
     print("=" * 62)
     summary = {}
     for stabilize, runs in results.items():
         label = "closed_loop" if stabilize else "open_loop_control"
-        walked = sum(1 for r in runs if r.get("verdict") == "WALKED")
-        upright = sum(1 for r in runs if not r.get("tumbled"))
-        tilts = [r["max_tilt_deg"] for r in runs if r.get("max_tilt_deg") is not None]
-        dists = [r["displacement_m"] for r in runs if r.get("displacement_m") is not None]
-        summary[label] = {
-            "trials": len(runs),
-            "walked": walked,
-            "walked_rate": round(walked / len(runs), 3) if runs else None,
-            "upright": upright,
-            "upright_rate": round(upright / len(runs), 3) if runs else None,
-            "median_max_tilt_deg": round(sorted(tilts)[len(tilts) // 2], 2) if tilts else None,
-            "worst_max_tilt_deg": round(max(tilts), 2) if tilts else None,
-            "median_displacement_m": round(sorted(dists)[len(dists) // 2], 3) if dists else None,
-            "verdicts": [r.get("verdict") for r in runs],
-        }
-        # Yaw is reported unconditionally, not just when --steer is set: a
-        # straight run's heading drift is the baseline that makes a steered
-        # run's number mean anything, and it is only credible if it is
-        # collected the same way in both arms rather than switched on for the
-        # arm being advertised.
-        yaws = [r["yaw_change_deg"] for r in runs
-                if r.get("yaw_change_deg") is not None]
-        if yaws:
-            summary[label]["median_yaw_change_deg"] = round(
-                sorted(yaws)[len(yaws) // 2], 2)
-            summary[label]["yaw_changes_deg"] = [round(y, 2) for y in yaws]
-        if args.disturb_at is not None:
-            # Recovery is scored only over trials where the kick actually
-            # landed.  Counting a NOT_APPLIED run as a recovery would inflate
-            # exactly the number this experiment exists to measure.
-            applied = [r for r in runs if r.get("disturb_ok")]
-            recovered = sum(1 for r in applied
-                            if r["disturbance"].get("verdict") == "RECOVERED")
-            peaks = [r["disturbance"]["peak_deg"] for r in applied]
-            settles = [r["disturbance"]["settle_time"] for r in applied
-                       if r["disturbance"].get("settle_time") is not None]
-            summary[label]["disturbance"] = {
-                "kick_applied": len(applied),
-                "kick_missing": len(runs) - len(applied),
-                "recovered": recovered,
-                "recovered_rate": (round(recovered / len(applied), 3)
-                                   if applied else None),
-                "median_peak_tilt_deg": (round(sorted(peaks)[len(peaks) // 2], 2)
-                                         if peaks else None),
-                "worst_peak_tilt_deg": round(max(peaks), 2) if peaks else None,
-                "median_settle_s": (round(sorted(settles)[len(settles) // 2], 3)
-                                    if settles else None),
-            }
-        print(f"{label:20s} walked {walked}/{len(runs)}  upright {upright}/{len(runs)}  "
-              f"median_tilt={summary[label]['median_max_tilt_deg']}deg"
-              f"  yaw={summary[label].get('median_yaw_change_deg')}deg"
-              + (f"  recovered {summary[label]['disturbance']['recovered']}/"
-                 f"{summary[label]['disturbance']['kick_applied']}"
+        summary[label] = s = arm_summary(runs, disturb_at=args.disturb_at)
+        if s.get("capture_excluded"):
+            # Belt over braces: main() never puts a captured run into `runs`,
+            # so this fires only if someone re-wires the loop above -- and
+            # then the excluded count is printed rather than silently folded
+            # into the rate.
+            print(f"[gait] WARNING: {label}: {s['capture_excluded']} "
+                  "capture-perturbed trial(s) EXCLUDED from every rate")
+        print(f"{label:20s} walked {s['walked']}/{s['trials']}  "
+              f"upright {s['upright']}/{s['trials']}  "
+              f"median_tilt={s['median_max_tilt_deg']}deg"
+              f"  yaw={s.get('median_yaw_change_deg')}deg"
+              + (f"  recovered {s['disturbance']['recovered']}/"
+                 f"{s['disturbance']['kick_applied']}"
                  if args.disturb_at is not None else ""))
     print(json.dumps(summary, indent=1))
 
@@ -1659,8 +1750,10 @@ def main() -> int:
 
     # With --trials the exit code reflects the ARM, not one lucky run: a single
     # WALKED out of ten is not a working gait, and an exit code that says so
-    # is the whole reason this flag exists.
-    primary = results.get(True, results.get(False, []))
+    # is the whole reason this flag exists.  Filtered through split_scoreable
+    # like every other rate: if only perturbed runs exist, the tool FAILS
+    # rather than grading the stall.
+    primary, _ = split_scoreable(results.get(True, results.get(False, [])))
     if not primary:
         return 1
     walked = sum(1 for r in primary if r.get("verdict") == "WALKED")
@@ -1768,12 +1861,18 @@ def run_trial(br: "Bridge", gait: dict, args, stabilize: bool,
               capture: str | None = None,
               route: dict | None = None,
               obstacles: "list | None" = None) -> dict:
-    """One scored run from a freshly rebuilt scene.
+    """One run from a freshly rebuilt scene.
 
     The scene is torn down and rebuilt per trial rather than reusing the
     stage.  A Go2 left holding its last joint targets topples within seconds,
     so a second trial starting from wherever the first one ended would be
     scoring the recovery of a fallen robot, not the gait.
+
+    ``capture`` makes this run EVIDENCE, not a data point: the mid-window
+    viewport render stalls the control callback (see the comment at the
+    capture block), so the result comes back stamped ``capture_perturbed``
+    with every verdict wrapped ``UNSCORED[...]`` and can never enter a rate.
+    Pass ``None`` for a scored trial.
     """
     br.sim_control("stop")
     time.sleep(1.0)
@@ -1814,21 +1913,37 @@ def run_trial(br: "Bridge", gait: dict, args, stabilize: bool,
     # looked alike for two arms whose traces could not be more different.
     # Anywhere in [0, seconds] is still a measured moment; past it is not.
     #
-    # CORRECTION (2026-07): the capture is not a neutral observer — the
-    # viewport render stalls the app-update loop that drives the control
-    # callback, and the same command and push measured 0/8 upright capture-on
-    # vs 8/8 capture-free (the retired "~5 N*s inverts it" ceiling was this
-    # artifact).  A captured trial frames the run AND perturbs it: keep the
-    # frame as evidence of the scene, take rates from capture-free trials.
-    at = args.seconds * 0.5 if args.capture_at is None else args.capture_at
-    at = max(0.0, min(float(at), args.seconds))
-    mid_deadline = time.time() + at
+    # BUT a capture is not a neutral observer.  /sim/capture (and
+    # /camera/look_at) render synchronously on the kit MAIN thread -- the
+    # thread that pumps the app-update stream _on_step rides -- so for the
+    # duration of the render the gait targets freeze mid-stride, the
+    # stabiliser is blind, any open push window straddles the gap, and on
+    # resume the sim-time jump snaps the gait phase discontinuously.
+    # Measured: same command and push, 0/8 upright capture-on vs 8/8
+    # capture-free (the retired "~5 N*s inverts it" ceiling was this
+    # artifact).  So a capture run is EVIDENCE, never a data point: the
+    # result is stamped capture_perturbed, its verdicts are wrapped
+    # UNSCORED[...], and split_scoreable() bars it from every rate.  main()
+    # only ever passes `capture` on a dedicated evidence run; scored trials
+    # take the `else` branch below, whose bridge traffic is identical
+    # whether or not --capture was given.
+    mid_shot = None
     if capture:
+        at = args.seconds * 0.5 if args.capture_at is None else args.capture_at
+        at = max(0.0, min(float(at), args.seconds))
+        mid_deadline = time.time() + at
         br.camera_look_at(ROBOT_PATH, distance=args.capture_distance,
                           elevation=args.capture_elevation)
-    time.sleep(max(0.0, mid_deadline - time.time()))
-    mid_shot = br.capture() if capture else None
-    time.sleep(max(0.0, args.seconds * 0.5 + 2.0))
+        time.sleep(max(0.0, mid_deadline - time.time()))
+        mid_shot = br.capture()
+        # Sleep out the REMAINDER of the window, measured from the actual
+        # capture time.  The old `seconds * 0.5 + 2.0` assumed a mid-window
+        # capture, so an early --capture-at made the total wait shorter than
+        # the window itself and CLEANUP tore the driver down mid-run.
+        time.sleep(max(0.0, (args.seconds - at) + 2.0))
+    else:
+        # No mid-window bridge traffic of any kind: one uninterrupted wait.
+        time.sleep(args.seconds + 2.0)
 
     collected = _ok("collect", br.execute(COLLECT_CODE))
     if collected.get("err"):
@@ -1841,6 +1956,11 @@ def run_trial(br: "Bridge", gait: dict, args, stabilize: bool,
     score["stabilized_steps"] = collected.get("stabilized")
     score["max_cmd_rad"] = collected.get("max_cmd_seen")
     score["stabilize"] = stabilize
+    # The stall tripwire, carried out of the kit for every run: the largest
+    # sim-time hole between consecutive control callbacks inside the scored
+    # window.  A healthy run sits near the ~17 ms frame period; a mid-window
+    # render shows up here as a hole orders of magnitude wider.
+    score["max_cb_gap_s"] = collected.get("max_cb_gap_s")
     # Carried out of the run so a live session can be graded against what was
     # actually COMMANDED, not just how far the body got.  Distance alone
     # cannot tell a body that obeyed a live operator from one running a baked
@@ -1852,6 +1972,25 @@ def run_trial(br: "Bridge", gait: dict, args, stabilize: bool,
     score["pose_trace"] = collected.get("trace", [])
     if route:
         score.update(score_route(collected, route, obstacles or []))
+
+    # Quarantine -- LAST, so every verdict any scorer added is already in the
+    # dict.  A run that captured had its control callback stalled by the
+    # render, so it is stamped and its verdicts wrapped: even a consumer that
+    # ignores split_scoreable() and string-matches "WALKED"/"RECOVERED" can
+    # never count this trial.  The raw measurements stay -- they are
+    # diagnostics (they are how the stall was caught) -- but no verdict from
+    # this run reads as a clean one.
+    score["capture_perturbed"] = capture is not None
+    if capture is not None:
+        score["verdict"] = f"UNSCORED[{score['verdict']}]"
+        if score.get("route_verdict"):
+            score["route_verdict"] = f"UNSCORED[{score['route_verdict']}]"
+        if score.get("disturbance"):
+            score["disturbance"]["verdict"] = (
+                f"UNSCORED[{score['disturbance']['verdict']}]")
+        if "disturb_ok" in score:
+            # A perturbed trial can never serve as disturbance evidence.
+            score["disturb_ok"] = False
 
     if capture and mid_shot:
         data = mid_shot.get("result", {})
