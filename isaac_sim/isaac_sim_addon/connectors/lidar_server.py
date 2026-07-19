@@ -241,6 +241,41 @@ class SyntheticScanSource(ScanSource):
         return scan
 
 
+def flat_scan_to_ranges(frame: dict, num_beams: int, angle_min: float,
+                        range_min: float, range_max: float) -> tuple:
+    """``IsaacComputeRTXLidarFlatScan`` output -> ``(ranges, has_returns)``.
+
+    Pure (numpy only) so both LiDAR shapes — the own-kit ``IsaacScanSource``
+    and the attached mode riding an already-running kit — bin the sensor's
+    frame through ONE tested path instead of two drifting copies.
+
+    ``has_returns`` is False when the frame carried no positive depth at all;
+    the caller owns warm-up bookkeeping, because "no returns yet" means
+    different things to a booting sensor and a running one.
+
+    -1 is the flat scan's NO-RETURN SENTINEL, not a range.  Feeding it through
+    unmasked makes every empty bearing the nearest contact in the sweep — an
+    obstacle detector would brake for open air.  Dropped here; the resampler
+    leaves those beams at ``range_max``, which is what "nothing out there"
+    means in a LaserScan.
+    """
+    depth = np.asarray(frame.get("linearDepthData", []),
+                       dtype=np.float64).ravel()
+    valid = depth > 0.0
+    if depth.size == 0 or not valid.any():
+        return np.full(num_beams, range_max, dtype=np.float64), False
+    # The flat scan reports its sweep as an azimuth RANGE in degrees plus a
+    # dense row of depths, not a per-point azimuth array — bearings are
+    # implied by index, so they are reconstructed here.  endpoint=False
+    # because the last bearing wraps onto the first (a 360 deg sweep must
+    # not sample -180 and +180 as two distinct beams).
+    az_lo, az_hi = np.deg2rad(np.asarray(
+        frame.get("azimuthRange", (-180.0, 180.0)), dtype=np.float64))
+    bearings = np.linspace(az_lo, az_hi, depth.size, endpoint=False)
+    return resample_to_beams(depth[valid], bearings[valid], num_beams,
+                             angle_min, range_min, range_max), True
+
+
 class IsaacScanSource(ScanSource):
     """Real Isaac Sim RTX Lidar -> ordered sweeps.
 
@@ -366,15 +401,10 @@ class IsaacScanSource(ScanSource):
     def get_scan(self) -> np.ndarray:
         self._world.step(render=True)
         frame = self._flat.get_data() or {}
-        depth = np.asarray(frame.get("linearDepthData", []),
-                           dtype=np.float64).ravel()
-        # -1 is the flat scan's NO-RETURN SENTINEL, not a range.  Feeding it
-        # through unmasked makes every empty bearing the nearest contact in the
-        # sweep -- an obstacle detector would brake for open air.  Drop the
-        # non-returns here and let resample_to_beams leave those beams at
-        # range_max, which is what "nothing out there" means in a LaserScan.
-        valid = depth > 0.0
-        if depth.size == 0 or not valid.any():
+        ranges, has_returns = flat_scan_to_ranges(
+            frame, self.num_beams, self.angle_min,
+            self.range_min, self.range_max)
+        if not has_returns:
             # A sweep of all-range_max is what an empty room looks like AND
             # what a sensor that never rendered looks like.  That ambiguity
             # cost a tick: with the Newton kit app holding 18 of 24 GB, the
@@ -393,18 +423,9 @@ class IsaacScanSource(ScanSource):
                     "allocation fails SILENTLY into this branch)",
                     self._empty_frames,
                 )
-            return np.full(self.num_beams, self.range_max, dtype=np.float64)
+            return ranges
         self._warmed = True
-        # The flat scan reports its sweep as an azimuth RANGE in degrees plus a
-        # dense row of depths, not a per-point azimuth array -- bearings are
-        # implied by index, so they are reconstructed here.  endpoint=False
-        # because the last bearing wraps onto the first (a 360 deg sweep must
-        # not sample -180 and +180 as two distinct beams).
-        az_lo, az_hi = np.deg2rad(np.asarray(
-            frame.get("azimuthRange", (-180.0, 180.0)), dtype=np.float64))
-        bearings = np.linspace(az_lo, az_hi, depth.size, endpoint=False)
-        return resample_to_beams(depth[valid], bearings[valid], self.num_beams,
-                                 self.angle_min, self.range_min, self.range_max)
+        return ranges
 
     def close(self) -> None:
         try:
@@ -505,6 +526,17 @@ class LidarState:
     def latest(self) -> bytes | None:
         with self._lock:
             return self._latest
+
+    def publish(self, body: bytes) -> None:
+        """Publish an ALREADY-ENCODED /scan payload to the holder.
+
+        CameraState.publish's twin: the seam that lets the attached mode
+        (``attached_sensor_server``) — which bins sweeps inside a running
+        Kit's update callback — serve through the same holder, counter and
+        HTTP handler as the own-kit poll loop."""
+        with self._lock:
+            self._latest = body
+            self.scans += 1
 
     def stop(self):
         self._stop.set()

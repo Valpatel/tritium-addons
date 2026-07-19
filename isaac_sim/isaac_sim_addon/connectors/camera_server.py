@@ -1056,15 +1056,29 @@ class CameraState:
                 blob = encode_depth16(frame) if name == "depth16" else self.encode(frame)
                 if blob:
                     encoded[name] = blob
-            if encoded.get("main"):
-                with self._lock:
-                    self._latest.update(encoded)
-                    self.frames += 1
-                return True
-            return False
+            return self.publish(encoded)
         except Exception as exc:
             log.warning("frame render failed: %s", exc)
             return False
+
+    def publish(self, encoded: dict) -> bool:
+        """Publish ALREADY-ENCODED channel blobs to the latest-frame holder.
+
+        The seam that lets a producer other than this class's own render loop
+        feed the HTTP routes — the attached mode (``attached_sensor_server``)
+        encodes inside a running Kit's update callback and hands the bytes
+        over here, so both arrangements serve through one holder and one
+        frame counter.  A frame only counts when ``main`` arrived: partial
+        updates (depth without RGB) refresh their channels but do not tick
+        the liveness counter a watcher uses to tell live from frozen."""
+        if not encoded:
+            return False
+        with self._lock:
+            self._latest.update(encoded)
+            if encoded.get("main"):
+                self.frames += 1
+                return True
+        return False
 
     def run_main_thread(self):
         """Drive rendering on the CALLING (main) thread until stopped. Blocks —
