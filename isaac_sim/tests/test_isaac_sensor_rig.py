@@ -240,3 +240,110 @@ def test_synthetic_camera_still_defaults_to_the_launchers_python():
     """The refusal must not touch the no-GPU path this rig is usually run on."""
     plan = rig.build_rig_plan({"camera": True, "lidar": True})
     assert plan[0][0] == sys.executable
+
+
+# --------------------------------------------------------------------------- #
+# push mode: the rig dials OUT to the operator
+#
+# A kit binds its MJPEG server to the render host's loopback, so the operator
+# can only ever be a different machine by *not* dialling in.  tick 30 taught
+# the camera server to push; this is the rig learning to ask for it.
+# --------------------------------------------------------------------------- #
+
+
+def _cam_argv(plan):
+    for argv in plan:
+        if rig.plan_role(argv) == "camera":
+            return argv
+    raise AssertionError("no camera in plan")
+
+
+def test_push_to_reaches_the_camera_server():
+    argv = _cam_argv(rig.build_rig_plan(
+        {"camera": True, "push_to": "http://operator:8000"}))
+    assert "--push-to" in argv
+    assert argv[argv.index("--push-to") + 1] == "http://operator:8000"
+
+
+def test_no_push_to_means_no_push_flags_at_all():
+    """The default stays a pull rig — push is opt-in, not a silent change."""
+    argv = _cam_argv(rig.build_rig_plan({"camera": True}))
+    assert "--push-to" not in argv
+    assert "--push-channel" not in argv
+
+
+def test_the_rgb_channel_is_always_pushed():
+    argv = _cam_argv(rig.build_rig_plan(
+        {"camera": True, "push_to": "http://operator:8000"}))
+    chans = [argv[i + 1] for i, a in enumerate(argv) if a == "--push-channel"]
+    assert chans == ["main"]
+
+
+def test_every_enabled_pixel_channel_is_pushed():
+    """A channel registered but never pushed is a permanently black tile."""
+    argv = _cam_argv(rig.build_rig_plan({
+        "camera": True, "depth": True, "stereo": True,
+        "push_to": "http://operator:8000",
+    }))
+    chans = [argv[i + 1] for i, a in enumerate(argv) if a == "--push-channel"]
+    assert sorted(chans) == ["depth16", "main", "right"]
+
+
+def test_depth_pushes_the_metric_channel_not_the_colormap():
+    """depth16 carries the NUMBER; /depth is a lossy picture of it."""
+    argv = _cam_argv(rig.build_rig_plan(
+        {"camera": True, "depth": True, "push_to": "http://operator:8000"}))
+    chans = [argv[i + 1] for i, a in enumerate(argv) if a == "--push-channel"]
+    assert "depth16" in chans
+    assert "depth" not in chans
+
+
+def test_push_fps_is_carried_when_set():
+    argv = _cam_argv(rig.build_rig_plan(
+        {"camera": True, "push_to": "http://operator:8000", "push_fps": 5.0}))
+    assert argv[argv.index("--push-fps") + 1] == "5.0"
+
+
+def test_pushed_channels_match_the_source_ids_the_rig_registers():
+    """The contract that makes or breaks the whole lane.
+
+    The rig registers source ids via the lib seam; the camera server derives
+    the id it POSTs to from the channel name.  If these two ever disagree,
+    every pushed frame 404s while both sides report success.
+    """
+    from tritium_lib.fleet.sensor_rig import registration_plan
+
+    cfg = dict(rig.DEFAULT_CONFIG)
+    cfg.update({"camera": True, "depth": True, "stereo": True,
+                "push_to": "http://operator:8000"})
+    argv = _cam_argv(rig.build_rig_plan(cfg))
+    pushed = {argv[i + 1] for i, a in enumerate(argv) if a == "--push-channel"}
+
+    registered = {
+        c.payload["source_id"]
+        for c in registration_plan(rig._rig_sensors(cfg, {"camera": 1}, "h"), push=True)
+    }
+    channel_to_id = {"main": "isaac_rgb", "right": "isaac_right",
+                     "depth16": "isaac_depth16"}
+    assert {channel_to_id[c] for c in pushed} == registered
+
+
+def test_lidar_is_not_given_push_flags():
+    """LiDAR streams sightings, not frames — it has no push channel."""
+    plan = rig.build_rig_plan({"lidar": True, "push_to": "http://operator:8000"})
+    for argv in plan:
+        if rig.plan_role(argv) == "lidar":
+            assert "--push-to" not in argv
+
+
+def test_depth_rig_serves_the_metric_channel_it_registers():
+    """Found by RUNNING it, not by reading it.
+
+    The rig registers ``isaac_depth16`` (the lib's depth stream is metric
+    uint16-mm), but ``--depth`` alone makes the camera server serve only the
+    TURBO-colormapped ``depth``.  Under push that is a hard argparse refusal;
+    under pull it is worse — a silently permanently-black depth tile.  So a
+    depth rig must always ask for the channel it advertises.
+    """
+    argv = _cam_argv(rig.build_rig_plan({"camera": True, "depth": True}))
+    assert "--depth16" in argv

@@ -111,7 +111,25 @@ DEFAULT_CONFIG: dict = {
     # alone).  Consumed by the runnable shell, not by build_rig_plan.
     "register_sc": "",
     "attach_to": "",          # tracked target the camera rides on ("" -> ask /status)
+    # Dial OUT instead of being dialled: the camera server POSTs its frames to
+    # this Command Center ("" -> pull, the historical default).  Needed
+    # whenever the rig and the operator are different machines, because a kit
+    # binds its stream to the RENDER HOST's loopback — an address the operator
+    # cannot reach no matter what the registration advertises.
+    "push_to": "",
+    "push_fps": 0.0,          # 0 -> let the camera server pick its default
 }
+
+#: Pixel channels the camera server can push, keyed by the rig config flag
+#: that enables each.  ``main`` (RGB) is unconditional — a camera rig always
+#: has an RGB channel.  Depth pushes ``depth16`` (metric uint16-mm), never
+#: ``depth``: the latter is a TURBO-colormapped JPEG, a picture of depth with
+#: the range already destroyed, which perception cannot measure from.
+_PUSH_CHANNELS: tuple[tuple[str, str], ...] = (
+    ("", "main"),
+    ("depth", "depth16"),
+    ("stereo", "right"),
+)
 
 
 def build_rig_plan(config: dict | None = None) -> list[list[str]]:
@@ -159,11 +177,24 @@ def build_rig_plan(config: dict | None = None) -> list[list[str]]:
             "--camera-id", cfg["camera_id"],
         ]
         if cfg["depth"]:
-            argv.append("--depth")
+            # Both: --depth is the human-readable colormapped preview,
+            # --depth16 the METRIC uint16-mm frame perception measures from.
+            # The registration advertises depth16, so serving only --depth
+            # would publish a channel that does not exist.
+            argv += ["--depth", "--depth16"]
         if cfg["stereo"]:
             argv.append("--stereo")
         if cfg["scene"]:
             argv += ["--scene", cfg["scene"]]
+        if cfg["push_to"]:
+            argv += ["--push-to", cfg["push_to"]]
+            if cfg["push_fps"]:
+                argv += ["--push-fps", str(cfg["push_fps"])]
+            # Every channel the rig REGISTERS must also be pushed, or the
+            # operator gets a tile that can never render.
+            for flag, channel in _PUSH_CHANNELS:
+                if not flag or cfg[flag]:
+                    argv += ["--push-channel", channel]
         plan.append(argv)
     if cfg["lidar"]:
         argv = [
@@ -301,7 +332,8 @@ def _register_with_sc(cfg: dict, ready_roles: dict, host: str, sc_url: str) -> b
         print(f"--register-sc needs tritium_lib importable: {exc}", file=sys.stderr)
         return False
 
-    calls = registration_plan(_rig_sensors(cfg, ready_roles, host))
+    push = bool(cfg.get("push_to"))
+    calls = registration_plan(_rig_sensors(cfg, ready_roles, host), push=push)
     if not calls:
         print("REGISTER: no pixel sensors in this rig — nothing to register")
         return False
@@ -450,6 +482,17 @@ def main(argv=None) -> int:
     ap.add_argument("--attach-to", default="",
                     help="tracked target id the camera rides on; omit to let "
                          "the camera server's /status advertisement decide")
+    ap.add_argument("--push-to", default="", metavar="URL",
+                    help="camera dials OUT: the camera server POSTs its "
+                         "frames to this Command Center instead of waiting "
+                         "to be dialled. Use whenever the rig and the "
+                         "operator are different machines -- a kit binds its "
+                         "stream to the RENDER HOST's loopback, so a pull "
+                         "registration can never reach it. Implies push-mode "
+                         "registration for --register-sc")
+    ap.add_argument("--push-fps", type=float, default=0.0,
+                    help="frames per second to push (0 -> the camera "
+                         "server's own default)")
     ap.add_argument("--print-plan", action="store_true",
                     help="print the subprocess argv lists and exit (no processes)")
     args = ap.parse_args(argv)
@@ -475,6 +518,7 @@ def main(argv=None) -> int:
         "mount_prim": args.mount_prim, "scene": args.scene,
         "body_asset": args.body_asset, "python": args.python,
         "register_sc": args.register_sc, "attach_to": args.attach_to,
+        "push_to": args.push_to, "push_fps": args.push_fps,
     }
     if not (cfg["camera"] or cfg["lidar"] or cfg["body"]):
         # No sensors named -> the standard full sensor rig (body stays opt-in:
