@@ -105,7 +105,13 @@ went 34/34 (100%) — a consumer that skips `stabilize_fn` inherits the 71%
 number. Those trials ran on the live RTX 4090 Newton kit and are recorded in
 [`examples/NEWTON-GAIT-FINDINGS.md`](examples/NEWTON-GAIT-FINDINGS.md) (tick
 19); they are not re-runnable in CI — the no-GPU tests cover the
-scheduling/clamp/trim contract, not the physics outcome.
+scheduling/clamp/trim contract, not the physics outcome. A third injected
+hook, `reflex_fn`, is the stepping-reflex seam — but lib has live-measured
+`tritium_lib.control.StepReflex` (velocity-residual gating) **unfit to gate a
+walking gait**: gate open on 100.0% of undisturbed walking ticks at the legal
+nominal, live A/B 6/6 upright vs 0/5 (Fisher p = 0.0022). The authoritative
+verdict lives in `tritium_lib.control.step_reflex`; the hook remains for a
+standing body or a future contact/force-triggered reflex.
 
 **Live fire reaches the operator.** `clients/fire_bridge.py` fires a hitscan
 round from a live Isaac body and grades it against target poses read **back**

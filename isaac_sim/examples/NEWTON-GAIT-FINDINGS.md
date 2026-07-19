@@ -702,6 +702,20 @@ the reusable path does not have the controller at all.**
    the tick-13 push-calibration table. The structural point stands: this
    stack has no stepping reflex, and a push beyond the trim's ceiling has no
    recovery mechanism.)*
+   *(Update, 2026-07-18: "add a stepping reflex" was then built and
+   live-measured in lib — `tritium_lib.control.StepReflex`, capture-point
+   stepping gated on the deviation of measured from commanded velocity —
+   and DISPROVEN for walking: at the legal nominal the gate sat open on
+   100.0% of undisturbed walking ticks (median 0.170 m, n=2719,
+   corroborated n=1336), and live A/B fell from baseline 6/6 upright to
+   reflex 0/5 (tilt medians 9.22° vs 179.98°, Fisher p = 0.0022; gate open
+   2350/2350 pooled ticks). lib's verdict — a velocity residual cannot
+   separate a push from the gait on this body; coherent for a STANDING
+   body only — is recorded authoritatively in
+   `tritium_lib.control.step_reflex` with three caveats. The mechanism gap
+   here is real, but a velocity-gated reflex is a measured dead end for
+   it; a walking recovery step needs a different trigger — contact/force
+   sensing, or model-predicted vs actual state error.)*
 3. **Flat ground only.** Every number here is a 50 × 50 × 1 m slab. Slopes,
    steps and debris are unmeasured.
 4. **Yaw drift is unregulated** — heading wanders (session medians +7.6°,

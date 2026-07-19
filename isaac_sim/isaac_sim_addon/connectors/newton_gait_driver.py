@@ -47,8 +47,8 @@ wired without ``stabilize_fn`` is the OPEN-LOOP arm — any consumer that skips
 the injection inherits the 71% number, not the 100% one.  See
 :class:`GaitScheduler` for the exact live binding.
 
-Gated step reflex — push recovery arrives INJECTED the same way
----------------------------------------------------------------
+Gated step reflex — the hook exists; lib MEASURED it unfit for a WALKING gait
+-----------------------------------------------------------------------------
 The closed attitude loop is an *ankle strategy*: it re-weights feet that are
 already planted; a push beyond what the trim can absorb inverts the body, and
 the only recovery is to MOVE a foot under the fall.  (The earlier "~5 N*s
@@ -66,9 +66,33 @@ gate (0.05 m, sold as "an undisturbed walk never crosses it") was
 live-DISPROVEN on Newton: a healthy 1.2 m/s trot's capture point peaks at
 0.101-0.131 m, so that gate fired continuously and took an undisturbed gait
 from 6/6 upright to 0/6 (median tilt 179.97 deg); re-gating at 0.35 m opened
-the gate 0 ticks and restored 6/6.  The deviation gate is the design response
-to that measurement and is NOT yet live-validated.  Like the trajectory and
-the stabilizer, the reflex arrives INJECTED so this module stays lib-free:
+the gate 0 ticks and restored 6/6.
+
+**lib's measured verdict (2026-07-17/18, live Newton — lib's measurement,
+not this addon's): the corrected DEVIATION gate is disproven for walking
+too.  A velocity residual cannot separate a push from the gait on this
+body — do NOT bind ``StepReflex`` behind ``reflex_fn`` on a WALKING gait.**
+At the legal nominal (the commanded speed, the only value a real caller
+has) the deviation capture point exceeded the 0.04 m gate on **100.0% of
+undisturbed walking ticks** (median 0.170 m, n=2719; corroborated n=1336);
+live A/B ran baseline **6/6 upright** vs reflex **0/5** (median tilt 9.22
+vs 179.98 deg, Fisher p = 0.0022), with the gate open on **2350/2350
+pooled ticks** — it never closed once.  lib scopes this as "disproven as
+shipped, on this body, at this gait quality" — NOT "can never work" — and
+records three caveats beside it (no visual evidence for that run; the
+gate-shut control arm never ran for the corrected build; the push
+signature was measured on a gait realising ~18% of commanded speed).  The
+authoritative statement lives in ``tritium_lib.control.step_reflex``'s
+module docstring, pinned there by its ``TestVerdictStaysStated`` — read
+that before wiring anything to this hook; this paragraph only carries it.
+
+Why the hook remains: the SEAM is correct.  A STANDING body is still a
+coherent binding (honest nominal ``(0, 0)`` — the deviation gate
+degenerates exactly to the absolute capture point, and there is no gait
+carrier to alias), and a future reflex triggered by something other than a
+velocity residual (contact/force sensing, model-predicted vs actual state
+error) would arrive through this same hook.  Like the trajectory and the
+stabilizer, the reflex arrives INJECTED so this module stays lib-free:
 
     ``GaitScheduler(..., reflex_fn=...)`` where
     ``reflex_fn(targets_rad, velocity, dt) -> dict[joint, radians]``
@@ -78,11 +102,8 @@ passes it to ``step(velocity=...)``; the scheduler hands the RAW radian
 targets, the opaque velocity, and the seconds since the previous measured
 reflex step to the injected reflex, then feeds its output to the stabilizer
 — placement first, height trim second, conversion/clamp last; see
-:class:`GaitScheduler` for why that order is pinned.  Below the lib's gate
-the reflex is a pure pass-through.  Deviation gating is DESIGNED to keep an
-undisturbed run below the gate (byte-identical with or without the reflex),
-but that property is not yet live-validated — the old absolute gate
-measurably had the opposite property.
+:class:`GaitScheduler` for why that order is pinned.  Below the injected
+reflex's gate it is a pure pass-through.
 
 Pieces
 ------
@@ -91,7 +112,8 @@ Pieces
   * ``GaitScheduler(targets_fn, dt=..., stabilize_fn=None, reflex_fn=None)``
     — walks injected trajectory time in fixed control steps, yielding
     per-step drive-target dicts in DEGREES; optionally closes the attitude
-    loop and/or the step reflex per step.
+    loop and/or the step reflex per step (read the verdict block above
+    before binding anything to ``reflex_fn``).
   * ``apply_foot_height_trim(targets_rad, leg_offsets_m)`` — pure leg-Jacobian
     mapping from per-leg vertical foot offsets (metres) to thigh/calf angle
     trims (radians) — the exact application math the 34/34 example driver
@@ -349,16 +371,25 @@ class GaitScheduler:
         # per control step, with a FRESH pose read:
         _, targets_deg = sched.step(attitude=(qw, qx, qy, qz))
 
-    Gated step reflex (INJECTED — push recovery beyond the trim's ceiling)
-    ----------------------------------------------------------------------
+    Gated step reflex (INJECTED — lib measured it UNFIT to gate a walking gait)
+    ---------------------------------------------------------------------------
     ``reflex_fn(targets_rad, velocity, dt) -> dict[joint_name, radians]``
     adjusts foot PLACEMENT — where a swing foot lands — from a measured body
-    velocity: the capture-point stepping layer that recovers pushes the
+    velocity: the capture-point stepping layer meant to recover pushes the
     attitude trim cannot.  (The trim-only stack's old "inverts above ~5 N*s"
     ceiling was a capture artifact — measured capture-free it survives a
     5 N*s push 6/10, near the 50% point; see the module docstring.  A large
-    enough push still needs a step.)  The
-    hook mirrors ``stabilize_fn`` exactly:
+    enough push still needs a step.)  **Before wiring anything here, read
+    the module docstring's verdict block: lib measured (live Newton,
+    2026-07-17/18) that a velocity residual cannot separate a push from the
+    gait on this body — deviation gate over threshold on 100.0% of
+    undisturbed walking ticks at the legal nominal (median 0.170 m,
+    n=2719); baseline 6/6 upright vs reflex 0/5, Fisher p = 0.0022; gate
+    open 2350/2350 pooled ticks.  Binding ``StepReflex`` to a WALKING gait
+    through this hook is the disproven path; a STANDING body or a future
+    contact/force-triggered reflex are the uses this hook exists for.  The
+    authority is ``tritium_lib.control.step_reflex``, not this class.**
+    The hook mirrors ``stabilize_fn`` exactly:
 
       * the placement change lands on RADIAN targets BEFORE the rad->deg
         conversion and actuator clamping;
@@ -397,15 +428,17 @@ class GaitScheduler:
         guarantees that structurally: its output goes straight to
         convert/clamp and nothing rewrites it.
 
-    The live binding (runner-side, like the stabilizer's): ``StepReflex``,
-    ``ReachLimits`` and ``LegPlacement`` come out of ``tritium_lib.control``;
-    the runner owns the IK that turns a ``StepDecision`` landing point into
-    swing-leg joint targets, applied at the next swing slot its gait
-    allows.  ``nominal_vel_xy`` is REQUIRED and keyword-only — the runner
-    states the velocity its gait is currently commanding, because gating on
-    the ABSOLUTE velocity measured 0/6 upright on an undisturbed Newton
-    trot; passing ``(0, 0)`` while the gait walks silently re-creates that
-    failure::
+    The surviving live binding (runner-side, like the stabilizer's) is the
+    STANDING regime: ``StepReflex``, ``ReachLimits`` and ``LegPlacement``
+    come out of ``tritium_lib.control``; the runner owns the IK that turns
+    a ``StepDecision`` landing point into swing-leg joint targets.
+    ``nominal_vel_xy`` is REQUIRED and keyword-only; for a standing body
+    the honest nominal is ``(0.0, 0.0)``, where the deviation gate
+    degenerates exactly to the absolute capture point and there is no gait
+    carrier to alias.  Passing a walking gait's commanded velocity here
+    instead — the wiring an earlier revision of this docstring showed — is
+    the configuration lib measured 6/6 -> 0/5 (see the verdict block
+    above)::
 
         reflex = StepReflex(com_height_m=0.30)
         legs = [LegPlacement(n, x, y)
@@ -415,13 +448,16 @@ class GaitScheduler:
         def reflex_fn(targets_rad, vel_xy, dt):
             decision = reflex.decide(
                 vel_xy, legs,
-                nominal_vel_xy=gait_cmd_vel_xy,  # what the gait commands NOW
+                nominal_vel_xy=(0.0, 0.0),  # STANDING — the measured-legal use
                 reach_limits=reach)
             if decision.step is None:
                 return targets_rad        # below the gate: pass-through
             return swing_leg_ik(targets_rad, decision.step)  # runner's IK
 
-        sched = GaitScheduler(jt, dt=1.0 / 60.0, limits=DEFAULT_LIMITS_DEG,
+        # stand_fn holds a stand pose — NOT a walking trajectory: lib's
+        # verdict is that this reflex must not gate a walking gait.
+        sched = GaitScheduler(stand_fn, dt=1.0 / 60.0,
+                              limits=DEFAULT_LIMITS_DEG,
                               stabilize_fn=stabilize_fn, reflex_fn=reflex_fn)
         # per control step, with FRESH pose + velocity reads:
         _, targets_deg = sched.step(attitude=quat_wxyz, velocity=vel_xy)
@@ -489,19 +525,25 @@ class GaitScheduler:
         attitude measurement, forwarded opaquely to the injected
         ``stabilize_fn``; ``velocity`` is this step's fresh horizontal
         body-velocity measurement, forwarded opaquely to the injected
-        ``reflex_fn`` (see the class docstring for both, including the
-        pinned composition order: reflex placement first, stabilizer height
-        trim second).  Omit them and the step is open-loop and
-        byte-identical to a scheduler with neither hook."""
+        ``reflex_fn`` (see the class docstring for both — the pinned
+        composition order, reflex placement first, stabilizer height trim
+        second, and lib's measured verdict that a StepReflex-backed
+        ``reflex_fn`` must not gate a WALKING gait).  Omit them and the
+        step is open-loop and byte-identical to a scheduler with neither
+        hook."""
         t = self.t
         rad: Mapping[str, float] = self.targets_fn(float(t))
         if velocity is not None:
             if self.reflex_fn is None:
                 raise ValueError(
                     "step() got a velocity but no reflex_fn was injected — "
-                    "the push recovery you think is armed is absent (a push "
-                    "beyond what the trim absorbs needs a step to catch it); "
-                    "construct GaitScheduler(..., reflex_fn=...)"
+                    "the push recovery you think is armed is absent; "
+                    "construct GaitScheduler(..., reflex_fn=...).  Before "
+                    "you do: lib MEASURED (tritium_lib.control.step_reflex) "
+                    "that a velocity-residual reflex cannot gate a WALKING "
+                    "gait on this body — live A/B baseline 6/6 upright vs "
+                    "reflex 0/5 — so bind StepReflex only for a STANDING "
+                    "body, or a differently-triggered reflex for walking"
                 )
             t_prev = self._vel_t_prev
             step_dt = (t - t_prev) if t_prev is not None else 0.0
@@ -644,7 +686,10 @@ def mock_stabilize_fn(targets_rad: dict[str, float], attitude: object,
 # Mock reflex geometry — a Go2-class ride height and this mock's OWN fixed
 # gate, literals for the hygiene gate (no tritium_lib on the box).  0.05 m is
 # NOT the lib's gate: the lib gates on deviation from ``nominal_vel_xy`` at
-# DEFAULT_DEVIATION_THRESHOLD_M = 0.04 (absolute gating was live-disproven).
+# DEFAULT_DEVIATION_THRESHOLD_M = 0.04 (absolute gating was live-disproven —
+# and lib has since measured the deviation gate unfit for a WALKING gait too;
+# see the module docstring's verdict block).  These literals exercise the
+# scheduler SEAM only.
 MOCK_REFLEX_COM_HEIGHT_M = 0.30
 MOCK_REFLEX_GATE_M = 0.05
 _GRAVITY_MPS2 = 9.80665
@@ -664,14 +709,19 @@ def mock_reflex_fn(targets_rad: dict[str, float], velocity: object,
     layering contract this seam exists to prove.  Absolute-velocity gating
     is exactly the scheme live-DISPROVEN in the lib (an undisturbed 1.2 m/s
     trot's capture point peaks at 0.101-0.131 m, so 6/6 upright fell to
-    0/6); the production ``StepReflex`` instead gates on the deviation from
-    a REQUIRED ``nominal_vel_xy``.  Fine for a mock: tests pick velocities
-    relative to THIS gate to exercise both sides of the seam.  Above it, a
-    cartoon step: the leg whose home placement sits closest to the capture
-    point (first wins a tie, like the lib) swings toward it — thigh by the
-    forward excursion, hip by the lateral, 1 rad per metre.  A cartoon
-    selection AND a cartoon law: the real reflex clamps to reach and reports
-    its residual; this only proves the seam."""
+    0/6); the production ``StepReflex`` gates on the deviation from a
+    REQUIRED ``nominal_vel_xy`` instead — and lib then measured THAT gate
+    unfit for a walking gait as well (over threshold on 100.0% of
+    undisturbed walking ticks at the legal nominal; live A/B 6/6 -> 0/5,
+    Fisher p = 0.0022 — the verdict block in the module docstring carries
+    lib's full statement; standing bodies only).  Fine for a mock: tests
+    pick velocities relative to THIS gate to exercise both sides of the
+    seam, proving the SEAM, not the reflex.  Above it, a cartoon step: the
+    leg whose home placement sits closest to the capture point (first wins
+    a tie, like the lib) swings toward it — thigh by the forward excursion,
+    hip by the lateral, 1 rad per metre.  A cartoon selection AND a cartoon
+    law: the real reflex clamps to reach and reports its residual; this
+    only proves the seam."""
     vx, vy = (float(v) for v in velocity)  # type: ignore[misc]
     tc = math.sqrt(MOCK_REFLEX_COM_HEIGHT_M / _GRAVITY_MPS2)
     cx, cy = vx * tc, vy * tc
@@ -695,7 +745,10 @@ def selftest(args) -> int:
     Then the stabilizer hook: no attitude / zero error = byte-identical to
     open-loop; a synthetic roll trims the two sides apart; clamps hold.
     Then the reflex hook: no velocity / below-gate velocity = byte-identical;
-    an above-gate shove moves the stepping leg's placement; clamps hold."""
+    an above-gate shove moves the stepping leg's placement; clamps hold.
+    The reflex checks prove the injection SEAM only — lib's live verdict
+    stands that StepReflex must not gate a walking gait (see the module
+    docstring); nothing here contradicts or re-tests that measurement."""
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     dt = 1.0 / args.hz
     stride_hz = 1.0                      # the mock trot's stride frequency
@@ -809,7 +862,8 @@ def selftest(args) -> int:
           f"stabilize_hook(idle={idle.stabilized} level={level.stabilized} "
           f"rolled={rolled.stabilized} calf_trim={math.degrees(got):+.2f}deg) "
           f"reflex_hook(calm={calm.reflexed} slow={slow.reflexed} "
-          f"shoved={shoved.reflexed}) "
+          f"shoved={shoved.reflexed}; seam only — lib measured StepReflex "
+          f"unfit to gate a WALKING gait) "
           + " ".join(f"{p}=[{a:.1f}..{b:.1f}]deg" for p, (a, b) in span.items()))
     return 0
 

@@ -309,14 +309,17 @@ def test_run_stays_open_loop():
 # 5 N*s push survives 6/10) — and the only recovery is to MOVE a foot
 # (capture-point stepping, the lib's StepReflex — which gates on deviation
 # from a REQUIRED ``nominal_vel_xy`` after live Newton disproved absolute
-# gating: 6/6 upright fell to 0/6 undisturbed; the deviation gate itself is
-# not yet live-validated).  Like the stabilizer the reflex arrives INJECTED,
-# so these tests
-# bind mocks exactly the way the live runner binds the lib, pin the mirrored
-# semantics (dry first measured step, positive-interval-only, opaque
-# measurement, raise-on-misuse, byte-identity when absent) and pin the
-# composition ORDER: reflex placement first, stabilizer height trim second,
-# conversion + clamp last.
+# gating: 6/6 upright fell to 0/6 undisturbed).  lib has since MEASURED the
+# deviation gate unfit for a WALKING gait as well (over threshold on 100.0%
+# of undisturbed walking ticks at the legal nominal; live A/B 6/6 -> 0/5,
+# Fisher p = 0.0022 — the authoritative verdict lives in
+# tritium_lib.control.step_reflex; standing bodies only).  These tests prove
+# the injection SEAM, not the reflex: like the stabilizer the reflex arrives
+# INJECTED, so they bind mocks exactly the way a live runner binds the lib,
+# pin the mirrored semantics (dry first measured step,
+# positive-interval-only, opaque measurement, raise-on-misuse, byte-identity
+# when absent) and pin the composition ORDER: reflex placement first,
+# stabilizer height trim second, conversion + clamp last.
 
 def test_reflex_fn_injected_but_never_fed_changes_nothing():
     """Injection alone must not alter output — only a measured velocity may.
