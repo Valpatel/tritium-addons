@@ -12,6 +12,7 @@ subprocesses, NO GPU.
 from __future__ import annotations
 
 import importlib.util
+import sys
 from pathlib import Path
 
 import pytest
@@ -140,13 +141,13 @@ def test_plan_full_rig_camera_depth_stereo_lidar():
 
 def test_plan_scene_passes_to_camera_and_lidar():
     plan = rig.build_rig_plan({"camera": True, "lidar": True,
-                               "source": "isaac", "scene": "/tmp/ao.usd"})
+                               "source": "isaac", "scene": "/tmp/ao.usd", "python": "/isaac/python.sh"})
     for argv in plan:
         assert _flag_value(argv, "--scene") == "/tmp/ao.usd"
 
 
 def test_plan_body_server_included_on_request():
-    plan = rig.build_rig_plan({"camera": True, "lidar": True, "body": True,
+    plan = rig.build_rig_plan({"camera": True, "lidar": True, "body": True, "python": "/isaac/python.sh",
                                "body_asset": "go2"})
     assert len(plan) == 3
     body = plan[2]
@@ -167,7 +168,7 @@ def test_plan_validation():
 
 
 def test_plan_role_names():
-    plan = rig.build_rig_plan({"camera": True, "lidar": True, "body": True})
+    plan = rig.build_rig_plan({"camera": True, "lidar": True, "body": True, "python": "/isaac/python.sh"})
     assert [rig.plan_role(a) for a in plan] == ["camera", "lidar", "body"]
 
 
@@ -201,3 +202,41 @@ def test_bad_config_exits_2(capsys):
     # build_rig_plan directly instead of fighting argparse in-process.
     with pytest.raises(ValueError):
         rig.build_rig_plan({"camera": True, "source": "bogus"})
+
+
+# --------------------------------------------------------------------------- #
+# Refusal: --source isaac demands an Isaac interpreter.
+# --------------------------------------------------------------------------- #
+
+def test_isaac_source_without_python_is_refused():
+    """``--source isaac`` under the launcher's OWN interpreter is a refusal.
+
+    The launcher is plain python3 by construction (stdlib only, no isaacsim),
+    so ``python=None`` -> ``sys.executable`` can never import Isaac.  Planning
+    it anyway spawns two full kit processes that each burn ~40 s of boot and
+    several GB of VRAM before dying on ``ModuleNotFoundError`` — and the rig
+    reports that as a health-poll timeout, which reads like a slow sensor
+    rather than the wrong interpreter.  Refuse at the seam instead.
+    """
+    with pytest.raises(ValueError, match="python"):
+        rig.build_rig_plan({"camera": True, "lidar": True, "source": "isaac"})
+
+
+def test_isaac_source_with_explicit_python_is_allowed():
+    """An explicit interpreter is the whole fix — this must still plan."""
+    plan = rig.build_rig_plan({
+        "camera": True, "source": "isaac", "python": "/isaac/python.sh",
+    })
+    assert plan[0][0] == "/isaac/python.sh"
+
+
+def test_body_server_without_python_is_refused():
+    """The body server is Isaac-only at every source, so it needs one too."""
+    with pytest.raises(ValueError, match="python"):
+        rig.build_rig_plan({"body": True, "source": "synthetic"})
+
+
+def test_synthetic_camera_still_defaults_to_the_launchers_python():
+    """The refusal must not touch the no-GPU path this rig is usually run on."""
+    plan = rig.build_rig_plan({"camera": True, "lidar": True})
+    assert plan[0][0] == sys.executable

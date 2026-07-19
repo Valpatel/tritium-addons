@@ -132,6 +132,19 @@ def build_rig_plan(config: dict | None = None) -> list[list[str]]:
         raise ValueError(f"source must be 'synthetic' or 'isaac', got {cfg['source']!r}")
     if not (cfg["camera"] or cfg["lidar"] or cfg["body"]):
         raise ValueError("empty rig: enable at least one of camera/lidar/body")
+    # An Isaac child needs an Isaac interpreter, and this launcher's own is by
+    # construction NOT one (stdlib only, no isaacsim — see the module
+    # docstring), so `python=None` under --source isaac is always wrong.
+    # Without this the rig spawns full kit processes that each burn ~40 s of
+    # boot and several GB of VRAM before dying on ModuleNotFoundError, which
+    # surfaces as a health-poll timeout — indistinguishable from a slow sensor.
+    needs_isaac = "--source isaac" if cfg["source"] == "isaac" else (
+        "the body server (Isaac-only at every source)" if cfg["body"] else "")
+    if needs_isaac and not cfg["python"]:
+        raise ValueError(
+            f"{needs_isaac} needs an Isaac interpreter: pass --python "
+            "<isaac-sim>/python.sh (the rig launcher's own python cannot "
+            "import isaacsim)")
 
     python = cfg["python"] or sys.executable
     conn = Path(cfg["connectors_dir"]) if cfg["connectors_dir"] else CONNECTORS_DIR
