@@ -226,6 +226,312 @@ def colorize_depth(depth: np.ndarray, near: float = 0.5, far: float = 60.0) -> n
 
 
 # --------------------------------------------------------------------------- #
+# Dialling OUT: pushing frames to the operator (--push-to).
+# --------------------------------------------------------------------------- #
+#
+# Everything above this line assumes the operator can reach US: MJPEG and
+# /snapshot are GETs, so tritium-sc must open a socket TO the render host.  On a
+# bench that is fine.  It fails everywhere that matters — the Isaac kit binds to
+# localhost on the render box, a fielded robot sits behind CGNAT or a radio with
+# no inbound route — and the symptom is always the same: a camera that is
+# rendering perfectly and is dark on the operator's map.  Real fleets solve this
+# the one way that works through NAT: the robot dials OUT and pushes.
+#
+# The DECISIONS (decimate, drop-never-queue, back off, count honestly) are
+# defined and tested once in ``tritium_lib.fleet.frame_push``.  They are
+# MIRRORED below rather than imported because connectors run inside Isaac's
+# python, which has no tritium on its path (test_connectors_do_not_import_tritium)
+# — the same arrangement as encode_depth16 and the mount helpers.  The drift is
+# pinned by test_policy_decisions_match_the_lib_policy_frame_for_frame, which
+# drives both copies through one script and demands identical decisions: if
+# these ever disagree, that test goes red instead of an operator quietly getting
+# a different rate limiter than the one with tests.
+
+#: Mirror of ``tritium_lib.fleet.frame_push.FRAME_PUSH_PATH``.
+FRAME_PUSH_PATH = "/api/camera-feeds/sources/{source_id}/frame"
+
+#: Channel -> the source id the rig already registers for it
+#: (``tritium_lib.fleet.sensor_rig._PIXEL_STREAMS``).  Pushing to a DIFFERENT id
+#: would create a second, unwatched feed beside the one on the operator's map.
+DEFAULT_PUSH_SOURCE_IDS = {
+    "main": "isaac_rgb",
+    "right": "isaac_right",
+    "depth16": "isaac_depth16",
+    "depth": "isaac_depth_view",
+}
+
+
+def frame_push_path(source_id: str) -> str:
+    """Path to POST bytes for *source_id* (percent-encoded, like the lib seam)."""
+    if not source_id or not source_id.strip():
+        raise ValueError("source_id must be a non-empty string")
+    from urllib.parse import quote
+
+    return FRAME_PUSH_PATH.format(source_id=quote(source_id, safe=""))
+
+
+class PushDecision:
+    """Whether to send this frame, and — when not — precisely why."""
+
+    __slots__ = ("send", "reason")
+
+    def __init__(self, send: bool, reason: str):
+        self.send = send
+        self.reason = reason
+
+    def __repr__(self):  # pragma: no cover - debugging aid
+        return f"PushDecision(send={self.send}, reason={self.reason!r})"
+
+
+class PushStats:
+    """Honest tally: four different reasons a frame did not land."""
+
+    __slots__ = ("sent", "dropped_rate_limited", "dropped_in_flight",
+                 "dropped_backoff", "failed", "consecutive_failures")
+
+    def __init__(self, sent, dropped_rate_limited, dropped_in_flight,
+                 dropped_backoff, failed, consecutive_failures):
+        self.sent = sent
+        self.dropped_rate_limited = dropped_rate_limited
+        self.dropped_in_flight = dropped_in_flight
+        self.dropped_backoff = dropped_backoff
+        self.failed = failed
+        self.consecutive_failures = consecutive_failures
+
+    @property
+    def dropped(self) -> int:
+        return (self.dropped_rate_limited + self.dropped_in_flight
+                + self.dropped_backoff)
+
+
+class FramePushPolicy:
+    """Decides which frames to push and when to stop trying.
+
+    Mirror of the lib class; see the contract note above.  Time is passed in
+    rather than read, so a multi-hour outage is testable without sleeping.
+    """
+
+    def __init__(self, target_fps: float = 10.0, base_backoff_s: float = 0.5,
+                 max_backoff_s: float = 30.0):
+        if target_fps <= 0:
+            raise ValueError(f"target_fps must be positive, got {target_fps!r}")
+        if base_backoff_s < 0 or max_backoff_s < 0:
+            raise ValueError("backoff seconds must not be negative")
+        self._interval_s = 1.0 / target_fps
+        self._base_backoff_s = base_backoff_s
+        self._max_backoff_s = max_backoff_s
+        self._in_flight = False
+        self._last_sent_at = None
+        self._retry_not_before = 0.0
+        self._sent = 0
+        self._dropped_rate = 0
+        self._dropped_in_flight = 0
+        self._dropped_backoff = 0
+        self._failed = 0
+        self._consecutive_failures = 0
+
+    def offer(self, now: float) -> PushDecision:
+        if self._in_flight:
+            self._dropped_in_flight += 1
+            return PushDecision(False, "in_flight")
+        if now < self._retry_not_before:
+            self._dropped_backoff += 1
+            return PushDecision(False, "backoff")
+        if self._last_sent_at is not None and (now - self._last_sent_at) < self._interval_s:
+            self._dropped_rate += 1
+            return PushDecision(False, "rate_limited")
+        self._in_flight = True
+        return PushDecision(True, "ok")
+
+    def sent(self, now: float) -> None:
+        if not self._in_flight:
+            raise RuntimeError("sent() without an offer() that returned send=True")
+        self._in_flight = False
+        self._sent += 1
+        self._last_sent_at = now
+        self._consecutive_failures = 0
+        self._retry_not_before = 0.0
+
+    def failed(self, now: float) -> None:
+        if not self._in_flight:
+            raise RuntimeError("failed() without an offer() that returned send=True")
+        # Clearing _in_flight here is load-bearing: without it one dropped
+        # connection wedges the pusher for the life of the process.
+        self._in_flight = False
+        self._failed += 1
+        self._consecutive_failures += 1
+        self._retry_not_before = now + self._current_backoff()
+
+    def backoff_remaining(self, now: float) -> float:
+        return max(0.0, self._retry_not_before - now)
+
+    @property
+    def stats(self) -> PushStats:
+        return PushStats(self._sent, self._dropped_rate, self._dropped_in_flight,
+                         self._dropped_backoff, self._failed,
+                         self._consecutive_failures)
+
+    @property
+    def healthy(self) -> bool:
+        """Conservative on purpose: a pusher that has never delivered a frame
+        is not "starting up", it is not working."""
+        return self._sent > 0 and self._consecutive_failures == 0
+
+    def _current_backoff(self) -> float:
+        exponent = max(0, self._consecutive_failures - 1)
+        if exponent > 32:
+            return self._max_backoff_s
+        return min(self._base_backoff_s * (2 ** exponent), self._max_backoff_s)
+
+
+class FramePusher(threading.Thread):
+    """One daemon thread pushing one channel's latest frame to the operator.
+
+    Takes a latest-frame holder (a :class:`CameraState`, or anything with
+    ``latest(channel) -> bytes``) and posts the bytes that channel ALREADY
+    holds — no second encode, so pushing costs bandwidth, not GPU.
+
+    Nothing here decides anything: the policy above owns rate, backoff and the
+    counters, and this thread only moves bytes and reports the outcome.
+    """
+
+    def __init__(self, frames, channel: str, base_url: str, source_id: str,
+                 target_fps: float = 10.0, base_backoff_s: float = 0.5,
+                 max_backoff_s: float = 30.0, timeout_s: float = 5.0):
+        super().__init__(daemon=True, name=f"isaac-cam-push-{channel}")
+        self.frames = frames
+        self.channel = channel
+        self.base_url = base_url.rstrip("/")
+        self.source_id = source_id
+        self.target_fps = float(target_fps)
+        self.timeout_s = timeout_s
+        self.url = self.base_url + frame_push_path(source_id)
+        self.content_type = channel_mime(channel)
+        self.policy = FramePushPolicy(target_fps, base_backoff_s, max_backoff_s)
+        self._stop_evt = threading.Event()
+        self._last_sent_blob = None
+        # Poll faster than the send rate (so a frame is never held back by the
+        # poll), but never so fast that an idle source spins a core.
+        self._idle_s = max(0.002, min(0.05, 0.5 / max(1.0, self.target_fps)))
+
+    def run(self) -> None:
+        while not self._stop_evt.is_set():
+            blob = self.frames.latest(self.channel)
+            if not blob or blob is self._last_sent_blob:
+                # Nothing new to say.  Re-posting a delivered frame would spend
+                # link budget making a frozen feed look live.
+                self._stop_evt.wait(self._idle_s)
+                continue
+            now = time.monotonic()
+            decision = self.policy.offer(now)
+            if not decision.send:
+                self._stop_evt.wait(
+                    max(0.002, min(0.25, self.policy.backoff_remaining(now)
+                                   or self._idle_s))
+                )
+                continue
+            if self._post(blob):
+                self.policy.sent(time.monotonic())
+                self._last_sent_blob = blob
+            else:
+                self.policy.failed(time.monotonic())
+
+    def _post(self, blob: bytes) -> bool:
+        """POST the bytes; True only on a 2xx.  Every other outcome — refusal,
+        redirect, dead port, DNS, timeout — is a failure the policy backs off
+        on, and NONE of them may escape and kill this thread."""
+        import urllib.error
+        import urllib.request
+
+        req = urllib.request.Request(
+            self.url, data=blob, method="POST",
+            headers={"Content-Type": self.content_type,
+                     "Content-Length": str(len(blob))},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
+                return 200 <= int(resp.status) < 300
+        except urllib.error.HTTPError as exc:
+            log.debug("push %s refused: HTTP %s", self.source_id, exc.code)
+            return False
+        except Exception as exc:
+            log.debug("push %s failed: %s", self.source_id, exc)
+            return False
+
+    def status(self) -> dict:
+        """What an operator needs to tell "pushing fine" from "being refused"."""
+        st = self.policy.stats
+        return {
+            "channel": self.channel,
+            "source_id": self.source_id,
+            "target": self.url,
+            "content_type": self.content_type,
+            "sent": st.sent,
+            "dropped": st.dropped,
+            "dropped_rate_limited": st.dropped_rate_limited,
+            "dropped_backoff": st.dropped_backoff,
+            "failed": st.failed,
+            "consecutive_failures": st.consecutive_failures,
+            "healthy": self.policy.healthy,
+        }
+
+    def stop(self, timeout: float = 2.0) -> None:
+        self._stop_evt.set()
+        if self.is_alive():
+            self.join(timeout=timeout)
+
+
+class PushPlan:
+    """One resolved ``--push-to`` target, before any thread exists.
+
+    Separated from the thread so the CLI can be validated (and tested) with no
+    sockets: a channel that is not being served is rejected at startup rather
+    than becoming a pusher that never finds a frame.
+    """
+
+    __slots__ = ("channel", "source_id", "base_url", "target_fps")
+
+    def __init__(self, channel: str, source_id: str, base_url: str, target_fps: float):
+        self.channel = channel
+        self.source_id = source_id
+        self.base_url = base_url.rstrip("/")
+        self.target_fps = float(target_fps)
+
+    def url(self) -> str:
+        return self.base_url + frame_push_path(self.source_id)
+
+    def build(self, frames) -> FramePusher:
+        return FramePusher(frames, self.channel, self.base_url, self.source_id,
+                           target_fps=self.target_fps)
+
+
+def push_plans(args, channels) -> list:
+    """The pushers implied by the CLI flags.  Empty when ``--push-to`` is unset
+    (pull-only remains the default: this adds a path, it does not replace one)."""
+    base = getattr(args, "push_to", "") or ""
+    if not base:
+        return []
+    overrides = {}
+    for item in getattr(args, "push_source_id", None) or []:
+        channel, _, sid = item.partition("=")
+        if not sid:
+            channel, sid = "", channel
+        overrides[channel] = sid
+    wanted = list(getattr(args, "push_channel", None) or ["main"])
+    plans = []
+    for channel in wanted:
+        if channel not in channels:
+            raise ValueError(
+                f"--push-channel {channel!r} is not served (channels: "
+                f"{','.join(channels)}) — enable it or drop the flag"
+            )
+        sid = overrides.get(channel) or overrides.get("") or \
+            DEFAULT_PUSH_SOURCE_IDS.get(channel, f"isaac_{channel}")
+        plans.append(PushPlan(channel, sid, base, float(args.push_fps)))
+    return plans
+
+
+# --------------------------------------------------------------------------- #
 # Mounting a camera ON a body (capability 8b).
 # --------------------------------------------------------------------------- #
 #
@@ -722,6 +1028,7 @@ class CameraState:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self.frames = 0
+        self.pushers: list = []
 
     def start(self):
         """Render in a BACKGROUND thread. Only legal for thread-safe sources —
@@ -821,8 +1128,33 @@ class CameraState:
         with self._lock:
             return self._latest.get(channel, b"")
 
+    # -- dial-out pushers ---------------------------------------------------
+
+    def attach_pusher(self, pusher) -> None:
+        """Register a :class:`FramePusher` so ``/status`` can report it."""
+        self.pushers.append(pusher)
+
+    def push_status(self) -> dict | None:
+        """The ``push`` block, or None when this server is pull-only.
+
+        Absence is the honest signal: an empty block would read as "configured
+        but idle", which is exactly the ambiguity an operator staring at a dark
+        feed cannot afford."""
+        if not self.pushers:
+            return None
+        return {
+            "url": self.pushers[0].base_url,
+            "fps": self.pushers[0].target_fps,
+            "channels": {p.channel: p.status() for p in self.pushers},
+        }
+
     def stop(self):
         self._stop.set()
+        for pusher in self.pushers:
+            try:
+                pusher.stop()
+            except Exception:  # pragma: no cover - shutdown must not raise
+                pass
         self.source.close()
 
 
@@ -901,11 +1233,15 @@ def _make_handler(state: CameraState):
 
         def do_GET(self):
             if self.path.startswith("/status"):
-                body = json.dumps({
+                payload = {
                     **state.meta, "frames": state.frames,
                     "source": state.source.name, "status": "online",
                     "channels": list(state.channels),
-                }).encode()
+                }
+                push = state.push_status()
+                if push is not None:
+                    payload["push"] = push
+                body = json.dumps(payload).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
@@ -1015,7 +1351,7 @@ def selftest(args) -> int:
     return 0
 
 
-def main(argv=None) -> int:
+def _build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Isaac Sim MJPEG camera server")
     ap.add_argument("--source", choices=["isaac", "synthetic"], default="synthetic")
     ap.add_argument("--port", type=int, default=8100)
@@ -1073,8 +1409,32 @@ def main(argv=None) -> int:
                     help="serve a right-eye STEREO channel at /mjpeg_right")
     ap.add_argument("--stereo-baseline", type=float, default=0.12,
                     help="isaac stereo right-eye offset in metres (default 0.12)")
+    # Dial-OUT push. Everything else here assumes the operator can open a
+    # socket to this process; --push-to is for when it cannot.
+    ap.add_argument("--push-to", default="", metavar="SC_BASE_URL",
+                    help="ALSO push frames outbound to this Command Center "
+                         "base URL (e.g. http://operator:8000) — for when the "
+                         "operator has no inbound route to this host")
+    ap.add_argument("--push-fps", type=float, default=10.0,
+                    help="max frames per second per pushed channel (default 10)")
+    ap.add_argument("--push-channel", action="append", default=None,
+                    metavar="CHANNEL",
+                    help="channel to push; repeatable (default: main)")
+    ap.add_argument("--push-source-id", action="append", default=None,
+                    metavar="[CHANNEL=]ID",
+                    help="override the camera-feeds source id a channel pushes "
+                         "to (default: the id the rig registers, e.g. isaac_rgb)")
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--selftest-frames", type=int, default=12)
+    return ap
+
+
+def _parse_args(argv=None):
+    return _build_parser().parse_args(argv)
+
+
+def main(argv=None) -> int:
+    ap = _build_parser()
     args = ap.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
@@ -1109,6 +1469,12 @@ def main(argv=None) -> int:
                  "render env — install one or drop --depth16")
     state = CameraState(source, meta, args.fps, encode, channels=channels,
                         hfov_deg=args.hfov)
+    try:
+        plans = push_plans(args, channels)
+    except ValueError as exc:
+        ap.error(str(exc))
+    for plan in plans:
+        state.attach_pusher(plan.build(state))
     httpd = ThreadingHTTPServer((args.host, args.port), _make_handler(state))
 
     # Which thread owns rendering vs HTTP depends on the source. Isaac/Kit must
@@ -1120,6 +1486,13 @@ def main(argv=None) -> int:
                          name="isaac-cam-http").start()
     else:
         state.start()
+
+    # Pushers start after the render path, so the first offer has a chance of
+    # finding a frame instead of burning a backoff slot on an empty holder.
+    for pusher in list(state.pushers):
+        pusher.start()
+        log.info("PUSHING channel=%s -> %s @ %.1f fps",
+                 pusher.channel, pusher.url, pusher.target_fps)
 
     def _shutdown(*_a):
         log.info("shutting down")
